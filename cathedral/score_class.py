@@ -440,9 +440,12 @@ def export_score_class_report(
         metric_text = _decimal_text(metric_units)
         if _METRIC_DECIMAL_RE.fullmatch(metric_text) is None:
             # One out-of-range receipt must not invalidate every honest miner.
-            # Preserve its exact provenance, score only that row as zero, and
-            # make the exclusion explicit in the decision record.
+            # Exclude both its units and receipt reference: public evidence
+            # bundles cover exactly the positive candidate set, so retaining
+            # evidence on a zero row would make the otherwise fail-closed
+            # report impossible to export.
             metric_text = "0"
+            evidence = []
             reasons = ["unsupported_work_unit_precision"]
         entries.append(
             {

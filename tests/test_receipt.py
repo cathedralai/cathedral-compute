@@ -1151,7 +1151,7 @@ def test_out_of_range_metric_excludes_only_that_miner(tmp_path: Path, work_units
 
     assert rows["public-hotkey"]["metrics"] == {"verified_work_units": "0"}
     assert rows["public-hotkey"]["reason_codes"] == ["unsupported_work_unit_precision"]
-    assert rows["public-hotkey"]["evidence"]
+    assert rows["public-hotkey"]["evidence"] == []
     assert rows["zero-hotkey"]["metrics"] == {"verified_work_units": "0"}
 
 
