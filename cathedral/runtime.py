@@ -14,9 +14,9 @@ import math
 import os
 import threading
 import urllib.parse
-from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
@@ -229,6 +229,7 @@ class _AttestationResult:
     attested: Attested | None = None
     evidence_digest: str | None = None
     envelope_digest: str | None = None
+    challenge_digest: str | None = None
     client: MinerClient | None = None
     error: str | None = None
     error_category: str | None = None
@@ -1039,6 +1040,7 @@ class ConfidentialRuntime:
                 policy_mode=result.attested.policy_mode or "compatibility",
                 score_eligible=score_eligible,
                 envelope_digest=result.envelope_digest,
+                challenge_digest=result.challenge_digest,
                 envelope_required=(
                     self.config.production_mode
                     and self.config.expected_tier is Tier.CC_CPU_TDX
@@ -1470,6 +1472,7 @@ class ConfidentialRuntime:
                     attested=verdict,
                     evidence_digest=evidence_digest,
                     envelope_digest=envelope_digest,
+                    challenge_digest="sha256:" + hashlib.sha256(nonce).hexdigest(),
                     client=client,
                     component_audit=component_audit,
                     gpu_component=gpu_component,

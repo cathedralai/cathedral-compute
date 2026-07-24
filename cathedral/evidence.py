@@ -482,7 +482,14 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         if (
             not isinstance(row, Mapping)
             or set(row)
-            != {"hotkey", "verdict", "evidence_digest", "envelope_digest", "disclosure"}
+            != {
+                "hotkey",
+                "verdict",
+                "evidence_digest",
+                "envelope_digest",
+                "challenge_digest",
+                "disclosure",
+            }
             or not isinstance(row["hotkey"], str)
             or not row["hotkey"]
             or not isinstance(row["verdict"], str)
@@ -492,6 +499,8 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         _require_digest(row["evidence_digest"], "attestation evidence digest")
         if row["envelope_digest"] is not None:
             _require_digest(row["envelope_digest"], "attestation envelope digest")
+        if row["challenge_digest"] is not None:
+            _require_digest(row["challenge_digest"], "attestation challenge digest")
     candidate_set = document["candidate_set"]
     if (
         not isinstance(candidate_set, Mapping)

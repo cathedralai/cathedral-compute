@@ -650,6 +650,8 @@ def replay_positive_miners(
     verifier_command: tuple[str, ...],
     verifier_artifacts: tuple[str, ...],
     candidates_all_rejected: bool = False,
+    epoch_generated_at: str | None = None,
+    max_evidence_age_seconds: float = 3600.0,
 ) -> ProvenanceResult:
     """Upgrade a receipts-only result to FULL assurance via raw replay.
 
@@ -700,6 +702,12 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"receipt for {miner.hotkey!r} carries no hardware evidence digest"
             )
+        challenge_digest = binding.get("challenge_digest")
+        if not isinstance(challenge_digest, str) or not challenge_digest:
+            raise ProvenanceError(
+                f"no committed challenge randomness for {miner.hotkey!r}; "
+                "freshness is NOT PROVEN"
+            )
         try:
             issued_at = datetime.strptime(
                 miner.issued_at, "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -708,6 +716,14 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"receipt issue time for {miner.hotkey!r} is malformed"
             ) from exc
+        if epoch_generated_at is not None:
+            epoch_moment = _parse_utc(epoch_generated_at, "manifest generated_at")
+            age = abs((epoch_moment - issued_at).total_seconds())
+            if age > max_evidence_age_seconds:
+                raise ProvenanceError(
+                    f"evidence for {miner.hotkey!r} is outside the epoch age "
+                    f"window ({age:.0f}s > {max_evidence_age_seconds:.0f}s)"
+                )
         try:
             # Historical policy: the profile set that was live when the
             # evidence was collected, from the SAME signed registry the
@@ -725,6 +741,7 @@ def replay_positive_miners(
                 expected_hotkey=miner.hotkey,
                 expected_measurement=miner.measurement,
                 expected_quote_digest=miner.hardware_evidence_digest,
+                expected_challenge_digest=challenge_digest,
                 verifier_binary=verifier_binary,
                 verifier_blob_digest=verifier_blob_digest,
                 verifier_command=verifier_command,

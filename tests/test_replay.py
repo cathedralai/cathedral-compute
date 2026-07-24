@@ -94,14 +94,20 @@ def _replay(tmp_path: Path, claims: dict, *, wrong_nonce: bool = False, **overri
     envelope_digest = "sha256:" + hashlib.sha256(envelope).hexdigest()
     blob_digest = "sha256:" + hashlib.sha256(VERIFIER_SCRIPT).hexdigest()
     implementation = "sha256:" + "0" * 64  # authentication is stubbed here
-    quote_b64 = json.loads(envelope)["components"][0]["quote_base64"]
-    quote_digest = "sha256:" + hashlib.sha256(base64.b64decode(quote_b64)).hexdigest()
+    component = json.loads(envelope)["components"][0]
+    quote_digest = "sha256:" + hashlib.sha256(
+        base64.b64decode(component["quote_base64"])
+    ).hexdigest()
+    challenge_digest = "sha256:" + hashlib.sha256(
+        base64.b64decode(component["nonce_base64"])
+    ).hexdigest()
     arguments = dict(
         expected_envelope_digest=envelope_digest,
         expected_evidence_digest=evidence_digest,
         expected_hotkey="tdx-miner",
         expected_measurement=MEASUREMENT,
         expected_quote_digest=quote_digest,
+        expected_challenge_digest=challenge_digest,
         verifier_binary=VERIFIER_SCRIPT,
         verifier_blob_digest=blob_digest,
         verifier_command=DECLARED,
@@ -346,8 +352,13 @@ def test_full_chain_refuses_a_script_verifier_without_stubs(tmp_path: Path):
     envelope, evidence_digest = _evidence_and_envelope(_full_claims())
     import hashlib
 
-    quote_b64 = json.loads(envelope)["components"][0]["quote_base64"]
-    quote_digest = "sha256:" + hashlib.sha256(base64.b64decode(quote_b64)).hexdigest()
+    component = json.loads(envelope)["components"][0]
+    quote_digest = "sha256:" + hashlib.sha256(
+        base64.b64decode(component["quote_base64"])
+    ).hexdigest()
+    challenge_digest = "sha256:" + hashlib.sha256(
+        base64.b64decode(component["nonce_base64"])
+    ).hexdigest()
     with pytest.raises(ReplayError, match="static x86-64|implementation"):
         replay_evidence(
             envelope,
@@ -356,6 +367,7 @@ def test_full_chain_refuses_a_script_verifier_without_stubs(tmp_path: Path):
             expected_hotkey="tdx-miner",
             expected_measurement=MEASUREMENT,
             expected_quote_digest=quote_digest,
+            expected_challenge_digest=challenge_digest,
             verifier_binary=VERIFIER_SCRIPT,
             verifier_blob_digest="sha256:" + hashlib.sha256(VERIFIER_SCRIPT).hexdigest(),
             verifier_command=DECLARED,
@@ -411,3 +423,14 @@ def test_zero_positive_miners_never_full(tmp_path: Path):
         verifier_artifacts=DECLARED,
     )
     assert upgraded.assurance_level == ASSURANCE_RECEIPTS_ONLY
+
+
+def test_stale_envelope_nonce_rejected_by_committed_challenge(tmp_path: Path):
+    """Counterexample C: an envelope whose nonce does not reproduce the
+    epoch's committed challenge randomness must never replay."""
+    with pytest.raises(ReplayError, match="committed challenge"):
+        _replay(
+            tmp_path,
+            _full_claims(),
+            expected_challenge_digest="sha256:" + "9" * 64,  # other epoch
+        )

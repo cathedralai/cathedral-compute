@@ -299,6 +299,7 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
                 "verdict": "VERIFIED",
                 "evidence_digest": "sha256:" + "5" * 64,
                 "envelope_digest": "sha256:" + "9" * 64,
+                "challenge_digest": "sha256:" + "8" * 64,
                 "disclosure": "controlled",
             }
         ],

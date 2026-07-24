@@ -272,6 +272,7 @@ def replay_evidence(
     expected_hotkey: str,
     expected_measurement: str,
     expected_quote_digest: str,
+    expected_challenge_digest: str,
     verifier_binary: bytes,
     verifier_blob_digest: str,
     verifier_command: tuple[str, ...],
@@ -294,6 +295,15 @@ def replay_evidence(
         raise ReplayError(
             "raw quote bytes do not match the receipt's signed hardware "
             "evidence digest"
+        )
+    # Freshness anchor: the nonce is NEVER trusted from the envelope alone.
+    # It must reproduce the challenge randomness committed for this epoch in
+    # the signed chain (recorded at admission, frozen with the report), so a
+    # stale envelope from another epoch cannot replay here.
+    if _digest(evidence.nonce) != expected_challenge_digest:
+        raise ReplayError(
+            "envelope nonce does not match the epoch's committed challenge "
+            "randomness"
         )
     authenticate_verifier_bytes(
         verifier_binary,

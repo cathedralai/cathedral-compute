@@ -9,11 +9,12 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Protocol
 
 from cathedral.lanes.sat import (
     CUSTOMER_SAT_WORK_UNITS,
@@ -215,7 +216,7 @@ ON customer_jobs(status, available_at, submitted_at, job_id);
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _validated_generated_at(value: str | None) -> str:
@@ -486,6 +487,7 @@ class Ledger:
         # historical CPU-only database.
         self._migrate_gpu_attestations_if_needed()
         self._migrate_attestation_envelope_if_needed()
+        self._migrate_attestation_challenge_if_needed()
         self._migrate_worker_lifecycle_fields_if_needed()
 
     def _migrate_registry_policy_fields_if_needed(self) -> None:
@@ -501,6 +503,20 @@ class Ledger:
                 )
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add registry policy audit fields") from exc
+
+    def _migrate_attestation_challenge_if_needed(self) -> None:
+        """Add the per-epoch challenge-randomness commitment column."""
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "challenge_digest" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN challenge_digest TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation challenge audit field") from exc
 
     def _migrate_attestation_envelope_if_needed(self) -> None:
         """Add the retained-envelope digest binding to historical rows.
@@ -555,8 +571,13 @@ class Ledger:
         # Preserve every column added by other migrations: a rebuild must
         # never silently drop data (the envelope-digest binding in particular).
         has_envelope = "envelope_digest" in columns
-        envelope_column_sql = "envelope_digest TEXT," if has_envelope else ""
-        envelope_select_sql = ",envelope_digest" if has_envelope else ""
+        has_challenge = "challenge_digest" in columns
+        envelope_column_sql = ("envelope_digest TEXT," if has_envelope else "") + (
+            "challenge_digest TEXT," if has_challenge else ""
+        )
+        envelope_select_sql = (",envelope_digest" if has_envelope else "") + (
+            ",challenge_digest" if has_challenge else ""
+        )
         self._connection.execute("PRAGMA foreign_keys = OFF")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -940,7 +961,7 @@ class Ledger:
         if (
             not isinstance(resolved_before, datetime)
             or resolved_before.tzinfo is None
-            or resolved_before.utcoffset() != timezone.utc.utcoffset(None)
+            or resolved_before.utcoffset() != UTC.utcoffset(None)
         ):
             raise LedgerError("resolved_before must be a UTC timestamp")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
@@ -987,7 +1008,7 @@ class Ledger:
                 raise LedgerError(f"{name} must be between 1 and {maximum}")
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "claim customer jobs")
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(UTC)
             now = now_dt.isoformat()
             expired = cx.execute(
                 "SELECT job_id,lease_challenge_id,attempt_count FROM customer_jobs "
@@ -1544,6 +1565,7 @@ class Ledger:
         score_eligible: bool | None = None,
         envelope_digest: str | None = None,
         envelope_required: bool = False,
+        challenge_digest: str | None = None,
     ) -> None:
         """Add exact CPU or composite-GPU evidence to a running epoch.
 
@@ -1560,6 +1582,11 @@ class Ledger:
             raise LedgerError(
                 "production scoring attestation requires a retained envelope digest"
             )
+        if challenge_digest is not None and (
+            not isinstance(challenge_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", challenge_digest) is None
+        ):
+            raise LedgerError("attestation challenge digest is invalid")
         hardware_shape = (verdict, tee_type, workload)
         if hardware_shape not in {
             ("VERIFIED", "TDX", "CPU"),
@@ -1606,8 +1633,9 @@ class Ledger:
             cx.execute(
                 "INSERT INTO epoch_attestations "
                 "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, "
-                "policy_mode, score_eligible, attested_at, envelope_digest) "
-                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?)",
+                "policy_mode, score_eligible, attested_at, envelope_digest, "
+                "challenge_digest) "
+                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     epoch_id,
                     hotkey,
@@ -1618,6 +1646,7 @@ class Ledger:
                     int(score_eligible),
                     _now(),
                     envelope_digest,
+                    challenge_digest,
                 ),
             )
 
@@ -1722,7 +1751,7 @@ class Ledger:
         if score_authority_valid_until is not None and (
             not isinstance(score_authority_valid_until, datetime)
             or score_authority_valid_until.tzinfo is None
-            or score_authority_valid_until.utcoffset() != timezone.utc.utcoffset(None)
+            or score_authority_valid_until.utcoffset() != UTC.utcoffset(None)
         ):
             raise LedgerError("score authority expiry must be a UTC timestamp")
         universe = set(all_hotkeys)
@@ -1881,7 +1910,7 @@ class Ledger:
                 report["network"], report["netuid"] = audience
             body = _canonical_json(report)
             digest = hashlib.sha256(body).hexdigest()
-            completion_time = datetime.now(timezone.utc)
+            completion_time = datetime.now(UTC)
             if (
                 score_authority_valid_until is not None
                 and completion_time >= score_authority_valid_until
@@ -2212,7 +2241,8 @@ class Ledger:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT hotkey, verdict, tee_type, workload, evidence_digest, "
-                "policy_mode, score_eligible, attested_at, envelope_digest "
+                "policy_mode, score_eligible, attested_at, envelope_digest, "
+                "challenge_digest "
                 "FROM epoch_attestations WHERE epoch_id = ? ORDER BY hotkey",
                 (epoch_id,),
             ).fetchall()

@@ -1334,6 +1334,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                     if row["envelope_digest"] is not None
                     else None
                 ),
+                "challenge_digest": (
+                    str(row["challenge_digest"])
+                    if row["challenge_digest"] is not None
+                    else None
+                ),
                 "disclosure": "controlled",
             }
             for row in ledger.attestation_rows(epoch_id)
