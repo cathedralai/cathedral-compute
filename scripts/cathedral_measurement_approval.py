@@ -25,15 +25,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -47,6 +50,11 @@ from cathedral.remote import RemoteMiner
 
 MEASUREMENT_PREFIX = "tdx-measurement-sha256:"
 ACCEPTABLE_TCB = {"UpToDate"}
+MAX_ROLLOVER_DAYS = 180
+MIN_ROLLOVER_DAYS = 7
+MAX_ROLLOVER_AUDIT_ENTRIES = 32
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_REGISTRY_BYTES = 8 * 1024 * 1024
 
 
 def _now_iso() -> str:
@@ -58,6 +66,46 @@ def _public_key_b64(seed: bytes) -> str:
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
     return base64.b64encode(public).decode()
+
+
+def _secure_read_bytes(
+    path: str | Path,
+    *,
+    label: str,
+    maximum: int = MAX_REGISTRY_BYTES,
+) -> bytes:
+    """Read a bounded, owned, non-symlink regular file without a TOCTOU gap."""
+    target = Path(path)
+    before = target.lstat()
+    if not stat.S_ISREG(before.st_mode) or target.is_symlink():
+        raise SystemExit(f"{label} must be a regular non-symlink file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags)
+    try:
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise SystemExit(f"{label} changed underneath the tool")
+        if after.st_mode & 0o022:
+            raise SystemExit(f"{label} must not be group/world writable")
+        if hasattr(os, "geteuid") and after.st_uid != os.geteuid():
+            raise SystemExit(f"{label} must be owned by the invoking user")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(raw) > maximum:
+        raise SystemExit(f"{label} exceeds the {maximum}-byte limit")
+    return raw
 
 
 def _capture(endpoint: str, cacert: str, hotkey: str, verifier: str) -> dict:
@@ -124,7 +172,9 @@ def _bump_release(registry: dict, measurement: str, operator: str, reason: str) 
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    registry = parse_registry_json(Path(args.registry).read_bytes())
+    registry = parse_registry_json(
+        _secure_read_bytes(args.registry, label="policy registry")
+    )
     profile = registry["profiles"][0]
     print(f"release {registry['release']}  profile {profile['id']}")
     print(f"valid {registry['valid_from']} .. {registry['valid_until']}")
@@ -137,7 +187,9 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    registry = parse_registry_json(Path(args.registry).read_bytes())
+    registry = parse_registry_json(
+        _secure_read_bytes(args.registry, label="policy registry")
+    )
     candidate = _capture(args.endpoint, args.cacert, args.hotkey, args.verifier)
     measurement = candidate["measurement"]
     print(
@@ -337,7 +389,7 @@ def cmd_renew(args: argparse.Namespace) -> int:
 
     operator = _bounded_field(args.operator, "operator")
     reason = _bounded_field(args.reason, "reason")
-    current_bytes = Path(args.registry).read_bytes()
+    current_bytes = _secure_read_bytes(args.registry, label="policy registry")
     registry = parse_registry_json(current_bytes)
     seed = _load_signing_seed(args.signing_key_file)
     trusted = {registry["signing_key_id"]: base64.b64decode(_public_key_b64(seed))}
@@ -407,7 +459,7 @@ def cmd_renew(args: argparse.Namespace) -> int:
     digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
     record = {
         "at": _now_iso(),
-        "action": "registry_reissued",
+        "action": "registry_reissue_prepared",
         "operator": operator,
         "reason": reason,
         "previous_release": int(registry["release"]),
@@ -436,6 +488,578 @@ def cmd_renew(args: argparse.Namespace) -> int:
           "the state store accepts this as a monotonic successor (no "
           "re-anchor). Install deliberately after review.")
     return 0
+
+
+def _parse_rollover_until(value: str, now: datetime) -> tuple[datetime, str]:
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("--valid-until must be an exact UTC timestamp") from exc
+    minimum = now + timedelta(days=MIN_ROLLOVER_DAYS)
+    maximum = now + timedelta(days=MAX_ROLLOVER_DAYS)
+    if not minimum <= parsed <= maximum:
+        raise SystemExit(
+            f"--valid-until must be between {MIN_ROLLOVER_DAYS} and "
+            f"{MAX_ROLLOVER_DAYS} days from now"
+        )
+    return parsed, parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _identifier(value: str, label: str) -> str:
+    if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
+        raise SystemExit(
+            f"{label} must be a 1..128 character identifier containing only "
+            "letters, digits, dot, underscore, colon, or hyphen"
+        )
+    return value
+
+
+def _prove_registry_successor(
+    *,
+    current_snapshot: object,
+    successor_snapshot: object,
+    current_release: int,
+    state_path: str | None,
+) -> None:
+    """Prove current -> successor against a temporary anti-rollback state."""
+    import sqlite3
+
+    from cathedral.policy_registry import PolicyRegistryState
+
+    with tempfile.TemporaryDirectory(prefix="cathedral-policy-proof-") as scratch:
+        proof_path = Path(scratch) / "policy-proof.sqlite"
+        if state_path:
+            try:
+                source = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True)
+            except sqlite3.Error as exc:
+                raise SystemExit("unable to open the policy state read-only") from exc
+            try:
+                destination = sqlite3.connect(proof_path)
+                try:
+                    source.backup(destination)
+                finally:
+                    destination.close()
+            finally:
+                source.close()
+        state = PolicyRegistryState(proof_path, minimum_release=current_release)
+        state.accept(current_snapshot)
+        state.accept(successor_snapshot)
+
+
+def _remove_created(paths: list[Path]) -> None:
+    for path in reversed(paths):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        else:
+            _fsync_parent(path)
+
+
+def cmd_rollover(args: argparse.Namespace) -> int:
+    """Prepare a bounded profile and receipt-key window rollover.
+
+    A same-policy reissue refreshes publication time but deliberately cannot
+    extend immutable profile or receipt-key windows. This command prepares
+    the next explicit policy release by cloning one existing CPU-TDX profile
+    under a new id, preserving all of its security controls and measurements,
+    and adding a freshly generated Ed25519 receipt key under a new id. Existing
+    profiles and keys are retained byte-for-byte for historical verification.
+
+    The command does not install any artifact. It emits a mode-0600 signed
+    registry and a separate mode-0600 receipt-key seed, proves the successor
+    against a temporary copy of the anti-rollback state, and appends a
+    non-secret audit record. The private seed is never printed or logged.
+    """
+    operator = _bounded_field(args.operator, "operator")
+    reason = _bounded_field(args.reason, "reason")
+    source_profile_id = _identifier(args.source_profile_id, "source profile id")
+    new_profile_id = _identifier(args.new_profile_id, "new profile id")
+    new_receipt_key_id = _identifier(args.new_receipt_key_id, "new receipt key id")
+    registry_out = Path(args.out)
+    receipt_key_out = Path(args.receipt_signing_key_out)
+    if registry_out == receipt_key_out:
+        raise SystemExit("registry and receipt key outputs must be different paths")
+
+    current_bytes = _secure_read_bytes(args.registry, label="policy registry")
+    registry = parse_registry_json(current_bytes)
+    policy_seed = _load_signing_seed(args.signing_key_file)
+    trusted = {
+        registry["signing_key_id"]: base64.b64decode(_public_key_b64(policy_seed))
+    }
+    now = datetime.now(UTC).replace(microsecond=0)
+    now_text = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    valid_until, valid_until_text = _parse_rollover_until(args.valid_until, now)
+    current_snapshot = verify_registry(
+        current_bytes,
+        trusted,
+        historical_at=now,
+        now=now,
+    )
+
+    profiles = registry.get("profiles")
+    keys = registry.get("receipt_signing_keys")
+    if not isinstance(profiles, list) or not isinstance(keys, list):
+        raise SystemExit("registry profiles or receipt signing keys are malformed")
+    if any(row.get("id") == new_profile_id for row in profiles if isinstance(row, dict)):
+        raise SystemExit("new profile id already exists")
+    if any(row.get("id") == new_receipt_key_id for row in keys if isinstance(row, dict)):
+        raise SystemExit("new receipt key id already exists")
+    source_profile = next(
+        (
+            row
+            for row in profiles
+            if isinstance(row, dict) and row.get("id") == source_profile_id
+        ),
+        None,
+    )
+    if source_profile is None or source_profile.get("kind") != "cpu_tdx":
+        raise SystemExit("source profile is not an existing CPU-TDX profile")
+    if source_profile.get("status") != "active":
+        raise SystemExit("source profile is not active")
+    current_policy = current_snapshot.to_policy(at=now)
+    if source_profile_id not in current_policy.registry_profile_ids:
+        raise SystemExit("source profile is not currently eligible")
+
+    doc = {
+        key: value
+        for key, value in registry.items()
+        if key not in ("signature", "signature_base64")
+    }
+    doc = json.loads(json.dumps(doc, sort_keys=True))
+    doc["release"] = int(registry["release"]) + 1
+    doc["generated_at"] = now_text
+    doc["valid_until"] = valid_until_text
+
+    new_profile = json.loads(json.dumps(source_profile, sort_keys=True))
+    new_profile["id"] = new_profile_id
+    new_profile["status"] = "active"
+    new_profile["status_changed_at"] = now_text
+    new_profile["valid_from"] = now_text
+    new_profile["valid_until"] = valid_until_text
+    new_profile["retire_at"] = None
+    profile_metadata = dict(new_profile.get("metadata", {}))
+    profile_metadata["rollover_from"] = source_profile_id
+    profile_metadata["rollover_release"] = doc["release"]
+    new_profile["metadata"] = profile_metadata
+    doc["profiles"].append(new_profile)
+
+    receipt_seed = secrets.token_bytes(32)
+    new_key = {
+        "id": new_receipt_key_id,
+        "algorithm": "ed25519",
+        "public_key_base64": _public_key_b64(receipt_seed),
+        "purpose": "assurance_receipt",
+        "status": "active",
+        "status_changed_at": now_text,
+        "valid_from": now_text,
+        "valid_until": valid_until_text,
+        "revoked_at": None,
+        "replacement_key_id": None,
+        "metadata": {
+            "rollover_from_profile": source_profile_id,
+            "rollover_release": doc["release"],
+        },
+    }
+    doc["receipt_signing_keys"].append(new_key)
+
+    metadata = dict(doc.get("metadata", {}))
+    rollovers = list(metadata.get("policy_rollovers", []))
+    rollovers.append(
+        {
+            "at": now_text,
+            "operator": operator,
+            "reason": reason,
+            "previous_release": int(registry["release"]),
+            "new_profile_id": new_profile_id,
+            "new_receipt_key_id": new_receipt_key_id,
+            "valid_until": valid_until_text,
+        }
+    )
+    metadata["policy_rollovers"] = rollovers[-MAX_ROLLOVER_AUDIT_ENTRIES:]
+    doc["metadata"] = metadata
+
+    signed = sign_registry(doc, policy_seed)
+    encoded = json.dumps(signed, separators=(",", ":"), sort_keys=True).encode()
+    successor_snapshot = verify_registry(encoded, trusted, now=now)
+    successor_snapshot.to_policy(at=now, max_age_seconds=86400)
+    future_policy = successor_snapshot.to_policy(
+        at=valid_until - timedelta(seconds=1)
+    )
+    if new_profile_id not in future_policy.registry_profile_ids:
+        raise SystemExit("new profile does not cover the requested window")
+    _prove_registry_successor(
+        current_snapshot=current_snapshot,
+        successor_snapshot=successor_snapshot,
+        current_release=int(registry["release"]),
+        state_path=args.state,
+    )
+
+    registry_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    receipt_public_digest = (
+        "sha256:"
+        + hashlib.sha256(base64.b64decode(new_key["public_key_base64"])).hexdigest()
+    )
+    record = {
+        "at": now_text,
+        "action": "policy_window_rolled_over",
+        "operator": operator,
+        "reason": reason,
+        "previous_release": int(registry["release"]),
+        "new_release": signed["release"],
+        "registry_digest": registry_digest,
+        "source_profile_id": source_profile_id,
+        "new_profile_id": new_profile_id,
+        "new_receipt_key_id": new_receipt_key_id,
+        "receipt_public_key_digest": receipt_public_digest,
+        "valid_from": now_text,
+        "valid_until": valid_until_text,
+    }
+
+    created: list[Path] = []
+    try:
+        _secure_write_new(
+            receipt_key_out,
+            base64.b64encode(receipt_seed) + b"\n",
+        )
+        created.append(receipt_key_out)
+        _secure_write_new(registry_out, encoded)
+        created.append(registry_out)
+        _secure_append_line(
+            Path(args.approval_log),
+            json.dumps(record, sort_keys=True),
+        )
+    except BaseException:
+        _remove_created(created)
+        raise
+
+    print(f"rollover release {signed['release']} written to {registry_out}")
+    print(f"registry_digest {registry_digest}")
+    print(
+        f"new profile {new_profile_id}; new receipt key {new_receipt_key_id} "
+        f"(private seed written securely to {receipt_key_out}, never printed)"
+    )
+    print(
+        "Existing profiles and receipt keys are preserved. Review and install "
+        "the registry, receipt key, and issuer key-id change as one bounded "
+        "operator transaction."
+    )
+    return 0
+
+
+def _secure_directory(path: Path, label: str) -> None:
+    before = path.lstat()
+    if not stat.S_ISDIR(before.st_mode) or path.is_symlink():
+        raise SystemExit(f"{label} must be a non-symlink directory")
+    if before.st_mode & 0o022:
+        raise SystemExit(f"{label} must not be group/world writable")
+    if hasattr(os, "geteuid") and before.st_uid != os.geteuid():
+        raise SystemExit(f"{label} must be owned by the invoking user")
+
+
+def _open_lock(path: Path) -> int:
+    """Open and exclusively lock a root/operator-owned local lock file."""
+    _secure_directory(path.parent, "lock directory")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit("republisher lock must be a regular file")
+        if info.st_mode & 0o077:
+            raise SystemExit("republisher lock must not be group/world accessible")
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise SystemExit("republisher lock must be owned by the invoking user")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return -1
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _install_registry_successor(
+    *,
+    registry_path: Path,
+    staging_path: Path,
+    current_bytes: bytes,
+    candidate_bytes: bytes,
+    history_dir: Path,
+    approval_log: Path,
+    method: str,
+    operator: str,
+    reason: str,
+) -> None:
+    """Durably install one verified successor while the shared lock is held.
+
+    The audit log is a two-record write-ahead journal. A crash before the
+    atomic replace leaves only ``install_prepared`` and the unchanged live
+    registry. A crash after replace leaves the new signed registry as the
+    source of truth and may omit ``install_committed``; operators reconcile
+    that exact digest and must never roll the release back.
+    """
+    current = parse_registry_json(current_bytes)
+    candidate = parse_registry_json(candidate_bytes)
+    current_digest = "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+    candidate_digest = "sha256:" + hashlib.sha256(candidate_bytes).hexdigest()
+    archive = history_dir / (
+        f"release-{int(current['release']):020d}-{current_digest.removeprefix('sha256:')}.json"
+    )
+    archive_exists = os.path.lexists(archive)
+    if archive_exists:
+        archived_bytes = _secure_read_bytes(
+            archive, label="existing policy history artifact"
+        )
+        if archived_bytes != current_bytes:
+            raise SystemExit("policy history path exists with different content")
+
+    # The global policy-writer lock is the supported-writer CAS contract.
+    # This exact-byte check catches an unsupported out-of-band write before
+    # any filesystem mutation. Every supported live-registry writer uses the
+    # same lock file.
+    if (
+        _secure_read_bytes(registry_path, label="installed policy registry")
+        != current_bytes
+    ):
+        raise SystemExit("installed registry changed during locked installation")
+
+    prepared_at = _now_iso()
+    prepared_record = {
+        "action": "policy_registry_install_prepared",
+        "at": prepared_at,
+        "method": method,
+        "operator": operator,
+        "reason": reason,
+        "previous_release": int(current["release"]),
+        "previous_registry_digest": current_digest,
+        "new_release": int(candidate["release"]),
+        "registry_digest": candidate_digest,
+    }
+    _secure_append_line(approval_log, json.dumps(prepared_record, sort_keys=True))
+
+    if not archive_exists:
+        _secure_write_new(archive, current_bytes)
+        os.chmod(archive, 0o644, follow_symlinks=False)
+        _fsync_parent(archive)
+
+    os.chmod(staging_path, 0o644, follow_symlinks=False)
+    os.replace(staging_path, registry_path)
+    _fsync_parent(registry_path)
+    installed = _secure_read_bytes(
+        registry_path, label="installed policy registry"
+    )
+    if installed != candidate_bytes:
+        raise SystemExit(
+            "installed registry does not match the verified candidate; "
+            "do not roll back, inspect the live signed release"
+        )
+
+    committed_record = {
+        **prepared_record,
+        "action": "policy_registry_install_committed",
+        "at": _now_iso(),
+        "prepared_at": prepared_at,
+    }
+    try:
+        _secure_append_line(
+            approval_log, json.dumps(committed_record, sort_keys=True)
+        )
+    except BaseException as exc:
+        raise SystemExit(
+            f"policy release {candidate['release']} is installed, but the "
+            "commit audit append failed; do not roll back, reconcile the "
+            f"live digest {candidate_digest}"
+        ) from exc
+
+
+def cmd_republish_install(args: argparse.Namespace) -> int:
+    """Atomically install one same-policy freshness reissue.
+
+    This is the narrow command intended for a systemd timer. It takes an
+    exclusive local lock, creates and verifies a monotonically higher signed
+    release through ``cmd_renew``, archives the exact outgoing registry, and
+    atomically replaces the live public registry. It never modifies the
+    anti-rollback state directly; the runtime accepts the successor on its
+    next ordinary epoch.
+    """
+    registry_path = Path(args.registry)
+    history_dir = Path(args.history_dir)
+    lock_descriptor = _open_lock(Path(args.lock_file))
+    if lock_descriptor == -1:
+        raise SystemExit("another policy writer holds the shared lock")
+
+    candidate: Path | None = None
+    try:
+        _secure_directory(registry_path.parent, "registry directory")
+        _secure_directory(history_dir, "policy history directory")
+        current_bytes = _secure_read_bytes(
+            registry_path, label="installed policy registry"
+        )
+        current = parse_registry_json(current_bytes)
+        policy_seed = _load_signing_seed(args.signing_key_file)
+        verify_registry(
+            current_bytes,
+            {
+                current["signing_key_id"]: base64.b64decode(
+                    _public_key_b64(policy_seed)
+                )
+            },
+            historical_at=datetime.now(UTC),
+        )
+        candidate = registry_path.parent / (
+            f".{registry_path.name}.candidate-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        renew_args = argparse.Namespace(
+            registry=str(registry_path),
+            signing_key_file=args.signing_key_file,
+            state=args.state,
+            operator=args.operator,
+            reason=args.reason,
+            approval_log=args.approval_log,
+            out=str(candidate),
+        )
+        cmd_renew(renew_args)
+        candidate_bytes = _secure_read_bytes(
+            candidate, label="candidate policy registry"
+        )
+        successor = parse_registry_json(candidate_bytes)
+        if int(successor["release"]) != int(current["release"]) + 1:
+            raise SystemExit("candidate release is not the exact next release")
+        verify_registry(
+            candidate_bytes,
+            {
+                successor["signing_key_id"]: base64.b64decode(
+                    _public_key_b64(policy_seed)
+                )
+            },
+            now=datetime.now(UTC),
+        )
+        _install_registry_successor(
+            registry_path=registry_path,
+            staging_path=candidate,
+            current_bytes=current_bytes,
+            candidate_bytes=candidate_bytes,
+            history_dir=history_dir,
+            approval_log=Path(args.approval_log),
+            method="scheduled_republication",
+            operator=_bounded_field(args.operator, "operator"),
+            reason=_bounded_field(args.reason, "reason"),
+        )
+        candidate = None
+        print(
+            f"installed policy release {successor['release']} atomically; "
+            f"archived release {current['release']}"
+        )
+        return 0
+    finally:
+        if candidate is not None:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                _fsync_parent(candidate)
+        os.close(lock_descriptor)
+
+
+def cmd_install_candidate(args: argparse.Namespace) -> int:
+    """Install one operator-reviewed signed registry through the shared lock."""
+    operator = _bounded_field(args.operator, "operator")
+    reason = _bounded_field(args.reason, "reason")
+    expected_current = _require_digest_arg(
+        args.expected_current_digest, "expected current registry digest"
+    )
+    expected_candidate = _require_digest_arg(
+        args.expected_candidate_digest, "expected candidate registry digest"
+    )
+    registry_path = Path(args.registry)
+    history_dir = Path(args.history_dir)
+    lock_descriptor = _open_lock(Path(args.lock_file))
+    if lock_descriptor == -1:
+        raise SystemExit("another policy writer holds the shared lock")
+
+    staging: Path | None = None
+    try:
+        _secure_directory(registry_path.parent, "registry directory")
+        _secure_directory(history_dir, "policy history directory")
+        current_bytes = _secure_read_bytes(
+            registry_path, label="installed policy registry"
+        )
+        candidate_bytes = _secure_read_bytes(
+            args.candidate, label="candidate policy registry"
+        )
+        if "sha256:" + hashlib.sha256(current_bytes).hexdigest() != expected_current:
+            raise SystemExit("installed registry does not match the reviewed digest")
+        if (
+            "sha256:" + hashlib.sha256(candidate_bytes).hexdigest()
+            != expected_candidate
+        ):
+            raise SystemExit("candidate registry does not match the reviewed digest")
+
+        current = parse_registry_json(current_bytes)
+        candidate = parse_registry_json(candidate_bytes)
+        if int(candidate["release"]) != int(current["release"]) + 1:
+            raise SystemExit("candidate release is not the exact next release")
+        seed = _load_signing_seed(args.signing_key_file)
+        trusted = {
+            current["signing_key_id"]: base64.b64decode(_public_key_b64(seed))
+        }
+        now = datetime.now(UTC)
+        current_snapshot = verify_registry(
+            current_bytes, trusted, historical_at=now, now=now
+        )
+        successor_snapshot = verify_registry(candidate_bytes, trusted, now=now)
+        _prove_registry_successor(
+            current_snapshot=current_snapshot,
+            successor_snapshot=successor_snapshot,
+            current_release=int(current["release"]),
+            state_path=args.state,
+        )
+
+        staging = registry_path.parent / (
+            f".{registry_path.name}.operator-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        _secure_write_new(staging, candidate_bytes)
+        _install_registry_successor(
+            registry_path=registry_path,
+            staging_path=staging,
+            current_bytes=current_bytes,
+            candidate_bytes=candidate_bytes,
+            history_dir=history_dir,
+            approval_log=Path(args.approval_log),
+            method="operator_reviewed_candidate",
+            operator=operator,
+            reason=reason,
+        )
+        staging = None
+        print(
+            f"installed reviewed policy release {candidate['release']} "
+            f"with digest {expected_candidate}"
+        )
+        return 0
+    finally:
+        if staging is not None:
+            try:
+                staging.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                _fsync_parent(staging)
+        os.close(lock_descriptor)
+
+
+def _require_digest_arg(value: str, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+        raise SystemExit(f"{label} must be a canonical sha256 digest")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -477,6 +1101,55 @@ def build_parser() -> argparse.ArgumentParser:
              "against a temporary COPY of it (the live file is never touched)",
     )
     renew.set_defaults(func=cmd_renew)
+
+    rollover = sub.add_parser(
+        "rollover",
+        help="prepare a bounded new CPU-TDX profile and receipt-key window",
+    )
+    rollover.add_argument("--registry", required=True)
+    rollover.add_argument("--signing-key-file", required=True)
+    rollover.add_argument("--state")
+    rollover.add_argument("--source-profile-id", required=True)
+    rollover.add_argument("--new-profile-id", required=True)
+    rollover.add_argument("--new-receipt-key-id", required=True)
+    rollover.add_argument("--valid-until", required=True)
+    rollover.add_argument("--operator", required=True)
+    rollover.add_argument("--reason", required=True)
+    rollover.add_argument("--approval-log", required=True)
+    rollover.add_argument("--out", required=True)
+    rollover.add_argument("--receipt-signing-key-out", required=True)
+    rollover.set_defaults(func=cmd_rollover)
+
+    republish = sub.add_parser(
+        "republish-install",
+        help="atomically install a locked same-policy freshness reissue",
+    )
+    republish.add_argument("--registry", required=True)
+    republish.add_argument("--signing-key-file", required=True)
+    republish.add_argument("--state", required=True)
+    republish.add_argument("--operator", required=True)
+    republish.add_argument("--reason", required=True)
+    republish.add_argument("--approval-log", required=True)
+    republish.add_argument("--history-dir", required=True)
+    republish.add_argument("--lock-file", required=True)
+    republish.set_defaults(func=cmd_republish_install)
+
+    install = sub.add_parser(
+        "install-candidate",
+        help="install a reviewed signed registry through the shared policy-writer lock",
+    )
+    install.add_argument("--registry", required=True)
+    install.add_argument("--candidate", required=True)
+    install.add_argument("--signing-key-file", required=True)
+    install.add_argument("--state", required=True)
+    install.add_argument("--expected-current-digest", required=True)
+    install.add_argument("--expected-candidate-digest", required=True)
+    install.add_argument("--operator", required=True)
+    install.add_argument("--reason", required=True)
+    install.add_argument("--approval-log", required=True)
+    install.add_argument("--history-dir", required=True)
+    install.add_argument("--lock-file", required=True)
+    install.set_defaults(func=cmd_install_candidate)
     return parser
 
 

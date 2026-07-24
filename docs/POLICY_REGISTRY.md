@@ -114,6 +114,92 @@ the receipt time falls inside that registry's validity window. That historical
 check does not update the admission high-water mark and never makes the old
 release current again.
 
+## Freshness republication and window rollover
+
+Production admission keeps a hard 24-hour maximum registry age. Do not widen
+that ceiling. Reissue the same policy at a higher release before the ceiling:
+
+```bash
+python scripts/cathedral_measurement_approval.py republish-install \
+  --registry /etc/cathedral/policy-registry-sn39.json \
+  --signing-key-file /etc/cathedral/policy-signing-sn39.key \
+  --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite \
+  --operator cathedral-sn39-systemd \
+  --reason "scheduled bounded 24-hour freshness reissue" \
+  --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl \
+  --history-dir /var/lib/cathedral-confidential-sn39/policy-history \
+  --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
+```
+
+`republish-install` takes a nonblocking local lock, proves the exact successor
+against a temporary copy of the rollback state, archives the outgoing signed
+registry, and atomically installs the verified next release. It never writes
+the anti-rollback state; the ordinary runtime accepts the new release. The
+example systemd service and timer under `examples/systemd/` run every 12 hours
+with a bounded randomized delay. Lock contention is a failed run, not a silent
+success; the example service retries failures after five minutes. Create the
+history directory as root-owned mode `0700` before enabling the timer. Run the
+service once manually and prove the next runtime epoch records the new release
+before relying on the timer.
+The audit log is a write-ahead journal: `registry_reissue_prepared` and
+`policy_registry_install_prepared` precede the filesystem commit, while
+`policy_registry_install_committed` follows it. After an interrupted run,
+compare the live signed-registry digest with those records; never roll back an
+already installed higher release.
+
+Fresh republication cannot extend immutable registry, profile, or receipt-key
+validity windows. Before those windows expire, prepare an explicit bounded
+rollover:
+
+```bash
+python scripts/cathedral_measurement_approval.py rollover \
+  --registry /etc/cathedral/policy-registry-sn39.json \
+  --signing-key-file /etc/cathedral/policy-signing-sn39.key \
+  --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite \
+  --source-profile-id cpu-tdx-sn39-v1 \
+  --new-profile-id cpu-tdx-sn39-v2 \
+  --new-receipt-key-id cathedral-receipt-sn39-YYYYMMDD \
+  --valid-until 2026-10-22T00:00:00Z \
+  --operator "<operator>" \
+  --reason "<reviewed reason>" \
+  --approval-log /var/lib/cathedral-confidential-sn39/policy-rollovers.jsonl \
+  --out /root/policy-registry-sn39.next.json \
+  --receipt-signing-key-out /root/receipt-signing-sn39.next.key
+```
+
+The requested window must be 7–180 days from issuance. The command clones the
+currently eligible CPU-TDX profile's measurements and security controls under
+a new ID, adds a new Ed25519 receipt public key, retains all historical
+profiles and keys, verifies the signed successor, and leaves live files
+untouched. Review the diff and install the new registry, private receipt seed,
+and runtime key ID as one bounded operator transaction.
+
+Every supported writer of the live registry must use the same
+`--lock-file`. Direct `cp`, `mv`, or editor writes to the live path are
+unsupported because they can race the timer. Stage the newly generated receipt
+seed under its final unique mode-0600 path first, then install the reviewed
+registry through the shared lock:
+
+```bash
+python scripts/cathedral_measurement_approval.py install-candidate \
+  --registry /etc/cathedral/policy-registry-sn39.json \
+  --candidate /root/policy-registry-sn39.next.json \
+  --signing-key-file /etc/cathedral/policy-signing-sn39.key \
+  --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite \
+  --expected-current-digest sha256:<reviewed-current-digest> \
+  --expected-candidate-digest sha256:<digest-printed-by-rollover> \
+  --operator "<operator>" \
+  --reason "<reviewed installation reason>" \
+  --approval-log /var/lib/cathedral-confidential-sn39/policy-rollovers.jsonl \
+  --history-dir /var/lib/cathedral-confidential-sn39/policy-history \
+  --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
+```
+
+Only after the runtime has accepted that registry should the receipt issuer be
+switched to the already staged new key ID/path; the old key remains valid
+during the overlap. Never publish, log, or copy the private seed into a command
+line.
+
 The committed sample contains placeholders only. Its deterministic test key is
 intentionally reproducible and must never be configured as a production trust
 root. It contains no production measurement, endpoint, platform identifier, or

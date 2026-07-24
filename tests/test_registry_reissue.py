@@ -259,7 +259,7 @@ def test_reissue_preserves_every_security_field_and_restores_freshness(reissued)
     assert record["reissued_at"] == document["generated_at"]
     logged = json.loads(log_path.read_text().strip().splitlines()[-1])
     assert logged["previous_release"] == original["release"]
-    assert logged["action"] == "registry_reissued"
+    assert logged["action"] == "registry_reissue_prepared"
     assert logged["new_release"] == snapshot.release
     # Secure output file semantics.
     assert (out_path.stat().st_mode & 0o777) == 0o600
