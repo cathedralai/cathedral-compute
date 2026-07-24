@@ -1245,6 +1245,12 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
     ledger = Ledger(args.ledger_db)
     try:
         epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
+        epoch_row = ledger.get_epoch(epoch_id)
+        if epoch_row is None or epoch_row["status"] != "published":
+            raise ValueError(
+                f"epoch {epoch_id} is not published/frozen; public export "
+                "requires a published epoch even with an explicit --epoch-id"
+            )
         export = ledger.get_score_class_export(
             epoch_id,
             network=args.score_network,
@@ -1335,6 +1341,13 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         ]
 
         wire_digest = str(snapshot["report_digest"]).removeprefix("sha256:")
+        # Deterministic manifest bytes: generated_at derives from the FROZEN
+        # epoch generation time, so an exact retry reproduces byte-identical
+        # blobs and the idempotent store paths succeed.
+        frozen_generated = datetime.datetime.fromisoformat(
+            str(snapshot["generated_at"]).replace("Z", "+00:00")  # noqa: FURB162 - ledger text may carry either suffix
+        ).astimezone(datetime.UTC)
+        manifest_generated_at = frozen_generated.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         candidate_rows = [
             {
                 "hotkey": str(row["hotkey"]),
@@ -1350,7 +1363,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             netuid=args.score_netuid,
             source_epoch=int(snapshot["source_epoch"]),
             epoch_id=epoch_id,
-            generated_at=None,
+            generated_at=manifest_generated_at,
             mechanism_id=args.mechanism,
             mechanism_revision=args.mechanism_revision,
             source_revision=args.source_revision,
@@ -1377,9 +1390,6 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             },
             wire_report_sha256=wire_digest,
         )
-        manifest_digest = store.put_blob(manifest_bytes)
-        store.put_epoch_copy(int(snapshot["source_epoch"]), manifest_bytes)
-
         index_seed = _load_private_seed(
             args.index_signing_key_file,
             production_mode=not args.development,
@@ -1424,6 +1434,12 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         # the latest pointer or history.
         index_txn = store.index_transaction()
         index_txn.__enter__()
+        # The manifest blob and immutable epoch copy publish inside the SAME
+        # critical section as the index update: a crash after the copy but
+        # before the index leaves only immutable artifacts, and the next
+        # export's rebuild-from-manifests recovery re-references them.
+        manifest_digest = store.put_blob(manifest_bytes)
+        store.put_epoch_copy(int(snapshot["source_epoch"]), manifest_bytes)
         recent: list[dict[str, object]] = []
         existing_index = index_txn.read()
         if existing_index is not None:
@@ -1630,6 +1646,41 @@ def _strict_json_object(data: bytes, label: str) -> dict:
     return document
 
 
+def _read_retained_blob(blob_path: Path, digest: str) -> bytes:
+    """No-follow open of a retained blob with regular/owner/0600/content
+    validation before acceptance — a drifted 0644 or foreign blob refuses."""
+    import stat as stat_module
+
+    from cathedral.evidence import EvidenceError, digest_bytes
+
+    if not os.path.lexists(blob_path):
+        raise EvidenceError(f"retained envelope {digest} is unavailable")
+    before = os.lstat(blob_path)
+    if stat_module.S_ISLNK(before.st_mode) or not stat_module.S_ISREG(before.st_mode):
+        raise EvidenceError(f"retained envelope {digest} must be a regular file")
+    if before.st_mode & 0o077:
+        raise EvidenceError(f"retained envelope {digest} has unsafe permissions")
+    if hasattr(os, "geteuid") and before.st_uid != os.geteuid():
+        raise EvidenceError(f"retained envelope {digest} has foreign ownership")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(blob_path, flags)
+    try:
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise EvidenceError(f"retained envelope {digest} changed underneath")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            data = handle.read(4 * 1024 * 1024 + 1)
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    if len(data) > 4 * 1024 * 1024:
+        raise EvidenceError(f"retained envelope {digest} is oversized")
+    if digest_bytes(data) != digest:
+        raise EvidenceError(f"retained envelope {digest} is corrupt")
+    return data
+
+
 def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
     """Package controlled-disclosure envelopes for an authorized validator.
 
@@ -1643,7 +1694,7 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
     """
     import tempfile as tempfile_module
 
-    from cathedral.evidence import EvidenceError, digest_bytes
+    from cathedral.evidence import digest_bytes
 
     ledger = Ledger(args.ledger_db)
     staging: str | None = None
@@ -1681,11 +1732,7 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
         for row in rows:
             digest = str(row["envelope_digest"])
             blob_path = retention_root / "blobs" / "sha256" / digest.split(":", 1)[1]
-            if blob_path.is_symlink() or not blob_path.is_file():
-                raise EvidenceError(f"retained envelope {digest} is unavailable")
-            data = blob_path.read_bytes()
-            if digest_bytes(data) != digest:
-                raise EvidenceError(f"retained envelope {digest} is corrupt")
+            data = _read_retained_blob(blob_path, digest)
             envelopes.append(
                 (
                     digest,
@@ -1707,24 +1754,55 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
         manifest_text = json.dumps(controlled_manifest, sort_keys=True, indent=2)
 
         if out_root.exists():
-            # Idempotent EXACT retry: identical manifest bytes => success.
-            existing = out_root / "controlled-manifest.json"
-            if existing.is_file() and existing.read_text() == manifest_text:
-                print(
-                    json.dumps(
-                        {
-                            "epoch_id": epoch_id,
-                            "envelopes": len(envelopes),
-                            "out": str(out_root),
-                            "replayed": True,
-                        },
-                        sort_keys=True,
-                    )
+            # Idempotent EXACT retry only when the COMPLETE package validates:
+            # directory type/owner/mode, the manifest text, and every envelope
+            # file present as a regular non-symlink 0600 owned file whose
+            # bytes hash to the manifest digest. Anything missing or unsafe
+            # fails closed — never a false "replayed" success.
+            root_stat = os.lstat(out_root)
+            import stat as stat_module
+
+            if (
+                stat_module.S_ISLNK(root_stat.st_mode)
+                or not stat_module.S_ISDIR(root_stat.st_mode)
+                or root_stat.st_mode & 0o077
+                or (hasattr(os, "geteuid") and root_stat.st_uid != os.geteuid())
+            ):
+                raise ValueError(
+                    "existing controlled output directory is unsafe; refusing"
                 )
-                return 0
-            raise ValueError(
-                "controlled output path exists with different content; refusing"
+            existing = out_root / "controlled-manifest.json"
+            if not existing.is_file() or existing.read_text() != manifest_text:
+                raise ValueError(
+                    "controlled output path exists with different content; refusing"
+                )
+            for digest, data, _entry in envelopes:
+                candidate = out_root / f"{digest.split(':', 1)[1]}.json"
+                file_stat = os.lstat(candidate) if os.path.lexists(candidate) else None
+                if (
+                    file_stat is None
+                    or stat_module.S_ISLNK(file_stat.st_mode)
+                    or not stat_module.S_ISREG(file_stat.st_mode)
+                    or file_stat.st_mode & 0o077
+                    or (hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid())
+                    or digest_bytes(candidate.read_bytes()) != digest
+                ):
+                    raise ValueError(
+                        f"controlled package is incomplete or unsafe at {digest}; "
+                        "refusing to report an exact replay"
+                    )
+            print(
+                json.dumps(
+                    {
+                        "epoch_id": epoch_id,
+                        "envelopes": len(envelopes),
+                        "out": str(out_root),
+                        "replayed": True,
+                    },
+                    sort_keys=True,
+                )
             )
+            return 0
 
         staging = tempfile_module.mkdtemp(
             prefix=f".controlled.{epoch_id}.", dir=parent
@@ -1769,6 +1847,70 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
 
             shutil.rmtree(staging, ignore_errors=True)
         ledger.close()
+
+
+def _update_fences_monotonic(
+    fence_path: Path, new_epoch: int, new_manifest: str
+) -> None:
+    """One flocked read/compare/write transaction for the durable fences.
+
+    Monotonic: a concurrent writer that verified an OLDER index cannot roll
+    the high-water back (epoch 12 then 11 ends at 12); the same epoch with a
+    different manifest never overwrites. Unique temp names, safe stale-temp
+    cleanup under the lock, fsynced file and parent.
+    """
+    import fcntl
+
+    fence_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = fence_path.with_suffix(".lock")
+    lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        current: dict = {}
+        if os.path.lexists(fence_path):
+            if fence_path.is_symlink() or not fence_path.is_file():
+                raise ValueError("verifier state file must be a regular file")
+            current = json.loads(fence_path.read_text())
+        stored_epoch = current.get("index_source_epoch")
+        if isinstance(stored_epoch, int):
+            if new_epoch < stored_epoch:
+                return  # keep the newer high-water; never move backwards
+            if (
+                new_epoch == stored_epoch
+                and current.get("index_manifest") != new_manifest
+            ):
+                return  # same-epoch different manifest never overwrites
+        current.update(
+            {"index_source_epoch": new_epoch, "index_manifest": new_manifest}
+        )
+        # Stale unique temps from crashed writers are safe to clear under
+        # the lock; the write itself uses a fresh unique name.
+        for stale in fence_path.parent.glob(fence_path.name + ".*.tmp"):
+            if not stale.is_symlink():
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+        fence_tmp = fence_path.with_name(
+            f"{fence_path.name}.{os.getpid()}.tmp"
+        )
+        descriptor = os.open(
+            fence_tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(current, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(fence_tmp, fence_path)
+        parent = os.open(fence_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        os.close(lock_descriptor)
 
 
 def cmd_provenance_verify(args: argparse.Namespace) -> int:
@@ -1885,11 +2027,18 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         manifest = parse_manifest(load_blob(manifest_digest))
         if manifest["network"] != args.network or manifest["netuid"] != args.netuid:
             raise EvidenceError("evidence manifest network/netuid mismatch")
-        if args.source_epoch is None and int(manifest["source_epoch"]) != int(
-            index_document["latest"]["source_epoch"]
-        ):
+        if args.source_epoch is None:
+            if int(manifest["source_epoch"]) != int(
+                index_document["latest"]["source_epoch"]
+            ):
+                raise EvidenceError(
+                    "index latest.source_epoch does not match the manifest it "
+                    "points to"
+                )
+        elif int(manifest["source_epoch"]) != int(args.source_epoch):
             raise EvidenceError(
-                "index latest.source_epoch does not match the manifest it points to"
+                "selected historical index row does not match its manifest's "
+                "source epoch"
             )
 
         # Durable anti-rollback fences: a signed-but-older index or a
@@ -1980,6 +2129,10 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             raise EvidenceError("verified registry release differs from the manifest")
         if result.report_id != manifest["score_report"]["report_id"]:
             raise EvidenceError("verified report id differs from the manifest")
+        if int(result.source_epoch) != int(manifest["source_epoch"]):
+            raise EvidenceError(
+                "verified report source epoch differs from the manifest"
+            )
         pinned_revision = getattr(args, "source_revision", None)
         if pinned_revision and manifest["source_revision"] != pinned_revision:
             raise EvidenceError(
@@ -2172,25 +2325,11 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 ),
             )
         if fence_path is not None and audit["result"] in ("PASS", "NOT_PROVEN"):
-            fences.update(
-                {
-                    "index_source_epoch": int(
-                        index_document["latest"]["source_epoch"]
-                    ),
-                    "index_manifest": index_document["latest"]["manifest"],
-                }
+            _update_fences_monotonic(
+                fence_path,
+                int(index_document["latest"]["source_epoch"]),
+                str(index_document["latest"]["manifest"]),
             )
-            fence_tmp = fence_path.with_suffix(".tmp")
-            descriptor = os.open(
-                fence_tmp,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(fences, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(fence_tmp, fence_path)
         if args.audit_out:
             Path(args.audit_out).expanduser().write_text(
                 json.dumps(audit, sort_keys=True, indent=2) + "\n"

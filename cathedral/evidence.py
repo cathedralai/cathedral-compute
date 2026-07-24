@@ -713,7 +713,20 @@ class RetentionStore:
         self.root.mkdir(parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
         if path.exists():
-            # Validate pre-existing bytes instead of trusting the name.
+            # Validate pre-existing blobs fully before acceptance: regular,
+            # owned, private (no drifted 0644), and content-correct.
+            import stat as stat_module
+
+            metadata = os.lstat(path)
+            if (
+                stat_module.S_ISLNK(metadata.st_mode)
+                or not stat_module.S_ISREG(metadata.st_mode)
+                or metadata.st_mode & 0o077
+                or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+            ):
+                raise EvidenceError(
+                    f"retained blob {digest} is unsafe on disk (mode/owner/type)"
+                )
             if digest_bytes(path.read_bytes()) != digest:
                 raise EvidenceError(f"retained blob {digest} is corrupt on disk")
         else:

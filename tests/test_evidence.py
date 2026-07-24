@@ -674,3 +674,34 @@ def test_retention_is_mandatory_when_configured_and_in_production(tmp_path: Path
             "public-hotkey",
         )
     assert not (tmp_path / "retained2" / "log.jsonl").exists()
+
+
+def test_fence_update_is_monotonic_under_out_of_order_writers(tmp_path: Path):
+    """Counterexample G: epoch 12 then a late writer with 11 must end at 12;
+    same-epoch different manifest never overwrites."""
+    from cathedral.cli import _update_fences_monotonic
+
+    fence = tmp_path / "fences.json"
+    _update_fences_monotonic(fence, 12, "sha256:" + "a" * 64)
+    _update_fences_monotonic(fence, 11, "sha256:" + "b" * 64)  # late, older
+    state = json.loads(fence.read_text())
+    assert state["index_source_epoch"] == 12
+    assert state["index_manifest"] == "sha256:" + "a" * 64
+    _update_fences_monotonic(fence, 12, "sha256:" + "c" * 64)  # equivocation
+    state = json.loads(fence.read_text())
+    assert state["index_manifest"] == "sha256:" + "a" * 64
+    # Stale crash-left temp is cleared and does not brick the writer.
+    (tmp_path / "fences.json.99999.tmp").write_text("stale")
+    _update_fences_monotonic(fence, 13, "sha256:" + "d" * 64)
+    assert json.loads(fence.read_text())["index_source_epoch"] == 13
+
+
+def test_retention_store_rejects_drifted_blob_permissions(tmp_path: Path):
+    """Counterexample L: an existing retained blob that drifted to 0644 is
+    refused, not silently accepted."""
+    retention = RetentionStore(tmp_path / "retained")
+    digest = retention.retain(b"raw-quote-bytes", kind="admission_evidence")
+    blob = tmp_path / "retained" / "blobs" / "sha256" / digest.split(":", 1)[1]
+    blob.chmod(0o644)
+    with pytest.raises(EvidenceError, match="unsafe on disk"):
+        retention.retain(b"raw-quote-bytes", kind="admission_evidence")
