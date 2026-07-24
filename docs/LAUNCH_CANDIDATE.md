@@ -15,7 +15,7 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 | 5. TTY + JSONL logs | IMPLEMENTED, locally tested | hardened EventLoggers both repos (recursive redaction, control-char neutralization, 0600 O_NOFOLLOW) |
 | 6. Adversarial + live proof | PARTIAL | adversarial suites green (confidential 1162 passed / 1 skipped; subnet two-mode 24 incl. work-replay, derived-challenge, and fence counterexamples); LIVE mainnet proof NOT PROVEN (deploy blocked) |
 | 7. Clean external reproduction | NOT PROVEN | docs/PROVENANCE.md documents the one-command path; requires deployed evidence surface + published key bundle |
-| 8. Operator/release docs + checklist | THIS FILE + docs/PROVENANCE.md + MRTD/BUDGET docs; release pinning pending review |
+| 8. Operator/release docs + checklist | THIS FILE + docs/PROVENANCE.md (one-command reproduction + acceptance semantics) + docs/MRTD.md (measurement/TCB policy + rollback) + docs/BUDGET.md (fixed spend/burn controls + security exceptions); reference integrity enforced by tests/test_docs_integrity.py; release pinning pending review |
 
 ## Precise NOT PROVEN items (blocking launch acceptance)
 
