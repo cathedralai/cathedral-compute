@@ -1146,7 +1146,7 @@ def test_cli_full_replay_wires_anchor_and_all_rejected_state(
     capsys.readouterr()
     assert code == 0
     assert real is not provenance_module.replay_positive_miners
-    assert captured["candidates_all_rejected"] is False
+    assert captured["candidate_outcomes"] == {"public-hotkey": "verified"}
     assert captured["challenge_anchor"] == {
         "block": 100,
         "block_hash": "0x" + "ab" * 32,
@@ -1585,18 +1585,49 @@ def test_bounded_local_reads_fail_closed(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_artifact_ceiling_is_coherent_with_the_manifest_cardinality():
-    """Finding 2 boundary: the command artifact cap must admit the maximal
-    valid epoch — index/manifest/registry/report/verifier (+ publisher
-    vector) overhead plus THREE artifacts per positive receipt at the
-    manifest's supported candidate cardinality — and refuse one past the
-    ceiling. The old 256 cap starved valid epochs above 84 miners."""
+def test_artifact_and_byte_budgets_are_coherent_with_the_manifest_grammar():
+    """Repair 7: the manifest grammar and the verifier's aggregate budget
+    are ONE derived contract. The worst-case maximal valid epoch — every
+    artifact at its per-kind cap, FULL mode included — must fit the 64 MiB
+    aggregate and the artifact ceiling; one receipt past the grammar bound
+    refuses. No cap here is ever multi-gigabyte."""
+    from cathedral import replay, workproof
     from cathedral.cli import COMMAND_ARTIFACT_OVERHEAD, MAX_COMMAND_ARTIFACTS, _FetchBudget
-    from cathedral.evidence import MAX_MANIFEST_CANDIDATES
+    from cathedral.evidence import (
+        MAX_CONTROLLED_ENVELOPE_BYTES,
+        MAX_MANIFEST_RECEIPTS,
+        MAX_RECEIPT_ARTIFACT_BYTES,
+        MAX_VERIFIER_ARTIFACT_BYTES,
+        MAX_WORK_ITEM_ARTIFACT_BYTES,
+        PER_VERIFIED_CANDIDATE_BYTES,
+        VERIFY_AGGREGATE_BUDGET_BYTES,
+        VERIFY_FIXED_OVERHEAD_BYTES,
+    )
+    from cathedral.receipt import MAX_RECEIPT_BYTES
 
-    fixed_overhead = 6  # index, manifest, registry, report, verifier, vector
-    supported_maximum = fixed_overhead + 3 * MAX_MANIFEST_CANDIDATES
-    assert supported_maximum > 256  # the exact starvation the finding names
+    # Byte coherence: worst-case fixed overhead plus the supported verified
+    # cardinality at worst-case per-candidate cost fits the aggregate.
+    worst_case = VERIFY_FIXED_OVERHEAD_BYTES + (
+        MAX_MANIFEST_RECEIPTS * PER_VERIFIED_CANDIDATE_BYTES
+    )
+    assert worst_case <= VERIFY_AGGREGATE_BUDGET_BYTES
+    assert (
+        VERIFY_FIXED_OVERHEAD_BYTES + (MAX_MANIFEST_RECEIPTS + 1) * PER_VERIFIED_CANDIDATE_BYTES
+        > VERIFY_AGGREGATE_BUDGET_BYTES
+    )  # the derived bound is tight, not arbitrary
+    assert MAX_MANIFEST_RECEIPTS >= 16  # launch-safe floor
+    assert VERIFY_AGGREGATE_BUDGET_BYTES == 64 * 1024 * 1024  # never raised
+    # Per-kind caps stay within the defensive parser ceilings they feed.
+    assert MAX_VERIFIER_ARTIFACT_BYTES == replay.MAX_VERIFIER_BINARY_BYTES
+    assert MAX_CONTROLLED_ENVELOPE_BYTES <= replay.MAX_ENVELOPE_BYTES
+    assert MAX_RECEIPT_ARTIFACT_BYTES <= MAX_RECEIPT_BYTES
+    assert MAX_WORK_ITEM_ARTIFACT_BYTES <= workproof.MAX_WORK_ARTIFACT_BYTES
+
+    # Artifact-count coherence: index + manifest + registry + report +
+    # verifier + vector + snapshot overhead, plus receipt + two work
+    # artifacts + one envelope per verified candidate.
+    fixed_overhead = 7
+    supported_maximum = fixed_overhead + 4 * MAX_MANIFEST_RECEIPTS
     assert COMMAND_ARTIFACT_OVERHEAD >= fixed_overhead
     assert MAX_COMMAND_ARTIFACTS >= supported_maximum
 
@@ -1612,13 +1643,15 @@ def test_artifact_ceiling_is_coherent_with_the_manifest_cardinality():
 
 
 def test_manifest_candidate_and_receipt_cardinality_boundaries():
-    """Finding 2 grammar half: the manifest accepts exactly the supported
-    cardinality and rejects one over it, for candidates AND receipts."""
-    from cathedral.evidence import MAX_MANIFEST_CANDIDATES
+    """Repair 7 grammar half: the manifest accepts exactly the supported
+    cardinality and rejects one over it — for candidate rows, receipt
+    rows, AND the count of verified outcomes (each verified candidate
+    costs receipt + work artifacts + envelope in the byte budget)."""
+    from cathedral.evidence import MAX_MANIFEST_CANDIDATES, MAX_MANIFEST_RECEIPTS
 
     registry_blob = digest_bytes(REGISTRY_BYTES)
 
-    def build(candidate_count: int, receipt_count: int = 0) -> bytes:
+    def build(candidate_count: int, receipt_count: int = 0, verified_count: int = 0) -> bytes:
         return build_manifest(
             network=NETWORK,
             netuid=NETUID,
@@ -1655,8 +1688,10 @@ def test_manifest_candidate_and_receipt_cardinality_boundaries():
                 "candidates": [
                     {
                         "hotkey": f"miner-{index}",
-                        "outcome": "rejected",
-                        "reason": "no_verified_work",
+                        "outcome": ("verified" if index < verified_count else "rejected"),
+                        "reason": (
+                            "receipt_verified" if index < verified_count else "no_verified_work"
+                        ),
                     }
                     for index in range(candidate_count)
                 ],
@@ -1668,8 +1703,12 @@ def test_manifest_candidate_and_receipt_cardinality_boundaries():
     parse_manifest(build(MAX_MANIFEST_CANDIDATES))
     with pytest.raises(EvidenceError, match="candidates list is invalid"):
         build(MAX_MANIFEST_CANDIDATES + 1)
+    parse_manifest(build(1, receipt_count=MAX_MANIFEST_RECEIPTS))
     with pytest.raises(EvidenceError, match="receipts is invalid"):
-        build(1, receipt_count=MAX_MANIFEST_CANDIDATES + 1)
+        build(1, receipt_count=MAX_MANIFEST_RECEIPTS + 1)
+    parse_manifest(build(MAX_MANIFEST_RECEIPTS, verified_count=MAX_MANIFEST_RECEIPTS))
+    with pytest.raises(EvidenceError, match="verified-candidate count exceeds"):
+        build(MAX_MANIFEST_RECEIPTS + 1, verified_count=MAX_MANIFEST_RECEIPTS + 1)
 
 
 def test_cli_verify_artifact_accounting_three_per_receipt_plus_overhead(
@@ -1741,17 +1780,56 @@ def test_export_evidence_requires_source_revision_before_any_publication(tmp_pat
 VECTOR_SEED = bytes(range(128, 160))
 
 
-def _signed_wire_vector(rows: list[dict], *, burn_percentage: float = 10.0) -> bytes:
+WIRE_BURN_HOTKEY = "burn-destination-hotkey"
+
+
+def _signed_wire_vector(rows: list[dict], *, source_epoch: int = 11) -> bytes:
     """A publisher wire vector signed exactly as the thin validator (and
-    _verify_wire_vector) expects: ed25519 over sorted compact JSON minus
-    ``signature``."""
+    _verify_wire_vector) expects — ed25519 over sorted compact JSON minus
+    ``signature`` — carrying the REAL validated_supply_v1 launch shape:
+    pre-burn confidential_primary rows, burn_uid null with the configured
+    burn hotkey, fixed 10% burn, and the signed policy/ingest blocks."""
+    positive = any(float(row.get("weight") or 0.0) > 0.0 for row in rows)
     body = {
         "key_id": "cathedral-weight-policy",
         "network": NETWORK,
         "netuid": NETUID,
         "vector_id": "vector-test-1",
         "expires_at": (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "burn_snapshot": {"burn_uid": 0, "forced_burn_percentage": burn_percentage},
+        "burn_snapshot": {
+            "burn_uid": None,
+            "burn_hotkey": WIRE_BURN_HOTKEY,
+            "forced_burn_percentage": 10.0,
+        },
+        "policy_metadata": {
+            "score_source": "confidential_primary:cathedral_confidential_tdx",
+            "validated_supply": {
+                "contract_version": "v1",
+                "intel_tdx_allocation": 0.90,
+                "verified_gpu_allocation": 0.10,
+                "verified_gpu_admitted": False,
+                "burn_hotkey": WIRE_BURN_HOTKEY,
+            },
+            "confidential_primary": {
+                "contract_version": "v1",
+                "mode": "confidential_primary",
+                "source": "cathedral_confidential_tdx",
+                "base_mass": 0.0,
+                "confidential_mass": 1.0 if positive else 0.0,
+                "complete": True,
+                "fresh": True,
+                "confirmed": True,
+            },
+            "external_scores": {
+                "enabled": True,
+                "source": "cathedral_confidential_tdx",
+                "mode": "confidential_primary",
+                "latest_epoch": source_epoch,
+                "latest_complete": True,
+                "latest_fresh": True,
+                "latest_report_sha256": "11" * 32,
+            },
+        },
         "weights": [dict(row) for row in rows],
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -1789,7 +1867,7 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
     state_path = tmp_path / "verifier-state.json"
     audit_path = tmp_path / "audit-vector.json"
 
-    served = {"payload": _signed_wire_vector([_vector_row("unverified-hotkey", 0.9)])}
+    served = {"payload": _signed_wire_vector([_vector_row("unverified-hotkey", 1.0)])}
     real_fetch = cli_module._bounded_https_fetch
 
     def fake_fetch(url: str, **kwargs):
@@ -1827,7 +1905,7 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
 
     # Control: the agreeing vector on the same chain is classified
     # NOT_PROVEN (receipts-only) and reserves fences exactly as before.
-    served["payload"] = _signed_wire_vector([_vector_row("public-hotkey", 0.9)])
+    served["payload"] = _signed_wire_vector([_vector_row("public-hotkey", 1.0)])
     code = cli_main(arguments)
     output = capsys.readouterr().out
     events = [json.loads(line) for line in output.strip().splitlines()]
@@ -2071,3 +2149,298 @@ def test_trickled_body_cannot_outlive_the_absolute_deadline(monkeypatch):
     # Dead at ~the 1.2s absolute deadline — not after 65536 trickled bytes.
     assert elapsed < 5.0, elapsed
     assert elapsed > 0.9, elapsed
+
+
+# ---------------------------------------------------------------------------
+# Launch repairs: mechanism pair (2), fence ordering (4), FULL-mode budget
+# (6), and the export/verify receipt-budget boundary (7).
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_carries_the_exact_frozen_mechanism_pair(tmp_path: Path, exported_evidence):
+    """Repair 2 producer half: the published manifest pins BOTH halves of
+    the mechanism pair, and export refuses any unsupported revision."""
+    evidence_dir, _summary = exported_evidence
+    manifest = parse_manifest((evidence_dir / "epochs" / "11.json").read_bytes())
+    assert manifest["reward_mechanism"] == {"id": "validated_supply_v1", "revision": 1}
+
+
+def test_export_refuses_an_unsupported_mechanism_pair(tmp_path: Path, capsys):
+    evidence_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    code = cli_main(_export_evidence_args(tmp_path, snapshot_path, mechanism_revision="2"))
+    assert code != 0
+    assert "not a frozen supported pair" in capsys.readouterr().err
+    assert not evidence_dir.exists()  # refused before any publication
+
+
+def test_verify_rejects_a_mismatched_mechanism_revision_before_recompute(
+    tmp_path: Path, exported_evidence, capsys
+):
+    """Repair 2 verifier half: an unsupported revision fails BEFORE any
+    recomputation and BEFORE any fence reservation."""
+    evidence_dir, _summary = exported_evidence
+    state_path = tmp_path / "revision-state.json"
+    code = cli_main(
+        _verify_cli_args(tmp_path, evidence_dir)
+        + ["--mechanism-revision", "2", "--state-file", str(state_path)]
+    )
+    output = capsys.readouterr().out
+    events = [json.loads(line) for line in output.strip().splitlines()]
+    assert code == 1
+    assert any("does not match the pinned pair" in event.get("detail", "") for event in events)
+    assert all(event["event"] != "CHAIN_VERIFIED_AND_RECOMPUTED" for event in events)
+    assert not state_path.exists()  # never reserved
+
+
+def test_reservation_conflict_emits_only_terminal_fail(
+    tmp_path: Path, exported_evidence, capsys, monkeypatch
+):
+    """Repair 4: a fence-reservation conflict discovered AFTER every check
+    passed (a concurrent verifier won the race) emits NO accepting terminal
+    event — no PASS, no NOT_PROVEN — only a terminal FAIL, and the audit
+    file reports FAIL, never acceptance."""
+    import cathedral.cli as cli_module
+
+    evidence_dir, _summary = exported_evidence
+    state_path = tmp_path / "conflict-state.json"
+    audit_path = tmp_path / "conflict-audit.json"
+    real_reserve = cli_module._reserve_fences
+
+    def racing_reserve(fence_path, **kwargs):
+        # A concurrent run commits a HIGHER high-water in the window between
+        # this run's checks and its reservation; the atomic reserve must
+        # then refuse, and no accepting event may already have been emitted.
+        fence_path.write_text(
+            json.dumps(
+                {"index_source_epoch": 999, "index_manifest": "sha256:" + "f" * 64},
+                sort_keys=True,
+            )
+        )
+        return real_reserve(fence_path, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_reserve_fences", racing_reserve)
+    code = cli_main(
+        _verify_cli_args(tmp_path, evidence_dir)
+        + [
+            "--allow-receipts-only",
+            "--state-file",
+            str(state_path),
+            "--audit-out",
+            str(audit_path),
+        ]
+    )
+    output = capsys.readouterr().out
+    events = [json.loads(line) for line in output.strip().splitlines()]
+    assert code == 1
+    assert all(event["event"] != "PROVENANCE_RESULT" for event in events)
+    assert all(event["status"] != "NOT_PROVEN" for event in events)
+    assert all(event["status"] != "PASS" or event["stage"] != "result" for event in events)
+    assert events[-1]["event"] == "PROVENANCE_FAILED"
+    assert events[-1]["status"] == "FAIL"
+    assert "rollback" in events[-1]["detail"]
+    audit = json.loads(audit_path.read_text())
+    assert audit["result"] == "FAIL"
+    assert "rollback" in audit["error"]
+
+
+def _full_mode_workspace(tmp_path: Path, capsys) -> tuple[Path, Path, Path, Path]:
+    """A verifier-bound export plus the controlled/independent inputs FULL
+    mode reads locally: (evidence dir, controlled dir, verifier, snapshot)."""
+    _prepared_export_workspace(tmp_path)
+    verifier_path = tmp_path / "verifier.bin"
+    verifier_path.write_bytes(b"\x7fELF-test-bytes")
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    full_dir = tmp_path / "evidence-full"
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                evidence_dir=full_dir,
+                verifier_binary=str(verifier_path),
+                verifier_production_path="/opt/cathedral/bin/verifier",
+            )
+        )
+        == 0
+    )
+    capsys.readouterr()
+    controlled = tmp_path / "controlled"
+    controlled.mkdir()
+    independent_path = tmp_path / "independent-snapshot.json"
+    independent_path.write_text(
+        json.dumps(CANDIDATE_SNAPSHOT_DOC, sort_keys=True, separators=(",", ":"))
+    )
+    return full_dir, controlled, verifier_path, independent_path
+
+
+def _full_mode_arguments(
+    tmp_path: Path, full_dir: Path, controlled: Path, verifier_path: Path, independent_path: Path
+) -> list[str]:
+    return [
+        *_verify_cli_args(tmp_path, full_dir),
+        "--controlled-dir",
+        str(controlled),
+        "--verifier-binary",
+        str(verifier_path),
+        "--independent-candidate-snapshot",
+        str(independent_path),
+    ]
+
+
+def test_full_mode_local_inputs_share_the_command_budget(tmp_path: Path, capsys, monkeypatch):
+    """Repair 6: the independent snapshot, the local verifier binary, and
+    every controlled envelope (streamed lazily, one at a time) are charged
+    to the SAME command artifact/byte/deadline budget as public evidence
+    reads — positive path plus symlink, oversize, and aggregate-cap
+    counterexamples."""
+    import dataclasses
+
+    import cathedral.cli as cli_module
+    from cathedral import provenance as provenance_module
+    from cathedral.evidence import MAX_CONTROLLED_ENVELOPE_BYTES
+
+    full_dir, controlled, verifier_path, independent_path = _full_mode_workspace(tmp_path, capsys)
+    envelope_path = controlled / ("e" * 64 + ".json")
+    envelope_path.write_bytes(b"{}")
+    arguments = _full_mode_arguments(
+        tmp_path, full_dir, controlled, verifier_path, independent_path
+    )
+
+    budgets: list = []
+    real_budget = cli_module._FetchBudget
+
+    def tracking_budget(**kwargs):
+        budget = real_budget(**kwargs)
+        budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(cli_module, "_FetchBudget", tracking_budget)
+
+    streamed: dict = {}
+
+    def spy(result, **kwargs):
+        # Exercise the CLI-built lazy loader exactly as the replay loop
+        # would: one .get() per positive miner, at replay time.
+        streamed["envelope"] = kwargs["envelopes_by_hotkey"].get("public-hotkey")
+        return dataclasses.replace(result, assurance_level="full")
+
+    monkeypatch.setattr(provenance_module, "replay_positive_miners", spy)
+
+    # Positive path: everything within budget verifies, the envelope is
+    # streamed through the loader, and exactly index + manifest + registry
+    # + report + receipt + 2 work artifacts + snapshot + verifier +
+    # envelope = 10 artifact slots were consumed.
+    assert cli_main(arguments) == 0
+    capsys.readouterr()
+    assert streamed["envelope"] == b"{}"
+    consumed = cli_module.MAX_COMMAND_ARTIFACTS - budgets[0].artifacts_remaining
+    assert consumed == 10
+    assert budgets[0].bytes_remaining < cli_module.MAX_COMMAND_FETCH_BYTES
+
+    # Symlinked envelope: refused at the read, fail closed.
+    envelope_path.unlink()
+    envelope_path.symlink_to(verifier_path)
+    budgets.clear()
+    code = cli_main(arguments)
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "cannot be opened safely" in output
+
+    # Oversized envelope: the per-artifact disclosure cap refuses.
+    envelope_path.unlink()
+    envelope_path.write_bytes(b"x" * (MAX_CONTROLLED_ENVELOPE_BYTES + 1))
+    budgets.clear()
+    code = cli_main(arguments)
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "exceeds the bounded size limit" in output
+
+    # Aggregate byte cap: an in-cap envelope still cannot exceed the shared
+    # command budget mid-read.
+    envelope_path.unlink()
+    envelope_path.write_bytes(b"y" * 200_000)
+    budgets.clear()
+    monkeypatch.setattr(
+        cli_module,
+        "_FetchBudget",
+        lambda **kwargs: real_budget(**{**kwargs, "max_total_bytes": 100_000}),
+    )
+    code = cli_main(arguments)
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "aggregate byte cap" in output
+
+
+def test_full_mode_symlinked_independent_snapshot_is_refused(tmp_path: Path, capsys, monkeypatch):
+    import cathedral.cli as cli_module  # noqa: F401 - parity with sibling test
+
+    full_dir, controlled, verifier_path, independent_path = _full_mode_workspace(tmp_path, capsys)
+    (controlled / ("e" * 64 + ".json")).write_bytes(b"{}")
+    independent_path.unlink()
+    independent_path.symlink_to(verifier_path)
+    code = cli_main(
+        _full_mode_arguments(tmp_path, full_dir, controlled, verifier_path, independent_path)
+    )
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "cannot be opened safely" in output
+
+
+def test_budget_deadline_covers_budget_charged_local_reads(tmp_path: Path):
+    """Repair 6 deadline half: a budget-charged local read (the same path
+    envelopes, the snapshot, and the verifier binary use) refuses once the
+    ONE command deadline is exhausted."""
+    from cathedral.cli import _FetchBudget, _read_bounded_local_file
+
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"0123456789")
+    budget = _FetchBudget(deadline_seconds=60)
+    budget.deadline = budget._clock() - 1.0  # the single deadline has passed
+    with pytest.raises(ValueError, match="total deadline"):
+        _read_bounded_local_file(artifact, 100, "artifact", budget=budget)
+
+
+def test_receipt_budget_boundary_is_enforced_at_export_and_verify(
+    tmp_path: Path, exported_evidence, capsys, monkeypatch
+):
+    """Repair 7 on the real command paths: with the receipt budget forced
+    to zero, the SAME constant makes export refuse to build the manifest
+    and verify refuse to accept a previously exported one."""
+    from cathedral import evidence as evidence_module
+
+    evidence_dir, summary = exported_evidence
+    assert summary["receipts"] == 1
+
+    monkeypatch.setattr(evidence_module, "MAX_MANIFEST_RECEIPTS", 0)
+    code = cli_main(_verify_cli_args(tmp_path, evidence_dir) + ["--allow-receipts-only"])
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "receipts is invalid" in output
+
+    export_dir = tmp_path / "evidence-over-budget"
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    code = cli_main(_export_evidence_args(tmp_path, snapshot_path, evidence_dir=export_dir))
+    assert code != 0
+    assert "receipts is invalid" in capsys.readouterr().err
+    # Content-addressed blobs may exist, but nothing was PUBLISHED: no
+    # signed index and no immutable epoch manifest copy.
+    assert not (export_dir / "index.json").exists()
+    assert not (export_dir / "epochs").exists()
+
+
+def test_retention_refuses_an_oversized_controlled_envelope(tmp_path: Path):
+    """Repair 7 retention half: an envelope past the launch disclosure cap
+    is refused AT RETENTION TIME, so an unfetchable envelope can never
+    silently unprove a published epoch later."""
+    from cathedral.evidence import MAX_CONTROLLED_ENVELOPE_BYTES, RetentionStore
+
+    store = RetentionStore(tmp_path / "retention")
+    with pytest.raises(EvidenceError, match="disclosure cap"):
+        store.retain(
+            b"x" * (MAX_CONTROLLED_ENVELOPE_BYTES + 1),
+            kind="admission_evidence",
+            hotkey="miner",
+        )
+    digest = store.retain(b"x" * 1024, kind="admission_evidence", hotkey="miner")
+    assert digest.startswith("sha256:")

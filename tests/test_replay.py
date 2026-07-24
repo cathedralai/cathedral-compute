@@ -403,19 +403,26 @@ def test_zero_positive_miners_never_full(tmp_path: Path):
         miners=[],
         recomputed_hotkey_weights={},
     )
-    upgraded = replay_positive_miners(
-        result,
-        registry=SNAPSHOT,
-        envelopes_by_hotkey={},
-        attestation_bindings={},
-        verifier_binary=_static_elf(),
-        verifier_blob_digest="sha256:" + "2" * 64,
-        verifier_command=DECLARED,
-        verifier_artifacts=DECLARED,
-        independent_candidates={"zero-hotkey"},
-        independent_block_hash="0x" + "ab" * 32,
-    )
+    from unittest import mock
+
+    # The pinned verifier bytes are still authenticated on a zero-replay
+    # epoch (stubbed here; the real authentication matrix lives below).
+    with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
+        upgraded = replay_positive_miners(
+            result,
+            registry=SNAPSHOT,
+            envelopes_by_hotkey={},
+            attestation_bindings={},
+            verifier_binary=_static_elf(),
+            verifier_blob_digest="sha256:" + "2" * 64,
+            verifier_command=DECLARED,
+            verifier_artifacts=DECLARED,
+            candidate_outcomes={"zero-hotkey": "rejected"},
+            independent_candidates={"zero-hotkey"},
+            independent_block_hash="0x" + "ab" * 32,
+        )
     assert upgraded.assurance_level == ASSURANCE_RECEIPTS_ONLY
+    assert upgraded.not_proven_reasons
 
 
 def test_stale_envelope_nonce_rejected_by_committed_challenge(tmp_path: Path):
