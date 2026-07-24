@@ -132,3 +132,20 @@ def test_jsonl_path_rejects_symlinks_and_lax_modes(tmp_path):
     logger.event("STARTUP", stage="startup", status=PASS)
     logger.close()
     assert (fresh.stat().st_mode & 0o777) == 0o600
+
+
+def test_bearer_header_and_named_fields_never_leak(tmp_path):
+    stream = io.StringIO()
+    logger = EventLogger(mode="thin", jsonl=stream, tty=None)
+    logger.event(
+        "FETCH_FAILED",
+        stage="fetch",
+        status=FAIL,
+        detail="server said: Authorization: Bearer sekrit-token-123 rejected",
+        payload={"token": "sekrit-2", "nested": {"Api_Key": "sekrit-3"}},
+        headers={"authorization": "Basic sekrit-4"},
+    )
+    text = stream.getvalue()
+    for secret in ("sekrit-token-123", "sekrit-2", "sekrit-3", "sekrit-4"):
+        assert secret not in text
+    assert "[REDACTED]" in text
