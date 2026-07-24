@@ -961,3 +961,88 @@ def test_evidence_export_refuses_a_swapped_candidate_snapshot(
     )
     assert cli_main(export_args) == 0
     capsys.readouterr()
+
+
+def test_resolver_slot_pool_bounds_abandoned_lookups(monkeypatch):
+    """Defect-5 stress proof: abandoned slow lookups retain a bounded slot
+    until the resolver returns, capacity exhaustion fails promptly, threads
+    never accumulate past the cap, and drained slots are reusable."""
+    import socket
+    import threading
+    import time
+
+    import cathedral.cli as cli_module
+    from cathedral.cli import RESOLVER_SLOT_CAP, _getaddrinfo_bounded
+
+    # A fresh pool for this test; restored automatically by monkeypatch.
+    monkeypatch.setattr(cli_module, "_RESOLVER_SLOTS", None)
+    release = threading.Event()
+
+    def hung_resolver(*_a, **_k):
+        release.wait(10)
+        return [(socket.AF_INET, 0, 6, "", ("34.71.88.140", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", hung_resolver)
+    baseline_threads = threading.active_count()
+
+    # Fill EVERY slot with an abandoned lookup: each caller times out
+    # promptly while its resolver thread keeps holding the slot.
+    for _ in range(RESOLVER_SLOT_CAP):
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="exceeded the command deadline"):
+            _getaddrinfo_bounded("example.com", 443, 0.001)
+        assert time.monotonic() - started < 0.5
+
+    # Capacity exhaustion is a PROMPT failure, not an unbounded queue …
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="capacity exhausted"):
+        _getaddrinfo_bounded("example.com", 443, 0.001)
+    assert time.monotonic() - started < 0.5
+    # … and the thread population is bounded by the cap, not by call count.
+    assert threading.active_count() <= baseline_threads + RESOLVER_SLOT_CAP + 1
+
+    # Once the resolvers actually return, their slots are RELEASED and the
+    # pool is reusable.
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            result = _getaddrinfo_bounded("example.com", 443, 1.0)
+            break
+        except ValueError:
+            time.sleep(0.05)
+    else:
+        pytest.fail("resolver slots were never released after completion")
+    assert result[0][4][0] == "34.71.88.140"
+
+
+def test_resolver_slot_pool_survives_repeated_timeout_storms(monkeypatch):
+    """Defect-5 stress proof: 3x-cap repeated timeouts recycle slots as
+    resolvers finish; every failure stays prompt and the pool never wedges."""
+    import socket
+    import threading
+    import time
+
+    import cathedral.cli as cli_module
+    from cathedral.cli import RESOLVER_SLOT_CAP, _getaddrinfo_bounded
+
+    monkeypatch.setattr(cli_module, "_RESOLVER_SLOTS", None)
+
+    def slow_resolver(*_a, **_k):
+        time.sleep(0.05)
+        return [(socket.AF_INET, 0, 6, "", ("34.71.88.140", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_resolver)
+    baseline_threads = threading.active_count()
+
+    for _ in range(3 * RESOLVER_SLOT_CAP):
+        started = time.monotonic()
+        with pytest.raises(
+            ValueError, match="exceeded the command deadline|capacity exhausted"
+        ):
+            _getaddrinfo_bounded("example.com", 443, 0.001)
+        assert time.monotonic() - started < 0.5
+        assert threading.active_count() <= baseline_threads + RESOLVER_SLOT_CAP + 1
+
+    time.sleep(0.2)  # let the in-flight resolvers drain
+    assert _getaddrinfo_bounded("example.com", 443, 1.0)

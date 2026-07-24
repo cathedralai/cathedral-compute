@@ -1720,29 +1720,70 @@ class _FetchBudget:
         self.remaining_seconds()
 
 
+RESOLVER_SLOT_CAP = 16
+_RESOLVER_SLOTS = None
+_RESOLVER_SLOTS_GUARD = None
+
+
+def _resolver_slots():
+    """Process-global bounded resolver slot pool (defect 5).
+
+    Every in-flight ``getaddrinfo`` — including calls whose caller already
+    timed out and moved on — holds exactly one slot until the resolver
+    thread actually returns, so repeated timeouts can never accumulate
+    unbounded daemon threads. When every slot is held by a hung resolver,
+    new callers fail PROMPTLY instead of queuing forever."""
+    global _RESOLVER_SLOTS, _RESOLVER_SLOTS_GUARD
+    import threading as _threading
+
+    if _RESOLVER_SLOTS_GUARD is None:
+        _RESOLVER_SLOTS_GUARD = _threading.Lock()
+    with _RESOLVER_SLOTS_GUARD:
+        if _RESOLVER_SLOTS is None:
+            _RESOLVER_SLOTS = _threading.BoundedSemaphore(RESOLVER_SLOT_CAP)
+    return _RESOLVER_SLOTS
+
+
 def _getaddrinfo_bounded(host: str, port: int, timeout: float) -> list:
     """Resolve with a GENUINE prompt bound: getaddrinfo runs on a daemon
-    thread and the caller waits at most ``timeout`` seconds — a slow
-    resolver fails at the budget, not after the resolver returns, and the
-    abandoned daemon thread never blocks interpreter shutdown."""
+    thread from a bounded process-global slot pool and the caller waits at
+    most ``timeout`` seconds — a slow resolver fails at the budget, an
+    abandoned call retains its slot only until the resolver returns, and
+    slot-pool exhaustion fails promptly instead of queuing."""
     import queue as _queue
     import socket as _socket
     import threading as _threading
 
+    slots = _resolver_slots()
+    if not slots.acquire(timeout=max(0.0, min(timeout, 5.0))):
+        raise ValueError(
+            f"DNS resolver capacity exhausted while resolving {host}: "
+            f"{RESOLVER_SLOT_CAP} lookups are already in flight (slow or "
+            "hung resolver); failing promptly instead of queuing"
+        )
     channel: _queue.Queue = _queue.Queue(maxsize=1)
 
     def _resolve() -> None:
         try:
-            channel.put(
-                ("ok", _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP))
-            )
-        except OSError as exc:
-            channel.put(("err", exc))
+            try:
+                channel.put(
+                    ("ok", _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP))
+                )
+            except OSError as exc:
+                channel.put(("err", exc))
+        finally:
+            # The slot is released when the RESOLVER finishes — not when the
+            # caller gives up — so abandoned slow lookups stay accounted for.
+            slots.release()
 
-    worker = _threading.Thread(
-        target=_resolve, name="cathedral-dns", daemon=True
-    )
-    worker.start()
+    try:
+        worker = _threading.Thread(
+            target=_resolve, name="cathedral-dns", daemon=True
+        )
+        worker.start()
+    except BaseException:
+        slots.release()  # the worker never ran; do not leak the slot
+        raise
     try:
         kind, value = channel.get(timeout=max(0.0, timeout))
     except _queue.Empty:
