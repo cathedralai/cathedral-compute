@@ -80,6 +80,7 @@ def replay_verify_tdx(
     nonce: bytes,
     policy: Policy,
     pinned_command: list[str],
+    timeout_override: float | None = None,
 ) -> Attested | None:
     """Run the CANONICAL strict TDX verification against an explicit,
     already-authenticated verifier binary (full-provenance replay).
@@ -93,7 +94,11 @@ def replay_verify_tdx(
     if not policy.tdx_strict:
         return None
     return _verify_tdx(
-        evidence, nonce, policy, _pinned_replay_command=list(pinned_command)
+        evidence,
+        nonce,
+        policy,
+        _pinned_replay_command=list(pinned_command),
+        _pinned_timeout=timeout_override,
     )
 
 
@@ -102,6 +107,7 @@ def _verify_tdx(
     nonce: bytes,
     policy: Policy,
     _pinned_replay_command: list[str] | None = None,
+    _pinned_timeout: float | None = None,
 ) -> Attested | None:
     """TDX verifier adapter.
 
@@ -131,6 +137,7 @@ def _verify_tdx(
         ),
         expected_report_data=expected_report_data,
         pinned_command=_pinned_replay_command,
+        pinned_timeout=_pinned_timeout,
     )
     # Both flags must be the exact JSON boolean true; missing, malformed, or
     # false (including string forms and integers) all reject.
@@ -514,6 +521,7 @@ def _run_tdx_verifier(
     production_mode: bool = False,
     expected_report_data: bytes | None = None,
     pinned_command: list[str] | None = None,
+    pinned_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
@@ -554,6 +562,9 @@ def _run_tdx_verifier(
     timeout = _bounded_int_from_env(
         "CATHEDRAL_TDX_VERIFY_TIMEOUT", _DEFAULT_VERIFY_TIMEOUT, _MAX_VERIFY_TIMEOUT
     )
+    if pinned_timeout is not None:
+        # The replay caller's absolute command deadline caps this subprocess.
+        timeout = max(1, min(timeout, int(pinned_timeout)))
     max_output = _bounded_int_from_env(
         "CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", _DEFAULT_MAX_OUTPUT, _MAX_VERIFY_OUTPUT
     )

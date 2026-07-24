@@ -279,6 +279,7 @@ def replay_evidence(
     verifier_artifacts: tuple[str, ...],
     verifier_implementation_digest: str,
     policy: Policy,
+    timeout_override: float | None = None,
 ) -> ReplayVerdict:
     """Replay one retained CPU-TDX envelope through the canonical strict path."""
     evidence = parse_envelope(
@@ -334,7 +335,11 @@ def replay_evidence(
         # cap enforced during execution, sanitized environment, and every
         # strict parent-process claim gate.
         attested = replay_verify_tdx(
-            evidence, evidence.nonce, policy, [binary_path]
+            evidence,
+            evidence.nonce,
+            policy,
+            [binary_path],
+            timeout_override=timeout_override,
         )
     if attested is None:
         raise ReplayError(

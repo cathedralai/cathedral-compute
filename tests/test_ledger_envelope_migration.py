@@ -182,3 +182,29 @@ def test_idempotent_attestation_compares_envelope_exactly(tmp_path: Path):
             epoch_id, "legacy", envelope_digest=None, envelope_required=True, **base
         )
     ledger.close()
+
+
+def test_idempotent_retry_with_conflicting_challenge_digest_rejected(tmp_path: Path):
+    """Defect-9 proof: an attestation retry that changes the committed
+    challenge randomness is equivocation, never an idempotent success."""
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    epoch_id = ledger.begin_epoch(11)
+    base = dict(
+        verdict="VERIFIED",
+        tee_type="TDX",
+        workload="CPU",
+        evidence_digest="sha256:" + "d" * 64,
+        policy_mode="strict",
+        envelope_digest=ENVELOPE,
+    )
+    ledger.add_attestation(
+        epoch_id, "hk", challenge_digest="sha256:" + "1" * 64, **base
+    )
+    ledger.add_attestation(  # exact retry OK
+        epoch_id, "hk", challenge_digest="sha256:" + "1" * 64, **base
+    )
+    with pytest.raises(LedgerError, match="immutable"):
+        ledger.add_attestation(
+            epoch_id, "hk", challenge_digest="sha256:" + "2" * 64, **base
+        )
+    ledger.close()

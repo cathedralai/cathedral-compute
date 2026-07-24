@@ -278,9 +278,35 @@ class EvidenceStore:
             except Exception:  # noqa: BLE001 - unreadable current index
                 return None
 
+        def _highwater_path(self) -> Path:
+            return self._store.root / ".index-highwater.json"
+
+        def read_highwater(self) -> tuple[int, str] | None:
+            """Durable latest pointer that survives a corrupt index.json."""
+            path = self._highwater_path()
+            try:
+                document = json.loads(path.read_text())
+                return (int(document["source_epoch"]), str(document["manifest"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+
         def publish(self, index_bytes: bytes) -> None:
             if self._descriptor is None:
                 raise EvidenceError("index publish requires an open transaction")
+            new_latest = self._latest_of(index_bytes)
+            if new_latest is None:
+                raise EvidenceError("refusing to publish a structurally invalid index")
+            highwater = self.read_highwater()
+            if highwater is not None:
+                if new_latest[0] < highwater[0]:
+                    raise EvidenceError(
+                        "refusing to publish an index older than the durable "
+                        "high-water (corrupt-index recovery must not roll back)"
+                    )
+                if new_latest[0] == highwater[0] and new_latest[1] != highwater[1]:
+                    raise EvidenceError(
+                        "refusing to equivocate the durable high-water manifest"
+                    )
             current = self._store.read_index()
             if current is not None and current != index_bytes:
                 current_latest = self._latest_of(current)
@@ -299,6 +325,14 @@ class EvidenceStore:
                             "refusing to equivocate the index latest manifest"
                         )
             _atomic_write(self._store.root / "index.json", index_bytes)
+            _atomic_write(
+                self._highwater_path(),
+                json.dumps(
+                    {"source_epoch": new_latest[0], "manifest": new_latest[1]},
+                    sort_keys=True,
+                ).encode("utf-8"),
+                mode=0o600,
+            )
 
     def index_transaction(self) -> EvidenceStore._IndexTransaction:
         return EvidenceStore._IndexTransaction(self)

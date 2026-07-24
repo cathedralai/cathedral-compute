@@ -389,3 +389,29 @@ def test_vector_comparison_agreement_and_discrepancies(exported):
     empty_vector = {"weights": []}
     agree, discrepancies = compare_with_vector(result, empty_vector)
     assert not agree  # earning miner missing from the signed vector is a finding
+
+
+def test_candidate_omission_cannot_inflate_a_survivor(exported):
+    """Defect-1 proof: a committed second verified candidate omitted from
+    the report fails the exhaustive accounting."""
+    report, receipts = exported
+    candidate_set = {
+        "source": "enrollment_registry",
+        "finalized_block": None,
+        "candidates": [
+            {"hotkey": "public-hotkey", "outcome": "verified", "reason": "receipt_verified"},
+            {"hotkey": "zero-hotkey", "outcome": "rejected", "reason": "no_verified_work"},
+            {"hotkey": "omitted-miner", "outcome": "verified", "reason": "receipt_verified"},
+        ],
+    }
+    with pytest.raises(ProvenanceError, match="omits committed candidates"):
+        _verify(report, receipts, candidate_set=candidate_set)
+
+
+def test_current_block_outside_report_window_fails(exported):
+    """Defect-3 proof: a trusted finalized block outside
+    valid_from_block..valid_until_block rejects the report."""
+    report, receipts = exported
+    with pytest.raises(ProvenanceError, match="outside the report's validity"):
+        _verify(report, receipts, current_block=10_000)  # window is 70..80
+    _verify(report, receipts, current_block=75)  # inside: verifies

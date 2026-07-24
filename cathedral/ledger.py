@@ -1615,7 +1615,7 @@ class Ledger:
             self._require_running(cx, epoch_id, "add attestations")
             existing = cx.execute(
                 "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible,"
-                "envelope_digest "
+                "envelope_digest,challenge_digest "
                 "FROM epoch_attestations "
                 "WHERE epoch_id = ? AND hotkey = ?",
                 (epoch_id, hotkey),
@@ -1632,6 +1632,7 @@ class Ledger:
                     or existing["tee_type"] != tee_type
                     or existing["workload"] != workload
                     or existing["envelope_digest"] != envelope_digest
+                    or existing["challenge_digest"] != challenge_digest
                     or bool(existing["score_eligible"]) is not score_eligible
                 ):
                     raise LedgerError("attestation evidence is immutable within an epoch")

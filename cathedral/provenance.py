@@ -684,6 +684,7 @@ def replay_positive_miners(
     candidates_all_rejected: bool = False,
     epoch_generated_at: str | None = None,
     max_evidence_age_seconds: float = 3600.0,
+    deadline_monotonic: float | None = None,
 ) -> ProvenanceResult:
     """Upgrade a receipts-only result to FULL assurance via raw replay.
 
@@ -730,6 +731,11 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"receipt for {miner.hotkey!r} lacks measurement/issue-time bindings"
             )
+        if epoch_generated_at is None:
+            raise ProvenanceError(
+                "positive replay requires the manifest epoch time; freshness "
+                "windows are never optional"
+            )
         if miner.hardware_evidence_digest is None:
             raise ProvenanceError(
                 f"receipt for {miner.hotkey!r} carries no hardware evidence digest"
@@ -770,6 +776,16 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"signed registry yields no usable policy at the receipt time: {exc}"
             ) from exc
+        timeout_override = None
+        if deadline_monotonic is not None:
+            import time as time_module
+
+            remaining = deadline_monotonic - time_module.monotonic()
+            if remaining <= 0:
+                raise ProvenanceError(
+                    "command deadline exhausted before raw-evidence replay"
+                )
+            timeout_override = remaining
         try:
             replay_evidence(
                 envelope,
@@ -785,6 +801,7 @@ def replay_positive_miners(
                 verifier_artifacts=verifier_artifacts,
                 verifier_implementation_digest=result.verifier_digest,
                 policy=policy,
+                timeout_override=timeout_override,
             )
         except ReplayError as exc:
             raise ProvenanceError(

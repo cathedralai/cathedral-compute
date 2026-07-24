@@ -106,11 +106,19 @@ def _abbrev(s: str | None, prefix: int = 5, suffix: int = 4) -> str:
 # replaced.  Redaction runs before truncation so no partial secret can
 # survive at the length boundary.
 _REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Authorization: Bearer <token>  (HTTP header echoed in error text)
-    re.compile(r"(Authorization\s*:\s*Bearer\s+)\S+", re.IGNORECASE),
-    # bearer=, token=, secret=, hmac=, api_key=, api-key=, apikey=
+    # Authorization: <scheme> <opaque>, including QUOTED whole values as they
+    # appear in serialized JSON / Python reprs echoed inside exceptions.
     re.compile(
-        r"((?:bearer|token|secret|hmac|api[-_]?key)\s*[=:]\s*)\S+",
+        r"([\"']?Authorization[\"']?\s*[=:]\s*)"
+        r"(\"[^\"]*\"|'[^']*'|(?:Bearer|Basic)\s+\S+|\S+)",
+        re.IGNORECASE,
+    ),
+    # key=value / key: value with bare, quoted (spaces included), or
+    # URL-safe values; keys may themselves be quoted.
+    re.compile(
+        r"([\"']?(?:bearer|basic|token|secret|hmac|password|private_key|"
+        r"api[-_]?key)[\"']?\s*[=:]\s*)"
+        r"(\"[^\"]*\"|'[^']*'|\S+)",
         re.IGNORECASE,
     ),
 )
@@ -1412,7 +1420,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             attestations=attestations,
             candidate_set={
                 "source": "enrollment_registry",
-                "finalized_block": None,
+                "finalized_block": (
+                    int(args.finalized_block)
+                    if args.finalized_block is not None
+                    else None
+                ),
                 "candidates": candidate_rows,
             },
             wire_report_sha256=wire_digest,
@@ -1506,6 +1518,19 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             private_key_seed=index_seed,
         )
         try:
+            from cathedral.evidence import verify_index as _self_check_index
+
+            # The completed signed index must VERIFY (signature, shape,
+            # ordering, latest consistency) before it is published - a
+            # rebuild from a corrupted store can never publish a
+            # self-invalid index.
+            _self_check_index(
+                index_bytes,
+                {args.index_signing_key_id: index_public},
+                expected_network=args.score_network,
+                expected_netuid=args.score_netuid,
+                max_age_seconds=None,
+            )
             index_txn.publish(index_bytes)
         finally:
             index_txn.__exit__(None, None, None)
@@ -1622,17 +1647,22 @@ class _FetchBudget:
 
 
 def _resolved_public_address(
-    host: str, port: int, *, allow_private: bool
+    host: str, port: int, *, allow_private: bool,
+    budget: _FetchBudget | None = None,
 ) -> tuple[str, int]:
     """Resolve once, validate the address policy, and return the EXACT peer
     the transport must use — no second unvalidated resolution."""
     import ipaddress as _ip
     import socket as _socket
 
+    if budget is not None:
+        budget.remaining_seconds()  # blocking DNS counts against the deadline
     try:
         infos = _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP)
     except OSError as exc:
         raise ValueError(f"evidence host does not resolve: {host}") from exc
+    if budget is not None:
+        budget.remaining_seconds()  # a slow resolver fails promptly here
     if not infos:
         raise ValueError(f"evidence host does not resolve: {host}")
     for info in infos:
@@ -1685,7 +1715,7 @@ def _bounded_https_fetch(
         budget.start_artifact()
         timeout = min(timeout, budget.remaining_seconds())
     peer_ip, peer_port = _resolved_public_address(
-        host, parsed.port or 443, allow_private=allow_private
+        host, parsed.port or 443, allow_private=allow_private, budget=budget
     )
 
     class _PinnedConnection(_http.HTTPSConnection):
@@ -1956,15 +1986,24 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
         ledger.close()
 
 
-def _update_fences_monotonic(
-    fence_path: Path, new_epoch: int, new_manifest: str
+def _reserve_fences(
+    fence_path: Path,
+    *,
+    index_epoch: int,
+    index_manifest: str,
+    policy_release: int,
+    policy_digest: str,
+    report_id: str,
+    previous_report_id: str | None,
+    source_epoch: int,
 ) -> None:
-    """One flocked read/compare/write transaction for the durable fences.
+    """ONE atomic lock/check/reserve transaction executed BEFORE PASS.
 
-    Monotonic: a concurrent writer that verified an OLDER index cannot roll
-    the high-water back (epoch 12 then 11 ends at 12); the same epoch with a
-    different manifest never overwrites. Unique temp names, safe stale-temp
-    cleanup under the lock, fsynced file and parent.
+    Any conflict - index rollback or equivocation, policy rollback or
+    same-release digest change, or a report that does not chain from the
+    recorded predecessor - RAISES. There is no silent keep-newer path: a
+    concurrent fork writing a conflicting reservation is an error, never an
+    accepted state.
     """
     import fcntl
 
@@ -1978,29 +2017,73 @@ def _update_fences_monotonic(
             if fence_path.is_symlink() or not fence_path.is_file():
                 raise ValueError("verifier state file must be a regular file")
             current = json.loads(fence_path.read_text())
+
         stored_epoch = current.get("index_source_epoch")
         if isinstance(stored_epoch, int):
-            if new_epoch < stored_epoch:
-                return  # keep the newer high-water; never move backwards
+            if index_epoch < stored_epoch:
+                raise ValueError(
+                    f"index rollback: epoch {index_epoch} < reserved "
+                    f"high-water {stored_epoch}"
+                )
             if (
-                new_epoch == stored_epoch
-                and current.get("index_manifest") != new_manifest
+                index_epoch == stored_epoch
+                and current.get("index_manifest") != index_manifest
             ):
-                return  # same-epoch different manifest never overwrites
+                raise ValueError(
+                    "index equivocation: same epoch reserved with a different "
+                    "manifest"
+                )
+        stored_release = current.get("policy_release")
+        if isinstance(stored_release, int):
+            if policy_release < stored_release:
+                raise ValueError(
+                    f"policy rollback: release {policy_release} < reserved "
+                    f"{stored_release}"
+                )
+            if (
+                policy_release == stored_release
+                and current.get("policy_digest") != policy_digest
+            ):
+                raise ValueError(
+                    "policy equivocation: same release, different digest"
+                )
+        stored_report = current.get("report_id")
+        stored_source = current.get("report_source_epoch")
+        if (
+            isinstance(stored_source, int)
+            and source_epoch > stored_source
+            and stored_report is not None
+            and previous_report_id != stored_report
+        ):
+            raise ValueError("report does not chain from the reserved predecessor")
+        if isinstance(stored_source, int):
+            if source_epoch < stored_source:
+                raise ValueError(
+                    f"report rollback: source epoch {source_epoch} < reserved "
+                    f"{stored_source}"
+                )
+            if source_epoch == stored_source and stored_report != report_id:
+                raise ValueError(
+                    "report equivocation: same source epoch, different report"
+                )
+
         current.update(
-            {"index_source_epoch": new_epoch, "index_manifest": new_manifest}
+            {
+                "index_source_epoch": index_epoch,
+                "index_manifest": index_manifest,
+                "policy_release": policy_release,
+                "policy_digest": policy_digest,
+                "report_id": report_id,
+                "report_source_epoch": source_epoch,
+            }
         )
-        # Stale unique temps from crashed writers are safe to clear under
-        # the lock; the write itself uses a fresh unique name.
         for stale in fence_path.parent.glob(fence_path.name + ".*.tmp"):
             if not stale.is_symlink():
                 try:
                     stale.unlink()
                 except FileNotFoundError:
                     pass
-        fence_tmp = fence_path.with_name(
-            f"{fence_path.name}.{os.getpid()}.tmp"
-        )
+        fence_tmp = fence_path.with_name(f"{fence_path.name}.{os.getpid()}.tmp")
         descriptor = os.open(
             fence_tmp,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -2076,7 +2159,10 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
 
     def load_blob(digest: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
         if store is not None:
-            return store.get_blob(digest)
+            command_budget.start_artifact()
+            data = store.get_blob(digest)
+            command_budget.charge(len(data))
+            return data
         data = fetch_url("/blobs/sha256/" + digest.split(":", 1)[1], max_bytes=max_bytes)
         if digest_bytes(data) != digest:
             raise EvidenceError(f"fetched blob does not match digest {digest}")
@@ -2085,6 +2171,11 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
     audit: dict[str, object] = {"result": "FAIL"}
     try:
         if getattr(args, "production", False):
+            if getattr(args, "allow_private_evidence_host", False):
+                raise ValueError(
+                    "--allow-private-evidence-host is testing-only and is "
+                    "refused in production (SSRF policy)"
+                )
             missing = [
                 flag
                 for flag, value in (
@@ -2092,6 +2183,8 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     ("--report-keys-digest", args.report_keys_digest),
                     ("--index-keys-digest", args.index_keys_digest),
                     ("--source-revision", getattr(args, "source_revision", None)),
+                    ("--current-block", getattr(args, "current_block", None)),
+                    ("--state-file", getattr(args, "state_file", None)),
                 )
                 if not value
             ]
@@ -2246,6 +2339,10 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             mechanism_id=args.mechanism,
             registry_max_age_seconds=args.registry_max_age_secs,
             work_artifacts_by_receipt=work_artifacts_by_receipt,
+            candidate_set=manifest["candidate_set"],
+            current_block=(
+                int(args.current_block) if args.current_block is not None else None
+            ),
         )
         if result.policy_release != manifest["policy_registry"]["release"]:
             raise EvidenceError("verified registry release differs from the manifest")
@@ -2320,6 +2417,8 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 verifier_artifacts=tuple(
                     verifier_info["artifacts"] or verifier_info["command"]
                 ),
+                epoch_generated_at=manifest["generated_at"],
+                deadline_monotonic=command_budget.deadline,
             )
             for miner in result.miners:
                 if miner.raw_verified:
@@ -2448,10 +2547,17 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 ),
             )
         if fence_path is not None and audit["result"] in ("PASS", "NOT_PROVEN"):
-            _update_fences_monotonic(
+            # Atomic reserve BEFORE the result is reported: a conflicting
+            # concurrent reservation fails the run instead of being kept.
+            _reserve_fences(
                 fence_path,
-                int(index_document["latest"]["source_epoch"]),
-                str(index_document["latest"]["manifest"]),
+                index_epoch=int(index_document["latest"]["source_epoch"]),
+                index_manifest=str(index_document["latest"]["manifest"]),
+                policy_release=int(result.policy_release),
+                policy_digest=str(result.policy_digest),
+                report_id=str(result.report_id),
+                previous_report_id=result.previous_report_id,
+                source_epoch=int(result.source_epoch),
             )
         if args.audit_out:
             Path(args.audit_out).expanduser().write_text(
@@ -2950,6 +3056,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_evidence.add_argument("--mechanism", default="validated_supply_v1")
     p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
     p_export_evidence.add_argument("--source-revision")
+    p_export_evidence.add_argument(
+        "--finalized-block",
+        type=int,
+        help="trusted finalized SN39 block observed by the epoch loop; "
+             "committed into the candidate-set binding",
+    )
     p_export_evidence.add_argument("--index-signing-key-id", required=True)
     p_export_evidence.add_argument("--index-signing-key-file", required=True)
     p_export_evidence.add_argument(
@@ -3104,6 +3216,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 0 for a receipts-only chain; the result is still recorded "
              "and logged as NOT_PROVEN, never as full provenance",
+    )
+    p_prov_verify.add_argument(
+        "--current-block",
+        type=int,
+        help="trusted current finalized SN39 block (REQUIRED in production); "
+             "the report's valid_from_block..valid_until_block window is "
+             "enforced against it",
     )
     p_prov_verify.add_argument(
         "--fetch-deadline-secs",

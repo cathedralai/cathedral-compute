@@ -701,23 +701,78 @@ def test_retention_is_mandatory_when_configured_and_in_production(tmp_path: Path
     assert not (tmp_path / "retained2" / "log.jsonl").exists()
 
 
-def test_fence_update_is_monotonic_under_out_of_order_writers(tmp_path: Path):
-    """Counterexample G: epoch 12 then a late writer with 11 must end at 12;
-    same-epoch different manifest never overwrites."""
-    from cathedral.cli import _update_fences_monotonic
+def test_fence_reservation_conflicts_fail_never_keep_silently(tmp_path: Path):
+    """Defect-4 proof: a late epoch-11 writer after 12, a same-epoch manifest
+    fork, policy rollback/equivocation, and a non-chaining report all RAISE;
+    stale temps recover; forward reservations advance."""
+    from cathedral.cli import _reserve_fences
 
     fence = tmp_path / "fences.json"
-    _update_fences_monotonic(fence, 12, "sha256:" + "a" * 64)
-    _update_fences_monotonic(fence, 11, "sha256:" + "b" * 64)  # late, older
+    base = dict(
+        policy_release=6,
+        policy_digest="sha256:" + "0" * 64,
+        report_id="sha256:" + "1" * 64,
+        previous_report_id=None,
+        source_epoch=12,
+    )
+    _reserve_fences(fence, index_epoch=12, index_manifest="sha256:" + "a" * 64, **base)
+    with pytest.raises(ValueError, match="index rollback"):
+        _reserve_fences(
+            fence, index_epoch=11, index_manifest="sha256:" + "b" * 64, **base
+        )
+    with pytest.raises(ValueError, match="index equivocation"):
+        _reserve_fences(
+            fence, index_epoch=12, index_manifest="sha256:" + "c" * 64, **base
+        )
     state = json.loads(fence.read_text())
     assert state["index_source_epoch"] == 12
     assert state["index_manifest"] == "sha256:" + "a" * 64
-    _update_fences_monotonic(fence, 12, "sha256:" + "c" * 64)  # equivocation
-    state = json.loads(fence.read_text())
-    assert state["index_manifest"] == "sha256:" + "a" * 64
-    # Stale crash-left temp is cleared and does not brick the writer.
+
+    with pytest.raises(ValueError, match="policy rollback"):
+        _reserve_fences(
+            fence,
+            index_epoch=13,
+            index_manifest="sha256:" + "d" * 64,
+            policy_release=5,
+            policy_digest="sha256:" + "0" * 64,
+            report_id="sha256:" + "2" * 64,
+            previous_report_id="sha256:" + "1" * 64,
+            source_epoch=13,
+        )
+    with pytest.raises(ValueError, match="policy equivocation"):
+        _reserve_fences(
+            fence,
+            index_epoch=13,
+            index_manifest="sha256:" + "d" * 64,
+            policy_release=6,
+            policy_digest="sha256:" + "9" * 64,
+            report_id="sha256:" + "2" * 64,
+            previous_report_id="sha256:" + "1" * 64,
+            source_epoch=13,
+        )
+    with pytest.raises(ValueError, match="does not chain"):
+        _reserve_fences(
+            fence,
+            index_epoch=13,
+            index_manifest="sha256:" + "d" * 64,
+            policy_release=6,
+            policy_digest="sha256:" + "0" * 64,
+            report_id="sha256:" + "2" * 64,
+            previous_report_id="sha256:" + "f" * 64,
+            source_epoch=13,
+        )
+    # Stale crash-left temp recovers; a proper forward reservation advances.
     (tmp_path / "fences.json.99999.tmp").write_text("stale")
-    _update_fences_monotonic(fence, 13, "sha256:" + "d" * 64)
+    _reserve_fences(
+        fence,
+        index_epoch=13,
+        index_manifest="sha256:" + "d" * 64,
+        policy_release=6,
+        policy_digest="sha256:" + "0" * 64,
+        report_id="sha256:" + "2" * 64,
+        previous_report_id="sha256:" + "1" * 64,
+        source_epoch=13,
+    )
     assert json.loads(fence.read_text())["index_source_epoch"] == 13
 
 
@@ -750,3 +805,75 @@ def test_command_budget_enforces_deadline_bytes_and_artifacts():
     expired.deadline = expired._clock() - 1
     with pytest.raises(ValueError, match="total deadline"):
         expired.start_artifact()
+
+
+def test_dns_resolution_is_capped_by_the_command_deadline(monkeypatch):
+    """Defect-7 proof: a ~1ms budget with a 50ms resolver fails promptly."""
+    import socket
+    import time
+
+    from cathedral.cli import _FetchBudget, _resolved_public_address
+
+    def slow_resolver(*_a, **_k):
+        time.sleep(0.05)
+        return [(socket.AF_INET, 0, 6, "", ("34.71.88.140", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_resolver)
+    budget = _FetchBudget(deadline_seconds=0.001)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="total deadline"):
+        _resolved_public_address("example.com", 443, allow_private=False, budget=budget)
+    assert time.monotonic() - started < 0.5  # promptly, not after retries
+
+
+def test_production_refuses_the_private_host_bypass(tmp_path, capsys):
+    """Defect-8 proof: --production + --allow-private-evidence-host fails."""
+    from cathedral.cli import main as cli_main
+
+    code = cli_main(
+        [
+            "provenance",
+            "verify",
+            "--evidence-dir",
+            str(tmp_path),
+            "--registry-keys", "r.json",
+            "--report-keys", "p.json",
+            "--index-keys", "i.json",
+            "--verifier-digest", "sha256:" + "d" * 64,
+            "--production",
+            "--allow-private-evidence-host",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "testing-only" in output
+
+
+def test_corrupt_index_recovery_cannot_roll_back_highwater(tmp_path):
+    """Defect-5 proof: with index.json corrupted, the durable high-water
+    still refuses publishing an OLDER latest."""
+    from cathedral.evidence import EvidenceError, EvidenceStore
+
+    store = EvidenceStore(tmp_path / "store")
+    index_13 = build_signed_index(
+        network=NETWORK,
+        netuid=NETUID,
+        latest_source_epoch=13,
+        latest_manifest_digest="sha256:" + "a" * 64,
+        recent=[],
+        signing_key_id="evidence-index-test-1",
+        private_key_seed=INDEX_SEED,
+    )
+    store.write_index(index_13)
+    (tmp_path / "store" / "index.json").write_bytes(b"CORRUPT")
+    index_12 = build_signed_index(
+        network=NETWORK,
+        netuid=NETUID,
+        latest_source_epoch=12,
+        latest_manifest_digest="sha256:" + "b" * 64,
+        recent=[],
+        signing_key_id="evidence-index-test-1",
+        private_key_seed=INDEX_SEED,
+    )
+    with pytest.raises(EvidenceError, match="durable\\s+high-water"):
+        store.write_index(index_12)
