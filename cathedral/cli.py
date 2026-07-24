@@ -1551,6 +1551,77 @@ def _verify_wire_vector(
 
 MAX_EVIDENCE_FETCH_BYTES = 4 * 1024 * 1024
 MAX_VERIFIER_FETCH_BYTES = 32 * 1024 * 1024
+MAX_COMMAND_FETCH_BYTES = 64 * 1024 * 1024
+MAX_COMMAND_ARTIFACTS = 256
+DEFAULT_COMMAND_DEADLINE_SECONDS = 120.0
+
+
+class _FetchBudget:
+    """One command-wide budget: a single monotonic wall-clock deadline plus
+    aggregate byte and artifact caps shared by EVERY remote operation (DNS,
+    connect, TLS, headers, every blob read)."""
+
+    def __init__(
+        self,
+        *,
+        deadline_seconds: float = DEFAULT_COMMAND_DEADLINE_SECONDS,
+        max_total_bytes: int = MAX_COMMAND_FETCH_BYTES,
+        max_artifacts: int = MAX_COMMAND_ARTIFACTS,
+    ) -> None:
+        import time as time_module
+
+        self._clock = time_module.monotonic
+        self.deadline = self._clock() + deadline_seconds
+        self.bytes_remaining = max_total_bytes
+        self.artifacts_remaining = max_artifacts
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - self._clock()
+        if remaining <= 0:
+            raise ValueError("evidence command exceeded its total deadline")
+        return remaining
+
+    def start_artifact(self) -> None:
+        self.artifacts_remaining -= 1
+        if self.artifacts_remaining < 0:
+            raise ValueError("evidence command exceeded its artifact cap")
+        self.remaining_seconds()
+
+    def charge(self, count: int) -> None:
+        self.bytes_remaining -= count
+        if self.bytes_remaining < 0:
+            raise ValueError("evidence command exceeded its aggregate byte cap")
+        self.remaining_seconds()
+
+
+def _resolved_public_address(
+    host: str, port: int, *, allow_private: bool
+) -> tuple[str, int]:
+    """Resolve once, validate the address policy, and return the EXACT peer
+    the transport must use — no second unvalidated resolution."""
+    import ipaddress as _ip
+    import socket as _socket
+
+    try:
+        infos = _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise ValueError(f"evidence host does not resolve: {host}") from exc
+    if not infos:
+        raise ValueError(f"evidence host does not resolve: {host}")
+    for info in infos:
+        address = _ip.ip_address(info[4][0])
+        if not allow_private and (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise ValueError(
+                f"evidence host resolves to a non-public address: {host}"
+            )
+    return infos[0][4][0], port
 
 
 def _bounded_https_fetch(
@@ -1559,12 +1630,21 @@ def _bounded_https_fetch(
     max_bytes: int = MAX_EVIDENCE_FETCH_BYTES,
     allow_private: bool = False,
     timeout: float = 30.0,
+    budget: "_FetchBudget | None" = None,
 ) -> bytes:
-    """HTTPS-only bounded fetch: no redirects, no downgrade, no private hosts."""
-    import ipaddress as _ip
+    """HTTPS-only bounded fetch pinned to the validated peer.
+
+    The validated DNS answer IS the transport peer: the TCP connection goes
+    to that exact address while TLS verifies the certificate for the
+    original hostname via SNI. No redirects are possible by construction
+    (any non-200 status fails), and the shared budget's deadline and caps
+    gate DNS, connect, TLS, headers, and every read.
+    """
+    import http.client as _http
     import socket as _socket
+    import ssl as _ssl
+    import time as _time
     import urllib.parse as _parse
-    import urllib.request as _request
 
     parsed = _parse.urlsplit(url)
     if parsed.scheme != "https":
@@ -1574,55 +1654,55 @@ def _bounded_https_fetch(
     host = parsed.hostname or ""
     if not host:
         raise ValueError("evidence URL has no host")
-    if not allow_private:
-        try:
-            infos = _socket.getaddrinfo(host, parsed.port or 443, proto=_socket.IPPROTO_TCP)
-        except OSError as exc:
-            raise ValueError(f"evidence host does not resolve: {host}") from exc
-        for info in infos:
-            address = _ip.ip_address(info[4][0])
-            if (
-                address.is_private
-                or address.is_loopback
-                or address.is_link_local
-                or address.is_reserved
-                or address.is_multicast
-                or address.is_unspecified
-            ):
-                raise ValueError(
-                    f"evidence host resolves to a non-public address: {host}"
-                )
+    if budget is not None:
+        budget.start_artifact()
+        timeout = min(timeout, budget.remaining_seconds())
+    peer_ip, peer_port = _resolved_public_address(
+        host, parsed.port or 443, allow_private=allow_private
+    )
 
-    class _NoRedirect(_request.HTTPRedirectHandler):
-        def redirect_request(self, *arguments, **keywords):
-            raise ValueError("evidence fetches must not follow redirects")
+    class _PinnedConnection(_http.HTTPSConnection):
+        def connect(self) -> None:  # noqa: D401
+            raw = _socket.create_connection((peer_ip, peer_port), self.timeout)
+            self.sock = self._context.wrap_socket(raw, server_hostname=host)
 
-    opener = _request.build_opener(_NoRedirect, _request.HTTPSHandler())
-    request = _request.Request(url, headers={"User-Agent": "cathedral-provenance/1.0"})
-    with opener.open(request, timeout=timeout) as response:
-        return _read_bounded_deadline(response, max_bytes, timeout)
-
-
-def _read_bounded_deadline(response, max_bytes: int, total_seconds: float) -> bytes:
-    """Read with BOTH a size bound and a total wall-clock deadline: a slow
-    drip that keeps each read under the socket timeout still cannot exceed
-    the overall budget."""
-    import time as _time
-
-    deadline = _time.monotonic() + total_seconds
-    chunks: list[bytes] = []
-    received = 0
-    while True:
-        if _time.monotonic() > deadline:
-            raise ValueError("evidence fetch exceeded the total deadline")
-        chunk = response.read(min(65536, max_bytes + 1 - received))
-        if not chunk:
-            break
-        received += len(chunk)
-        if received > max_bytes:
-            raise ValueError("evidence response exceeds the bounded size limit")
-        chunks.append(chunk)
-    return b"".join(chunks)
+    context = _ssl.create_default_context()
+    connection = _PinnedConnection(host, peer_port, timeout=timeout, context=context)
+    try:
+        target = parsed.path or "/"
+        if parsed.query:
+            raise ValueError("evidence URLs must be query-free")
+        connection.request(
+            "GET",
+            target,
+            headers={"Host": host, "User-Agent": "cathedral-provenance/1.0"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError(
+                f"evidence fetch failed with status {response.status} "
+                "(redirects and errors are never followed)"
+            )
+        deadline = _time.monotonic() + timeout
+        chunks: list[bytes] = []
+        received = 0
+        while True:
+            if _time.monotonic() > deadline:
+                raise ValueError("evidence fetch exceeded the total deadline")
+            if budget is not None:
+                budget.remaining_seconds()
+            chunk = response.read(min(65536, max_bytes + 1 - received))
+            if not chunk:
+                break
+            received += len(chunk)
+            if received > max_bytes:
+                raise ValueError("evidence response exceeds the bounded size limit")
+            if budget is not None:
+                budget.charge(len(chunk))
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        connection.close()
 
 
 def _strict_json_object(data: bytes, label: str) -> dict:
@@ -1939,6 +2019,12 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         tty=sys.stderr,
     )
 
+    command_budget = _FetchBudget(
+        deadline_seconds=float(
+            getattr(args, "fetch_deadline_secs", DEFAULT_COMMAND_DEADLINE_SECONDS)
+        )
+    )
+
     def fetch_url(path: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
         url = args.evidence_url.rstrip("/") + path
         try:
@@ -1946,6 +2032,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 url,
                 max_bytes=max_bytes,
                 allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
+                budget=command_budget,
             )
         except ValueError as exc:
             raise EvidenceError(str(exc)) from exc
@@ -2251,6 +2338,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             vector_bytes = _bounded_https_fetch(
                 args.publisher_url.rstrip("/") + "/v1/validator/weights/next",
                 allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
+                budget=command_budget,
             )
             vector = _strict_json_object(vector_bytes, "weight vector")
             _verify_wire_vector(
@@ -2981,6 +3069,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 0 for a receipts-only chain; the result is still recorded "
              "and logged as NOT_PROVEN, never as full provenance",
+    )
+    p_prov_verify.add_argument(
+        "--fetch-deadline-secs",
+        type=float,
+        default=DEFAULT_COMMAND_DEADLINE_SECONDS,
+        help="one command-wide wall-clock budget covering DNS, connect, TLS, "
+             "and every blob read",
     )
     p_prov_verify.add_argument(
         "--allow-private-evidence-host",

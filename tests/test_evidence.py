@@ -705,3 +705,23 @@ def test_retention_store_rejects_drifted_blob_permissions(tmp_path: Path):
     blob.chmod(0o644)
     with pytest.raises(EvidenceError, match="unsafe on disk"):
         retention.retain(b"raw-quote-bytes", kind="admission_evidence")
+
+
+def test_command_budget_enforces_deadline_bytes_and_artifacts():
+    """Counterexample M: one command-wide budget gates every operation."""
+    from cathedral.cli import _FetchBudget
+
+    budget = _FetchBudget(deadline_seconds=60, max_total_bytes=10, max_artifacts=2)
+    budget.start_artifact()
+    budget.charge(6)
+    budget.start_artifact()
+    with pytest.raises(ValueError, match="aggregate byte cap"):
+        budget.charge(6)
+    fresh = _FetchBudget(deadline_seconds=60, max_total_bytes=100, max_artifacts=1)
+    fresh.start_artifact()
+    with pytest.raises(ValueError, match="artifact cap"):
+        fresh.start_artifact()
+    expired = _FetchBudget(deadline_seconds=60, max_total_bytes=100, max_artifacts=5)
+    expired.deadline = expired._clock() - 1
+    with pytest.raises(ValueError, match="total deadline"):
+        expired.start_artifact()
