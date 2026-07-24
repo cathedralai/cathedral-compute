@@ -715,7 +715,7 @@ def replay_positive_miners(
     """
     from dataclasses import replace as dataclass_replace
 
-    from cathedral.replay import ReplayError, replay_evidence
+    from cathedral.replay import ReplayError, authenticate_verifier_bytes, replay_evidence
 
     upgraded: list[MinerProvenance] = []
     replayed_count = 0
@@ -847,16 +847,31 @@ def replay_positive_miners(
 
     result.miners = upgraded
     if replayed_count == 0:
-        # Nothing raw was replayed. A zero-positive vector is FULL only when
-        # the manifest's exhaustive candidate accounting proves EVERY active
-        # candidate was explicitly rejected/fail-closed for this epoch
-        # (candidates_all_rejected, established by the caller from the
-        # verified candidate set + report zero rows). That is the legitimate
-        # provable all-burn revocation state. Anything less stays
-        # receipts_only: an empty epoch is never vacuously FULL.
-        result.assurance_level = (
-            ASSURANCE_FULL if candidates_all_rejected else ASSURANCE_RECEIPTS_ONLY
-        )
+        # Nothing raw was replayed. A zero-positive epoch could only claim
+        # FULL if (a) the manifest's exhaustive candidate accounting proves
+        # every active candidate was explicitly rejected, (b) the PINNED
+        # verifier bytes independently authenticate against BOTH the content
+        # digest and the implementation digest, and (c) candidate-specific
+        # RAW rejection evidence replays for every active candidate. The
+        # launch artifact model publishes no raw rejection evidence, so (c)
+        # cannot be satisfied and an all-rejected epoch REMAINS
+        # receipts_only (NOT PROVEN) - fail closed; zero replays never mint
+        # FULL. Invalid pinned verifier bytes are a hard error even here:
+        # a fake or unexercised binary must surface, never ride along.
+        if candidates_all_rejected:
+            try:
+                authenticate_verifier_bytes(
+                    verifier_binary,
+                    expected_blob_digest=verifier_blob_digest,
+                    declared_command=tuple(verifier_command),
+                    declared_artifacts=tuple(verifier_artifacts),
+                    expected_implementation_digest=result.verifier_digest,
+                )
+            except ReplayError as exc:
+                raise ProvenanceError(
+                    f"pinned verifier bytes failed authentication: {exc}"
+                ) from exc
+        result.assurance_level = ASSURANCE_RECEIPTS_ONLY
         return result
     result.assurance_level = ASSURANCE_FULL
     return result

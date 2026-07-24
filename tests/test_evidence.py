@@ -51,10 +51,15 @@ RECEIPT_SEED = bytes(range(32, 64))
 REPORT_SEED = bytes(range(64, 96))
 INDEX_SEED = bytes(range(96, 128))
 
+from cathedral.lanes.sat import _compute_challenge_id
+from cathedral.lanes.sat_types import SatInstance as _SatInstance
+
 NOW = datetime.now(UTC).replace(microsecond=0)
 WINDOW_FROM = NOW - timedelta(hours=1)
 WINDOW_UNTIL = NOW + timedelta(hours=47)
-CHALLENGE_ID = "a" * 64
+# The PRODUCER-DERIVED id for the standard work fixture (instance+seed):
+# fabricated ids no longer replay under the shared contract.
+CHALLENGE_ID = _compute_challenge_id(_SatInstance(n_vars=3, clauses=[[1, 2, -3]] * 20), 7)
 VERIFIER_DIGEST = "sha256:" + "d" * 64
 NETWORK = "local"
 NETUID = 1
@@ -1133,10 +1138,16 @@ def test_cli_full_replay_wires_anchor_and_all_rejected_state(
     }
 
 
-def test_cli_all_rejected_epoch_reaches_full_end_to_end(tmp_path: Path, capsys):
-    """Round-six C1 (all-rejected half): a zero-positive epoch whose signed
-    candidate set is exhaustively rejected must reach FULL through the real
-    CLI replay path — previously it silently stayed receipts_only."""
+def test_cli_all_rejected_epoch_fails_closed_without_rejection_evidence(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """Round-seven F3 (supersedes the round-six expectation): with zero raw
+    replays, an all-rejected epoch (a) hard-fails when the pinned verifier
+    bytes do not authenticate, and (b) with authenticated bytes stays
+    receipts_only/NOT_PROVEN because exhaustive raw rejection evidence is
+    not published by the current artifact model — FULL is never minted
+    unexercised. The anchor/all-rejected wiring itself remains covered by
+    the spy test above."""
     ledger = Ledger(tmp_path / "ledger.sqlite")
     epoch_id = ledger.begin_epoch(
         11,
@@ -1202,22 +1213,33 @@ def test_cli_all_rejected_epoch_reaches_full_end_to_end(tmp_path: Path, capsys):
     controlled = tmp_path / "controlled"
     controlled.mkdir()
     audit_out = tmp_path / "audit.json"
-    code = cli_main(
-        [
-            *_verify_cli_args(tmp_path, tmp_path / "evidence"),
-            "--controlled-dir",
-            str(controlled),
-            "--verifier-binary",
-            str(verifier_path),
-            "--audit-out",
-            str(audit_out),
-        ]
-    )
+    arguments = [
+        *_verify_cli_args(tmp_path, tmp_path / "evidence"),
+        "--controlled-dir",
+        str(controlled),
+        "--verifier-binary",
+        str(verifier_path),
+        "--audit-out",
+        str(audit_out),
+    ]
+    # (a) The inert test bytes match the manifest blob digest but cannot
+    # reproduce the pinned implementation digest: hard failure, exit != 0.
+    code = cli_main(arguments)
+    output = capsys.readouterr()
+    assert code != 0
+    assert "failed authentication" in output.out + output.err
+    # (b) With verifier-bytes authentication satisfied (stubbed exactly as
+    # in the ELF adversarial matrix), the claim STILL stays receipts_only:
+    # no raw rejection evidence exists, so NOT_PROVEN — fail closed.
+    from unittest import mock
+
+    with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
+        code = cli_main(arguments)
     capsys.readouterr()
     audit = json.loads(audit_out.read_text())
-    assert code == 0
-    assert audit["assurance"] == "full"
-    assert audit["result"] == "PASS"
+    assert code != 0
+    assert audit["assurance"] == "receipts_only"
+    assert audit["result"] == "NOT_PROVEN"
 
 
 def test_zero_work_receipt_never_mints_a_verified_manifest_outcome(tmp_path: Path, capsys):

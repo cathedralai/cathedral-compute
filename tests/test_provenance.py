@@ -465,3 +465,54 @@ def test_report_snapshot_binding_shape_is_enforced(exported):
     ):
         with pytest.raises(ProvenanceError, match=message):
             _verify(_reforge(report, mutate), receipts)
+
+
+def test_zero_replays_never_mint_full_even_when_all_rejected(tmp_path):
+    """Round-seven F3 counterexamples: with ZERO raw replays an
+    all-rejected epoch (a) hard-fails when the pinned verifier bytes do
+    not authenticate, and (b) even with authenticated bytes REMAINS
+    receipts_only, because exhaustive candidate-specific raw rejection
+    evidence is not present — assurance=full is never minted unexercised."""
+    import hashlib
+    from unittest import mock
+
+    from cathedral.ledger import Ledger
+    from cathedral.provenance import load_registry, replay_positive_miners
+    from tests.test_receipt import _completed_zero_epoch
+
+    ledger = Ledger(tmp_path / "zero-ledger.sqlite")
+    epoch_id = _completed_zero_epoch(ledger, 11)
+    report = _export_score_class(ledger, epoch_id)
+    ledger.close()
+
+    registry = load_registry(REGISTRY_BYTES, TRUSTED, now=NOW, max_age_seconds=172800)
+    junk = b"definitely-not-a-static-elf-verifier"
+    kwargs = {
+        "registry": registry,
+        "envelopes_by_hotkey": {},
+        "attestation_bindings": {},
+        "verifier_binary": junk,
+        "verifier_blob_digest": "sha256:" + hashlib.sha256(junk).hexdigest(),
+        "verifier_command": ("/opt/cathedral/bin/verifier",),
+        "verifier_artifacts": ("/opt/cathedral/bin/verifier",),
+        "candidates_all_rejected": True,
+    }
+
+    # (a) The pinned verifier bytes MUST authenticate even with zero
+    # replays: invalid/unexercised bytes are a hard failure, never FULL.
+    with pytest.raises(ProvenanceError, match="failed authentication"):
+        replay_positive_miners(_verify(report, {}), **kwargs)
+
+    # (b) Authenticated bytes still cannot mint FULL: raw rejection
+    # evidence for every active candidate is not present, so the claim
+    # stays receipts_only (NOT PROVEN) — fail closed.
+    with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
+        outcome = replay_positive_miners(_verify(report, {}), **kwargs)
+    assert outcome.assurance_level == "receipts_only"
+
+    # Sanity: candidates_all_rejected=False behaves identically.
+    with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
+        plain = replay_positive_miners(
+            _verify(report, {}), **{**kwargs, "candidates_all_rejected": False}
+        )
+    assert plain.assurance_level == "receipts_only"
