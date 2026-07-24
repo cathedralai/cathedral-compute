@@ -10,7 +10,7 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 |---|---|---|
 | 1. Evidence bundle + retention + controlled disclosure | IMPLEMENTED, locally tested | mandatory production retention (preflight + admission + ledger gates), TDX-only token-free envelopes, `runtime export-evidence`, `provenance export-controlled`; suites in tests/test_evidence.py, test_replay.py, test_ledger_envelope_migration.py |
 | 2. Concurrent thin + full-provenance modes | IMPLEMENTED, locally tested | subnet two-mode validator: shadow = single-flight background worker (timing-proven ≥10s audit cannot delay thin ticks); authority requires FULL assurance, derives its own UID vector, and RESERVES its durable fence (index+policy+report lines and chain identity, one flock hold) BEFORE any PASS is emitted; candidate membership is proven by EXACT equality against the HISTORICAL metagraph at the anchored block via the validator's own chain queries (current-metagraph drift is not an input; unavailable history is NOT_PROVEN) |
-| 3. Versioned reward mechanisms | IMPLEMENTED | `validated_supply_v1` (units-proportional shares + fixed 10% burn) pinned in manifests, provenance recompute, and validator config |
+| 3. Versioned reward mechanisms | IMPLEMENTED | `validated_supply_v1` (units-proportional shares + fixed 10% burn) pinned in manifests, provenance recompute, and validator config; work units derive under the versioned `sat_work_units_v1` rule shared VERBATIM by the producer lane and the independent replayer (canonical audit work = clause count; customer jobs = fixed CUSTOMER_SAT_WORK_UNITS) — never a signer or miner claim; replayed work items must satisfy the FULL producer contract (recomputed challenge_id from canonical instance+seed, clause/total-literal/per-clause/seed/size bounds) |
 | 4. Public artifact/index surfaces | IMPLEMENTED, NOT DEPLOYED | content-addressed store + signed index with full recent-row validation and verified history carry; manifests carry a versioned `candidate_set` anchored to an independently fetched SN39 metagraph snapshot (`cathedral_candidate_snapshot_v1`: network/netuid/block/block_hash + exact hotkeys, no machine identity); deploy blocked pending review |
 | 5. TTY + JSONL logs | IMPLEMENTED, locally tested | hardened EventLoggers both repos (recursive redaction, control-char neutralization, 0600 O_NOFOLLOW) |
 | 6. Adversarial + live proof | PARTIAL | adversarial suites green (confidential 1162 passed / 1 skipped; subnet two-mode 24 incl. work-replay, derived-challenge, and fence counterexamples); LIVE mainnet proof NOT PROVEN (deploy blocked) |
@@ -37,13 +37,17 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 6. **Live two-mode positive → revoked → restored** transitions in both modes
    with chain/dashboard/log evidence.
 7. **Full-authority revocation (all-burn) state.** A zero-positive epoch is
-   deliberately `receipts_only`: the artifact model does not yet publish
-   exhaustive per-candidate rejection/revocation evidence, so a FULL claim
-   for "everyone revoked" would be vacuous. Authority mode therefore fails
-   closed on revocation epochs (the chain retains the last vector; the
-   thin/shadow default carries revocation to burn). Making the revoked
-   state FULL requires an exhaustive candidate-set artifact with
-   independently replayable rejection evidence — designed, not built.
+   deliberately `receipts_only` and this is now ENFORCED in
+   `replay_positive_miners`: zero raw replays can never mint FULL. An
+   all-rejected claim additionally hard-fails unless the pinned verifier
+   bytes independently authenticate (content digest + implementation
+   digest), and even then the upgrade is WITHHELD because the artifact
+   model does not publish exhaustive per-candidate raw rejection
+   evidence. Authority mode therefore fails closed on revocation epochs
+   (the chain retains the last vector; the thin/shadow default carries
+   revocation to burn). Making the revoked state FULL requires an
+   exhaustive candidate-set artifact with independently replayable
+   rejection evidence — designed, not built.
 8. **pip 26.1.2 upgrade** in every managed venv. Clean installs and the
    production venvs must run `python -m pip install --upgrade 'pip>=26.1.2'`
    (fixes PYSEC-2026-196/2875/2876) before installing packages; this is a
