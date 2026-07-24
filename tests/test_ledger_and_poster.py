@@ -1354,6 +1354,54 @@ def test_complete_epoch_refuses_hotkey_the_subnet_ingest_cannot_accept() -> None
     assert ledger.get_epoch(epoch_id)["status"] == "running"
 
 
+def test_complete_epoch_refuses_json_escape_amplifying_unicode_hotkey() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    unicode_hotkey = "5" + "😀" * 30
+    assert len(unicode_hotkey.encode("utf-8")) < 128
+
+    with pytest.raises(LedgerError, match="invalid or duplicate hotkey"):
+        ledger.complete_epoch(
+            epoch_id,
+            {unicode_hotkey},
+            score_network="finney",
+            score_netuid=39,
+        )
+    assert ledger.get_epoch(epoch_id)["status"] == "running"
+
+
+def test_legacy_oversized_wire_body_is_refused_before_publication_network() -> None:
+    from cathedral.launch_limits import MAX_LAUNCH_WIRE_REPORT_BYTES
+
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(
+        epoch_id,
+        set(),
+        score_network="finney",
+        score_netuid=39,
+    )
+    document = json.loads(ledger.report_bytes(epoch_id))
+    document["metadata"]["legacy_padding"] = "x" * MAX_LAUNCH_WIRE_REPORT_BYTES
+    body = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ledger._connection.execute(
+        "UPDATE epochs SET report_body=?, report_digest=? WHERE epoch_id=?",
+        (body, hashlib.sha256(body).hexdigest(), epoch_id),
+    )
+    called = False
+
+    class NeverPoster:
+        def post(self, _report_body: bytes) -> dict:
+            nonlocal called
+            called = True
+            raise AssertionError("network must not be called")
+
+    with pytest.raises(LedgerError, match="subnet intake limit"):
+        ledger.post_and_mark_published(epoch_id, NeverPoster())
+    assert called is False
+    assert ledger.get_epoch(epoch_id)["status"] == "complete"
+
+
 def test_legacy_completed_over_cap_is_refused_before_publication_network() -> None:
     from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 

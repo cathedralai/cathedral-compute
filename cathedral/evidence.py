@@ -33,9 +33,9 @@ from typing import Any
 
 from cathedral.launch_limits import (
     MAX_LAUNCH_CANDIDATES,
-    MAX_LAUNCH_HOTKEY_BYTES,
     MAX_LAUNCH_SCORE_REPORT_BYTES,
     MAX_LAUNCH_VERIFIED_CANDIDATES,
+    is_launch_hotkey,
 )
 from cathedral.policy_registry import (
     MAX_REGISTRY_BYTES,
@@ -554,7 +554,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         not isinstance(report, Mapping)
         or set(report) != {"report_id", "blob", "signing_key_id"}
         or not isinstance(report["report_id"], str)
-        or not report["report_id"].startswith("sha256:")
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", report["report_id"]) is None
         or not isinstance(report["signing_key_id"], str)
         or not report["signing_key_id"]
     ):
@@ -563,22 +563,28 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     receipts = document["receipts"]
     if not isinstance(receipts, list) or len(receipts) > MAX_MANIFEST_RECEIPTS:
         raise EvidenceError("evidence manifest receipts is invalid")
+    seen_receipt_ids: set[str] = set()
+    receipt_hotkeys: set[str] = set()
     for row in receipts:
         if (
             not isinstance(row, Mapping)
             or set(row) != {"receipt_id", "hotkey", "blob", "work_item_blob", "result_blob"}
             or not isinstance(row["receipt_id"], str)
-            or not row["receipt_id"].startswith("receipt-sha256:")
-            or not isinstance(row["hotkey"], str)
-            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+            or re.fullmatch(r"receipt-sha256:[0-9a-f]{64}", row["receipt_id"]) is None
+            or not is_launch_hotkey(row["hotkey"])
         ):
             raise EvidenceError("evidence manifest receipt row is invalid")
         _require_digest(row["blob"], "receipt blob")
         _require_digest(row["work_item_blob"], "work item blob")
         _require_digest(row["result_blob"], "work result blob")
+        if row["receipt_id"] in seen_receipt_ids or row["hotkey"] in receipt_hotkeys:
+            raise EvidenceError("evidence manifest duplicates a receipt or receipt hotkey")
+        seen_receipt_ids.add(row["receipt_id"])
+        receipt_hotkeys.add(row["hotkey"])
     attestations = document["attestations"]
-    if not isinstance(attestations, list) or len(attestations) > MAX_MANIFEST_CANDIDATES:
+    if not isinstance(attestations, list) or len(attestations) > MAX_MANIFEST_RECEIPTS:
         raise EvidenceError("evidence manifest attestations is invalid")
+    attestation_hotkeys: set[str] = set()
     for row in attestations:
         if (
             not isinstance(row, Mapping)
@@ -591,8 +597,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
                 "challenge_digest",
                 "disclosure",
             }
-            or not isinstance(row["hotkey"], str)
-            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+            or not is_launch_hotkey(row["hotkey"])
             or not isinstance(row["verdict"], str)
             or row["disclosure"] not in _DISCLOSURES
         ):
@@ -602,6 +607,9 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
             _require_digest(row["envelope_digest"], "attestation envelope digest")
         if row["challenge_digest"] is not None:
             _require_digest(row["challenge_digest"], "attestation challenge digest")
+        if row["hotkey"] in attestation_hotkeys:
+            raise EvidenceError("evidence manifest duplicates an attestation hotkey")
+        attestation_hotkeys.add(row["hotkey"])
     candidate_set = document["candidate_set"]
     if (
         not isinstance(candidate_set, Mapping)
@@ -626,8 +634,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         if (
             not isinstance(row, Mapping)
             or set(row) != {"hotkey", "outcome", "reason"}
-            or not isinstance(row["hotkey"], str)
-            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+            or not is_launch_hotkey(row["hotkey"])
             or row["outcome"] not in _CANDIDATE_OUTCOMES
             or not isinstance(row["reason"], str)
             or len(row["reason"]) > 200
@@ -636,13 +643,21 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         if row["hotkey"] in seen_candidates:
             raise EvidenceError("evidence manifest duplicates a candidate")
         seen_candidates.add(row["hotkey"])
-    verified_count = sum(1 for row in candidates if row["outcome"] == "verified")
-    if verified_count > MAX_MANIFEST_RECEIPTS:
+    verified_hotkeys = {row["hotkey"] for row in candidates if row["outcome"] == "verified"}
+    if len(verified_hotkeys) > MAX_MANIFEST_RECEIPTS:
         raise EvidenceError(
             "evidence manifest verified-candidate count exceeds the launch "
-            f"receipt budget ({verified_count} > {MAX_MANIFEST_RECEIPTS}); "
+            f"receipt budget ({len(verified_hotkeys)} > {MAX_MANIFEST_RECEIPTS}); "
             "every verified candidate needs a receipt, two work artifacts, "
             "and a controlled envelope inside the verifier's aggregate byte cap"
+        )
+    if receipt_hotkeys != verified_hotkeys:
+        raise EvidenceError(
+            "evidence manifest receipts must cover exactly the verified candidate set"
+        )
+    if attestation_hotkeys != verified_hotkeys:
+        raise EvidenceError(
+            "evidence manifest attestations must cover exactly the verified candidate set"
         )
     wire = document["wire_report_sha256"]
     if wire is not None and (not isinstance(wire, str) or not re.fullmatch(r"[0-9a-f]{64}", wire)):
@@ -650,10 +665,46 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
 
 
 def parse_manifest(manifest_bytes: bytes) -> dict[str, Any]:
+    if (
+        not isinstance(manifest_bytes, bytes)
+        or not manifest_bytes
+        or len(manifest_bytes) > MAX_MANIFEST_ARTIFACT_BYTES
+    ):
+        raise EvidenceError("evidence manifest is empty or exceeds its artifact cap")
+
+    def _reject_manifest_duplicates(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise EvidenceError(f"duplicate evidence manifest JSON key {key!r}")
+            result[key] = value
+        return result
+
     try:
-        document = parse_registry_json(manifest_bytes)
-    except PolicyRegistryError as exc:
-        raise EvidenceError(f"evidence manifest is not strict JSON: {exc}") from exc
+        document = json.loads(
+            manifest_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_manifest_duplicates,
+            parse_float=lambda _value: (_ for _ in ()).throw(
+                EvidenceError("floating-point evidence manifest JSON is not canonical")
+            ),
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                EvidenceError("non-finite evidence manifest JSON is not canonical")
+            ),
+        )
+    except EvidenceError:
+        raise
+    except (
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise EvidenceError("evidence manifest is not strict UTF-8 JSON") from exc
+    if not isinstance(document, dict):
+        raise EvidenceError("evidence manifest must be a JSON object")
     if canonical_json(document) != manifest_bytes:
         raise EvidenceError("evidence manifest bytes are not canonical JSON")
     validate_manifest(document)

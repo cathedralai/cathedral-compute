@@ -24,8 +24,9 @@ from cathedral.lanes.sat import (
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.launch_limits import (
     MAX_LAUNCH_CANDIDATES,
-    MAX_LAUNCH_HOTKEY_BYTES,
     MAX_LAUNCH_VERIFIED_CANDIDATES,
+    MAX_LAUNCH_WIRE_REPORT_BYTES,
+    is_launch_hotkey,
 )
 from cathedral.lifecycle import (
     LifecycleReason,
@@ -67,6 +68,11 @@ _GPU_POLICY_MODE_RE = re.compile(
 def _validate_launch_report_cardinality(body: bytes) -> None:
     """Refuse a confidential report the public verifier cannot reproduce."""
 
+    if len(body) > MAX_LAUNCH_WIRE_REPORT_BYTES:
+        raise LedgerError(
+            "persisted confidential score report exceeds the subnet intake "
+            f"limit ({len(body)} > {MAX_LAUNCH_WIRE_REPORT_BYTES})"
+        )
     try:
         document = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -87,11 +93,7 @@ def _validate_launch_report_cardinality(body: bytes) -> None:
         if not isinstance(row, dict):
             raise LedgerError("persisted confidential score report has an invalid score row")
         hotkey = row.get("miner_hotkey")
-        if (
-            not isinstance(hotkey, str)
-            or not 1 <= len(hotkey.encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
-            or hotkey in seen_hotkeys
-        ):
+        if not is_launch_hotkey(hotkey) or hotkey in seen_hotkeys:
             raise LedgerError(
                 "persisted confidential score report has an invalid or duplicate hotkey"
             )

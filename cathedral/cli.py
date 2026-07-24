@@ -1423,22 +1423,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 return "sha256:" + text
             return text
 
-        attestations = [
-            {
-                "hotkey": str(row["hotkey"]),
-                "verdict": str(row["verdict"]),
-                "evidence_digest": _normalized_digest(row["evidence_digest"]),
-                "envelope_digest": (
-                    str(row["envelope_digest"]) if row["envelope_digest"] is not None else None
-                ),
-                "challenge_digest": (
-                    str(row["challenge_digest"]) if row["challenge_digest"] is not None else None
-                ),
-                "disclosure": "controlled",
-            }
-            for row in ledger.attestation_rows(epoch_id)
-            if row["evidence_digest"]
-        ]
+        attestation_rows = ledger.attestation_rows(epoch_id)
 
         wire_digest = str(snapshot["report_digest"]).removeprefix("sha256:")
         # Deterministic manifest bytes: generated_at derives from the FROZEN
@@ -1513,6 +1498,32 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             raise ValueError(
                 "signed report carries positive entries outside the anchored "
                 f"snapshot: {sorted(stray_verified)}"
+            )
+        # Only a positive, receipt-backed candidate needs an attestation
+        # binding in the public replay manifest. Including every zero-work
+        # attested candidate can amplify a producer-valid 4,096-row epoch past
+        # the 2 MiB manifest ceiling even though only 28 positive candidates
+        # are supported by the replay byte budget.
+        attestations = [
+            {
+                "hotkey": str(row["hotkey"]),
+                "verdict": str(row["verdict"]),
+                "evidence_digest": _normalized_digest(row["evidence_digest"]),
+                "envelope_digest": (
+                    str(row["envelope_digest"]) if row["envelope_digest"] is not None else None
+                ),
+                "challenge_digest": (
+                    str(row["challenge_digest"]) if row["challenge_digest"] is not None else None
+                ),
+                "disclosure": "controlled",
+            }
+            for row in attestation_rows
+            if row["evidence_digest"] and str(row["hotkey"]) in verified_hotkeys
+        ]
+        if {row["hotkey"] for row in attestations} != verified_hotkeys:
+            missing = sorted(verified_hotkeys - {row["hotkey"] for row in attestations})
+            raise ValueError(
+                f"signed report carries positive entries without attestation bindings: {missing}"
             )
         candidate_rows = [
             {

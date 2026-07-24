@@ -1696,19 +1696,119 @@ def test_manifest_candidate_and_receipt_cardinality_boundaries():
                     for index in range(candidate_count)
                 ],
             },
-            attestations=[],
+            attestations=[
+                {
+                    "hotkey": f"miner-{index}",
+                    "verdict": "VERIFIED",
+                    "evidence_digest": "sha256:" + "8" * 64,
+                    "envelope_digest": "sha256:" + "9" * 64,
+                    "challenge_digest": "sha256:" + "a" * 64,
+                    "disclosure": "controlled",
+                }
+                for index in range(min(verified_count, MAX_MANIFEST_RECEIPTS))
+            ],
             wire_report_sha256=None,
         )
 
     parse_manifest(build(MAX_MANIFEST_CANDIDATES))
     with pytest.raises(EvidenceError, match="candidates list is invalid"):
         build(MAX_MANIFEST_CANDIDATES + 1)
-    parse_manifest(build(1, receipt_count=MAX_MANIFEST_RECEIPTS))
+    parse_manifest(
+        build(
+            MAX_MANIFEST_RECEIPTS,
+            receipt_count=MAX_MANIFEST_RECEIPTS,
+            verified_count=MAX_MANIFEST_RECEIPTS,
+        )
+    )
     with pytest.raises(EvidenceError, match="receipts is invalid"):
-        build(1, receipt_count=MAX_MANIFEST_RECEIPTS + 1)
-    parse_manifest(build(MAX_MANIFEST_RECEIPTS, verified_count=MAX_MANIFEST_RECEIPTS))
+        build(
+            MAX_MANIFEST_RECEIPTS,
+            receipt_count=MAX_MANIFEST_RECEIPTS + 1,
+            verified_count=MAX_MANIFEST_RECEIPTS,
+        )
     with pytest.raises(EvidenceError, match="verified-candidate count exceeds"):
-        build(MAX_MANIFEST_RECEIPTS + 1, verified_count=MAX_MANIFEST_RECEIPTS + 1)
+        build(
+            MAX_MANIFEST_RECEIPTS + 1,
+            receipt_count=MAX_MANIFEST_RECEIPTS,
+            verified_count=MAX_MANIFEST_RECEIPTS + 1,
+        )
+
+
+def test_maximum_launch_manifest_fits_the_public_fetch_ceiling():
+    """Every maximum-size launch identity remains one fetchable manifest."""
+    from cathedral.evidence import (
+        MAX_MANIFEST_ARTIFACT_BYTES,
+        MAX_MANIFEST_CANDIDATES,
+        MAX_MANIFEST_RECEIPTS,
+    )
+    from cathedral.launch_limits import MAX_LAUNCH_HOTKEY_BYTES
+
+    hotkeys = [
+        f"5{index:04x}" + "x" * (MAX_LAUNCH_HOTKEY_BYTES - 5)
+        for index in range(MAX_MANIFEST_CANDIDATES)
+    ]
+    verified = hotkeys[:MAX_MANIFEST_RECEIPTS]
+    verified_set = set(verified)
+    manifest = build_manifest(
+        network=NETWORK,
+        netuid=NETUID,
+        source_epoch=11,
+        epoch_id=1,
+        generated_at=None,
+        mechanism_id="validated_supply_v1",
+        mechanism_revision=1,
+        source_revision="a" * 64,
+        registry_release=1,
+        registry_digest=SNAPSHOT.digest,
+        registry_blob="sha256:" + "1" * 64,
+        verifier_digest=VERIFIER_DIGEST,
+        verifier_binary_blob="sha256:" + "2" * 64,
+        verifier_command=["/" + "v" * 4095],
+        verifier_artifacts=["/" + "a" * 4095],
+        report_id="sha256:" + "3" * 64,
+        report_blob="sha256:" + "4" * 64,
+        report_signing_key_id="k" * 128,
+        receipts=[
+            {
+                "receipt_id": "receipt-sha256:" + f"{index:064x}",
+                "hotkey": hotkey,
+                "blob": "sha256:" + "5" * 64,
+                "work_item_blob": "sha256:" + "6" * 64,
+                "result_blob": "sha256:" + "7" * 64,
+            }
+            for index, hotkey in enumerate(verified)
+        ],
+        attestations=[
+            {
+                "hotkey": hotkey,
+                "verdict": "VERIFIED",
+                "evidence_digest": "sha256:" + "8" * 64,
+                "envelope_digest": "sha256:" + "9" * 64,
+                "challenge_digest": "sha256:" + "a" * 64,
+                "disclosure": "controlled",
+            }
+            for hotkey in verified
+        ],
+        candidate_set={
+            "source": "sn39_metagraph",
+            "network": NETWORK,
+            "netuid": NETUID,
+            "block": 100,
+            "block_hash": "ab" * 32,
+            "candidates": [
+                {
+                    "hotkey": hotkey,
+                    "outcome": "verified" if hotkey in verified_set else "rejected",
+                    "reason": "r" * 200,
+                }
+                for hotkey in hotkeys
+            ],
+        },
+        wire_report_sha256="b" * 64,
+    )
+
+    assert 1024 * 1024 < len(manifest) <= MAX_MANIFEST_ARTIFACT_BYTES
+    assert len(parse_manifest(manifest)["candidate_set"]["candidates"]) == MAX_MANIFEST_CANDIDATES
 
 
 def test_cli_verify_artifact_accounting_three_per_receipt_plus_overhead(
