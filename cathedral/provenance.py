@@ -108,6 +108,7 @@ class MinerProvenance:
     measurement: str | None = None
     issued_at: str | None = None
     hardware_evidence_digest: str | None = None
+    work_verified: bool = False
     raw_verified: bool = False
 
 
@@ -359,6 +360,7 @@ def verify_and_recompute(
     now: datetime | None = None,
     registry_max_age_seconds: int = 86400,
     candidate_set: Mapping[str, Any] | None = None,
+    work_artifacts_by_receipt: Mapping[str, tuple[bytes, bytes]] | None = None,
     expected_class_id: str = "confidential_compute",
     expected_source_id: str = "cathedralconfidential",
     current_block: int | None = None,
@@ -533,6 +535,34 @@ def verify_and_recompute(
                     f"receipt {receipt_id} work units {receipt_units} != report units {units}"
                 )
             receipt_verified = True
+            work_verified = False
+            receipt_work = parsed.get("work") or {}
+            if work_artifacts_by_receipt is not None:
+                artifacts = work_artifacts_by_receipt.get(receipt_id)
+                if artifacts is None:
+                    raise ProvenanceError(
+                        f"no published work artifacts for {receipt_id!r}; a "
+                        "signer-only work assertion never earns"
+                    )
+                from cathedral.workproof import WorkProofError, verify_work_artifacts
+
+                try:
+                    verify_work_artifacts(
+                        artifacts[0],
+                        artifacts[1],
+                        expected_manifest_digest=str(
+                            receipt_work.get("manifest_digest")
+                        ),
+                        expected_result_digest=str(receipt_work.get("result_digest")),
+                        expected_challenge_id=str(receipt_work.get("challenge_id")),
+                        expected_hotkey=hotkey,
+                        expected_units=units,
+                    )
+                except WorkProofError as exc:
+                    raise ProvenanceError(
+                        f"independent work replay failed for {hotkey!r}: {exc}"
+                    ) from exc
+                work_verified = True
             receipt_measurement = parsed.get("measurement")
             receipt_issued_at = parsed.get("issued_at")
             receipt_hardware = (
@@ -542,6 +572,7 @@ def verify_and_recompute(
             receipt_quote_digest = receipt_hardware.get("evidence_digest")
             positive.append((hotkey, units))
         else:
+            work_verified = False
             receipt_measurement = None
             receipt_issued_at = None
             receipt_quote_digest = None
@@ -573,6 +604,7 @@ def verify_and_recompute(
                     if isinstance(receipt_quote_digest, str)
                     else None
                 ),
+                work_verified=work_verified,
             )
         )
 
@@ -701,6 +733,11 @@ def replay_positive_miners(
         if miner.hardware_evidence_digest is None:
             raise ProvenanceError(
                 f"receipt for {miner.hotkey!r} carries no hardware evidence digest"
+            )
+        if not miner.work_verified:
+            raise ProvenanceError(
+                f"work for {miner.hotkey!r} was not independently replayed; a "
+                "valid quote plus a signer-asserted work claim never reaches FULL"
             )
         challenge_digest = binding.get("challenge_digest")
         if not isinstance(challenge_digest, str) or not challenge_digest:

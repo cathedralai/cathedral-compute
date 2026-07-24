@@ -134,7 +134,25 @@ TRUSTED = {"cathedral-policy-test-1": _public_raw(REGISTRY_SEED)}
 SNAPSHOT = verify_registry(REGISTRY_BYTES, TRUSTED, now=NOW)
 
 
-def _fresh_claims(policy):
+def _work_fixture(challenge_id: str, hotkey: str, n_clauses: int = 20):
+    """A REAL solvable SAT workload whose canonical bytes reproduce the
+    receipt's manifest/result digests, so full provenance can replay it."""
+    from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
+    from cathedral.runtime import _sat_manifest_bytes, _sat_result_bytes
+
+    instance = SatInstance(n_vars=3, clauses=[[1, 2, -3]] * n_clauses)
+    item = SatWorkItem(instance=instance, seed=7, challenge_id=challenge_id)
+    certificate = SatCertificate(
+        satisfiable=True,
+        assignment=[1, 2, -3],
+        work_units=float(n_clauses),
+        challenge_id=challenge_id,
+        assigned_hotkey=hotkey,
+    )
+    return _sat_manifest_bytes(item), _sat_result_bytes(item, certificate)
+
+
+def _fresh_claims(policy, result_bytes: bytes = b"work-result-material"):
     verified_text = NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     claims = attestation_claims(b"raw-quote-secret", policy, verified_at=verified_text)
     claims = with_verified_channel(
@@ -142,7 +160,7 @@ def _fresh_claims(policy):
     )
     work = evaluated_claim(
         ClaimStatus.PASSED,
-        b"work-result-material",
+        result_bytes,
         SAT_WORK_POLICY_DIGEST,
         verified_at=verified_text,
     )
@@ -192,7 +210,10 @@ def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
         policy_registry_digest=SNAPSHOT.digest,
     )
     policy = SNAPSHOT.to_policy(at=NOW)
-    claims = _fresh_claims(policy)
+    work_item_bytes, result_bytes = _work_fixture(CHALLENGE_ID, "public-hotkey")
+    from cathedral.assurance import sha256_digest as _sha
+
+    claims = _fresh_claims(policy, result_bytes)
     receipt = ReceiptIssuer(SNAPSHOT, "receipt-test-1", RECEIPT_SEED).issue(
         epoch_id=epoch_id,
         source_epoch=11,
@@ -202,10 +223,11 @@ def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
         assurance=claims,
         worker_lifecycle=_fresh_lifecycle(claims, policy, "public-hotkey"),
         challenge_id=CHALLENGE_ID,
-        manifest_digest="sha256:" + "b" * 64,
+        manifest_digest=_sha(work_item_bytes),
         work_units=20.0,
         issued_at=NOW,
     )
+    ledger.record_work_artifacts(CHALLENGE_ID, work_item_bytes, result_bytes)
     ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
     ledger.resolve_challenge_with_receipt(
         CHALLENGE_ID,
@@ -280,6 +302,8 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
                 "receipt_id": "receipt-sha256:" + "3" * 64,
                 "hotkey": "public-hotkey",
                 "blob": "sha256:" + "4" * 64,
+                "work_item_blob": "sha256:" + "6" * 64,
+                "result_blob": "sha256:" + "7" * 64,
             }
         ],
         candidate_set={

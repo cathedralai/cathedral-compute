@@ -132,6 +132,12 @@ CREATE TABLE IF NOT EXISTS epoch_scores (
     PRIMARY KEY (epoch_id, hotkey)
 );
 
+CREATE TABLE IF NOT EXISTS work_artifacts (
+    challenge_id TEXT PRIMARY KEY,
+    work_item_body BLOB NOT NULL,
+    result_body BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS assurance_receipts (
     receipt_id TEXT PRIMARY KEY,
     epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
@@ -2014,6 +2020,51 @@ class Ledger:
                 "SELECT * FROM epochs WHERE epoch_id = ?", (epoch_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def record_work_artifacts(
+        self, challenge_id: str, work_item_body: bytes, result_body: bytes
+    ) -> None:
+        """Persist the canonical SAT work item and raw result bytes.
+
+        Idempotent for identical bytes; different bytes for a recorded
+        challenge are equivocation and fail closed.
+        """
+        if not challenge_id or not isinstance(work_item_body, bytes) or not isinstance(
+            result_body, bytes
+        ):
+            raise LedgerError("work artifacts are invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT work_item_body, result_body FROM work_artifacts "
+                "WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    bytes(row["work_item_body"]) != work_item_body
+                    or bytes(row["result_body"]) != result_body
+                ):
+                    raise LedgerError(
+                        f"work artifacts for {challenge_id!r} are immutable"
+                    )
+                return
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO work_artifacts (challenge_id, work_item_body, "
+                    "result_body, created_at) VALUES (?, ?, ?, ?)",
+                    (challenge_id, work_item_body, result_body, _now()),
+                )
+
+    def work_artifacts_for_challenge(
+        self, challenge_id: str
+    ) -> Mapping[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT work_item_body, result_body FROM work_artifacts "
+                "WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
 
     def receipt_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
         with self._lock:

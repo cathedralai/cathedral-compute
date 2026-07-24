@@ -1306,11 +1306,33 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                     )
                 blob = store.put_blob(body)
                 store.put_receipt_copy(receipt_id, body)
+                receipt_document = json.loads(body)
+                receipt_work = receipt_document.get("work") or {}
+                artifacts = ledger.work_artifacts_for_challenge(
+                    str(receipt_work.get("challenge_id"))
+                )
+                if artifacts is None:
+                    raise ValueError(
+                        f"receipt {receipt_id!r} has no persisted work "
+                        "artifacts; a signer-only work assertion is never "
+                        "publishable"
+                    )
+                work_item_body = bytes(artifacts["work_item_body"])
+                result_body = bytes(artifacts["result_body"])
+                if digest_bytes(work_item_body) != receipt_work.get(
+                    "manifest_digest"
+                ) or digest_bytes(result_body) != receipt_work.get("result_digest"):
+                    raise ValueError(
+                        f"persisted work artifacts for {receipt_id!r} do not "
+                        "match the receipt's signed digests"
+                    )
                 manifest_receipts.append(
                     {
                         "receipt_id": receipt_id,
                         "hotkey": entry["miner_hotkey"],
                         "blob": blob,
+                        "work_item_blob": store.put_blob(work_item_body),
+                        "result_blob": store.put_blob(result_body),
                     }
                 )
 
@@ -2196,6 +2218,13 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         receipts_by_id = {
             row["receipt_id"]: load_blob(row["blob"]) for row in manifest["receipts"]
         }
+        work_artifacts_by_receipt = {
+            row["receipt_id"]: (
+                load_blob(row["work_item_blob"]),
+                load_blob(row["result_blob"]),
+            )
+            for row in manifest["receipts"]
+        }
         logger.event(
             "EVIDENCE_ARTIFACTS_FETCHED",
             stage="fetch",
@@ -2216,6 +2245,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             expected_verifier_digest=args.verifier_digest,
             mechanism_id=args.mechanism,
             registry_max_age_seconds=args.registry_max_age_secs,
+            work_artifacts_by_receipt=work_artifacts_by_receipt,
         )
         if result.policy_release != manifest["policy_registry"]["release"]:
             raise EvidenceError("verified registry release differs from the manifest")

@@ -467,7 +467,8 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     for row in receipts:
         if (
             not isinstance(row, Mapping)
-            or set(row) != {"receipt_id", "hotkey", "blob"}
+            or set(row)
+            != {"receipt_id", "hotkey", "blob", "work_item_blob", "result_blob"}
             or not isinstance(row["receipt_id"], str)
             or not row["receipt_id"].startswith("receipt-sha256:")
             or not isinstance(row["hotkey"], str)
@@ -475,6 +476,8 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         ):
             raise EvidenceError("evidence manifest receipt row is invalid")
         _require_digest(row["blob"], "receipt blob")
+        _require_digest(row["work_item_blob"], "work item blob")
+        _require_digest(row["result_blob"], "work result blob")
     attestations = document["attestations"]
     if not isinstance(attestations, list):
         raise EvidenceError("evidence manifest attestations is invalid")

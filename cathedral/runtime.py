@@ -1249,6 +1249,7 @@ class ConfidentialRuntime:
                         assurance,
                         status="verified",
                         work_units=units,
+                        certificate=certificate,
                         customer_lease=lease,
                         customer_disposition="succeeded" if lease is not None else None,
                         customer_result=(
@@ -1279,7 +1280,18 @@ class ConfidentialRuntime:
         customer_disposition: str | None = None,
         customer_result: Mapping[str, object] | None = None,
         customer_error: str | None = None,
+        certificate: SatCertificate | None = None,
     ) -> None:
+        if status == "verified" and certificate is not None:
+            # Durable canonical work artifacts: the exact bytes the receipt's
+            # manifest/result digests sign, so full provenance can replay the
+            # workload independently. Recorded before the receipt so a crash
+            # can never leave a receipt without its replayable work.
+            self.ledger.record_work_artifacts(
+                item.challenge_id,
+                _sat_manifest_bytes(item),
+                _sat_result_bytes(item, certificate),
+            )
         if self.receipt_issuer is None:
             self.ledger.resolve_challenge(
                 item.challenge_id,
@@ -1576,7 +1588,9 @@ def _work_assurance(
     return claims.with_claim(AssuranceDimension.WORK, work)
 
 
-def _sat_manifest_digest(item: SatWorkItem) -> str:
+def _sat_manifest_bytes(item: SatWorkItem) -> bytes:
+    """The EXACT canonical work-item bytes the receipt's manifest digest
+    signs — persisted so full provenance can replay the workload."""
     manifest = {
         "schema": "cathedral_sat_manifest_v1",
         "challenge_id": item.challenge_id,
@@ -1586,14 +1600,40 @@ def _sat_manifest_digest(item: SatWorkItem) -> str:
             "clauses": item.instance.clauses,
         },
     }
-    encoded = json.dumps(
+    return json.dumps(
         manifest,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
         allow_nan=False,
     ).encode("ascii")
-    return sha256_digest(encoded)
+
+
+def _sat_result_bytes(item: SatWorkItem, certificate: SatCertificate | None) -> bytes:
+    """The EXACT canonical result bytes the work claim's evidence digest
+    signs (mirrors _work_assurance's material encoding)."""
+    material = {
+        "assigned_hotkey": certificate.assigned_hotkey if certificate else None,
+        "assignment": (
+            list(certificate.assignment)
+            if certificate is not None and isinstance(certificate.assignment, list)
+            else None
+        ),
+        "challenge_id": item.challenge_id,
+        "satisfiable": certificate.satisfiable if certificate else None,
+        "work_units": certificate.work_units if certificate else None,
+    }
+    return json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def _sat_manifest_digest(item: SatWorkItem) -> str:
+    return sha256_digest(_sat_manifest_bytes(item))
 
 
 def _sat_certificate_json(certificate: SatCertificate) -> Mapping[str, object]:
