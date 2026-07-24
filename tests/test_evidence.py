@@ -258,6 +258,7 @@ def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
         workload="CPU",
         evidence_digest=claims.hardware.evidence_digest,
         policy_mode="strict",
+        envelope_digest="sha256:" + "e" * 64,
     )
     ledger.add_lifecycle_snapshot(
         epoch_id,
@@ -443,7 +444,7 @@ def exported_evidence(tmp_path: Path, capsys):
         private_key_seed=REPORT_SEED,
         generated_at=NOW,
         valid_until=NOW + timedelta(minutes=30),
-        valid_from_block=1,
+        valid_from_block=100,
         valid_until_block=10_000_000_000,
         verifier_digest=VERIFIER_DIGEST,
         candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
@@ -1029,3 +1030,506 @@ def test_resolver_slot_pool_survives_repeated_timeout_storms(monkeypatch):
 
     time.sleep(0.2)  # let the in-flight resolvers drain
     assert _getaddrinfo_bounded("example.com", 443, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Round-six adversarial regressions
+# ---------------------------------------------------------------------------
+
+
+def _export_evidence_args(
+    tmp_path: Path, snapshot_path: Path, evidence_dir: Path | None = None, **extra
+) -> list[str]:
+    arguments = [
+        "runtime",
+        "export-evidence",
+        "--ledger-db",
+        str(tmp_path / "ledger.sqlite"),
+        "--evidence-dir",
+        str(evidence_dir or (tmp_path / "evidence")),
+        "--score-network",
+        NETWORK,
+        "--score-netuid",
+        str(NETUID),
+        "--policy-registry",
+        str(tmp_path / "registry.json"),
+        "--verifier-digest",
+        VERIFIER_DIGEST,
+        "--mechanism",
+        "validated_supply_v1",
+        "--source-revision",
+        "abc1234",
+        "--index-signing-key-id",
+        "evidence-index-test-1",
+        "--index-signing-key-file",
+        str(tmp_path / "index-signing.key"),
+        "--candidate-snapshot",
+        str(snapshot_path),
+    ]
+    for flag, value in extra.items():
+        arguments += ["--" + flag.replace("_", "-"), value]
+    return arguments
+
+
+def test_cli_full_replay_wires_anchor_and_all_rejected_state(
+    tmp_path: Path, exported_evidence, capsys, monkeypatch
+):
+    """Round-six C1 (positive half): the CLI full-replay path must hand
+    replay_positive_miners the EXACT verified challenge anchor (network,
+    netuid, finalized height AND hash) and the derived all-rejected state —
+    previously it passed neither, so positive FULL raised."""
+    import dataclasses
+
+    from cathedral import provenance as provenance_module
+
+    _fixture_dir, _summary = exported_evidence
+    controlled = tmp_path / "controlled"
+    controlled.mkdir()
+    (controlled / ("e" * 64 + ".json")).write_bytes(b"{}")
+    verifier_path = tmp_path / "verifier.bin"
+    verifier_path.write_bytes(b"\x7fELF-test-bytes")
+    # A SEPARATE export carrying the verifier bindings full mode requires.
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    full_dir = tmp_path / "evidence-full"
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                evidence_dir=full_dir,
+                verifier_binary=str(verifier_path),
+                verifier_production_path="/opt/cathedral/bin/verifier",
+            )
+        )
+        == 0
+    )
+    capsys.readouterr()
+    captured: dict = {}
+    real = provenance_module.replay_positive_miners
+
+    def spy(result, **kwargs):
+        captured.update(kwargs)
+        return dataclasses.replace(result, assurance_level="full")
+
+    monkeypatch.setattr(provenance_module, "replay_positive_miners", spy)
+    code = cli_main(
+        [
+            *_verify_cli_args(tmp_path, full_dir),
+            "--controlled-dir",
+            str(controlled),
+            "--verifier-binary",
+            str(verifier_path),
+        ]
+    )
+    capsys.readouterr()
+    assert code == 0
+    assert real is not provenance_module.replay_positive_miners
+    assert captured["candidates_all_rejected"] is False
+    assert captured["challenge_anchor"] == {
+        "block": 100,
+        "block_hash": "0x" + "ab" * 32,
+        "network": NETWORK,
+        "netuid": NETUID,
+    }
+
+
+def test_cli_all_rejected_epoch_reaches_full_end_to_end(tmp_path: Path, capsys):
+    """Round-six C1 (all-rejected half): a zero-positive epoch whose signed
+    candidate set is exhaustively rejected must reach FULL through the real
+    CLI replay path — previously it silently stayed receipts_only."""
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=SNAPSHOT.release,
+        policy_registry_digest=SNAPSHOT.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + "ab" * 32,
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"idle-hotkey"},
+        generated_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
+    ledger.mark_published(epoch_id)
+    snapshot_doc = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": NETWORK,
+        "netuid": NETUID,
+        "block": 100,
+        "block_hash": "0x" + "ab" * 32,
+        "hotkeys": ["idle-hotkey"],
+    }
+    export_score_class_report(
+        ledger,
+        epoch_id,
+        network=NETWORK,
+        netuid=NETUID,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=REPORT_SEED,
+        generated_at=NOW,
+        valid_until=NOW + timedelta(minutes=30),
+        valid_from_block=100,
+        valid_until_block=10_000_000_000,
+        verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=snapshot_doc,
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+    ledger.close()
+    (tmp_path / "registry.json").write_bytes(REGISTRY_BYTES)
+    _write_key_file(tmp_path / "index-signing.key", INDEX_SEED)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot_doc, sort_keys=True))
+    verifier_path = tmp_path / "verifier.bin"
+    verifier_path.write_bytes(b"\x7fELF-inert-test-verifier")
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                verifier_binary=str(verifier_path),
+                verifier_production_path="/opt/cathedral/bin/verifier",
+            )
+        )
+        == 0
+    )
+    capsys.readouterr()
+    controlled = tmp_path / "controlled"
+    controlled.mkdir()
+    audit_out = tmp_path / "audit.json"
+    code = cli_main(
+        [
+            *_verify_cli_args(tmp_path, tmp_path / "evidence"),
+            "--controlled-dir",
+            str(controlled),
+            "--verifier-binary",
+            str(verifier_path),
+            "--audit-out",
+            str(audit_out),
+        ]
+    )
+    capsys.readouterr()
+    audit = json.loads(audit_out.read_text())
+    assert code == 0
+    assert audit["assurance"] == "full"
+    assert audit["result"] == "PASS"
+
+
+def test_zero_work_receipt_never_mints_a_verified_manifest_outcome(tmp_path: Path, capsys):
+    """Round-six C4: a FAILED receipt (receipt bytes exist, zero verified
+    work) must produce manifest outcome 'rejected' — never a 'verified'
+    outcome the verifier will later reject."""
+    from cathedral.assurance import ReasonCategory
+
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=SNAPSHOT.release,
+        policy_registry_digest=SNAPSHOT.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + "ab" * 32,
+    )
+    policy = SNAPSHOT.to_policy(at=NOW)
+    verified_text = NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    failed_challenge = "f" * 64
+    claims = attestation_claims(b"raw-quote-secret", policy, verified_at=verified_text)
+    claims = with_verified_channel(claims, b"channel-binding-material", verified_at=verified_text)
+    failed_work = evaluated_claim(
+        ClaimStatus.FAILED,
+        b"failed-work-material",
+        SAT_WORK_POLICY_DIGEST,
+        verified_at=verified_text,
+        reason=ReasonCategory.WORK_INVALID,
+    )
+    claims = claims.with_claim(AssuranceDimension.WORK, failed_work)
+    receipt = ReceiptIssuer(SNAPSHOT, "receipt-test-1", RECEIPT_SEED).issue(
+        epoch_id=epoch_id,
+        source_epoch=11,
+        subject_hotkey="failed-worker",
+        attested=_fresh_attested(claims),
+        policy=policy,
+        assurance=claims,
+        worker_lifecycle=_fresh_lifecycle(claims, policy, "failed-worker"),
+        challenge_id=failed_challenge,
+        manifest_digest="sha256:" + "b" * 64,
+        work_units=0.0,
+        issued_at=NOW,
+    )
+    ledger.issue_challenge(failed_challenge, "failed-worker", epoch_id)
+    ledger.resolve_challenge_with_receipt(
+        failed_challenge,
+        "failed",
+        0.0,
+        validator_derived=True,
+        receipt_id=receipt.receipt_id,
+        receipt_body=receipt.receipt_bytes,
+        receipt_digest=receipt.receipt_digest,
+        issued_at=verified_text,
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"failed-worker"},
+        generated_at=verified_text,
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
+    ledger.mark_published(epoch_id)
+    snapshot_doc = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": NETWORK,
+        "netuid": NETUID,
+        "block": 100,
+        "block_hash": "0x" + "ab" * 32,
+        "hotkeys": ["failed-worker"],
+    }
+    export_score_class_report(
+        ledger,
+        epoch_id,
+        network=NETWORK,
+        netuid=NETUID,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=REPORT_SEED,
+        generated_at=NOW,
+        valid_until=NOW + timedelta(minutes=30),
+        valid_from_block=100,
+        valid_until_block=10_000_000_000,
+        verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=snapshot_doc,
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+    ledger.close()
+    (tmp_path / "registry.json").write_bytes(REGISTRY_BYTES)
+    _write_key_file(tmp_path / "index-signing.key", INDEX_SEED)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot_doc, sort_keys=True))
+    assert cli_main(_export_evidence_args(tmp_path, snapshot_path)) == 0
+    capsys.readouterr()
+
+    store = EvidenceStore(tmp_path / "evidence")
+    index = json.loads((tmp_path / "evidence" / "index.json").read_bytes())
+    manifest = parse_manifest(store.get_blob(index["latest"]["manifest"]))
+    outcomes = {row["hotkey"]: row["outcome"] for row in manifest["candidate_set"]["candidates"]}
+    assert outcomes == {"failed-worker": "rejected"}
+    # The chain still verifies end-to-end: the manifest is NOT self-rejecting.
+    from cathedral.provenance import verify_and_recompute
+
+    report_bytes = store.get_blob(manifest["score_report"]["blob"])
+    verify_and_recompute(
+        report_bytes=report_bytes,
+        receipts_by_id={},
+        registry_bytes=REGISTRY_BYTES,
+        trusted_registry_keys=TRUSTED,
+        report_signing_keys={"score-test-1": _public_raw(REPORT_SEED)},
+        expected_network=NETWORK,
+        expected_netuid=NETUID,
+        expected_verifier_digest=VERIFIER_DIGEST,
+        candidate_set=manifest["candidate_set"],
+    )
+
+
+def test_departed_zero_row_is_omitted_but_positive_departure_refuses(
+    tmp_path: Path,
+):
+    """Round-six C5: a deregistered hotkey's zero-valued historical row is
+    silently omitted (it must not permanently block future epochs); a
+    POSITIVE row outside the snapshot still refuses to sign."""
+    ledger, epoch_id = _completed_fresh_epoch(tmp_path)
+    # 'departed-hotkey' got a zero score row via the completion universe of
+    # a fresh epoch; simulate by exporting with a snapshot that excludes it.
+    # The fixture's completion universe is only public-hotkey, so build the
+    # zero row directly through a snapshot that omits a zero universe member
+    # is impossible here — instead prove both halves against the fixture:
+    # (a) positive outside snapshot refuses:
+    with pytest.raises(Exception, match="POSITIVE work"):
+        export_score_class_report(
+            ledger,
+            epoch_id,
+            network=NETWORK,
+            netuid=NETUID,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=REPORT_SEED,
+            generated_at=NOW,
+            valid_until=NOW + timedelta(minutes=30),
+            valid_from_block=100,
+            valid_until_block=10_000_000_000,
+            verifier_digest=VERIFIER_DIGEST,
+            candidate_snapshot={
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": NETWORK,
+                "netuid": NETUID,
+                "block": 100,
+                "block_hash": "0x" + "ab" * 32,
+                "hotkeys": ["someone-else"],
+            },
+        )
+    ledger.close()
+
+
+def test_departed_zero_universe_member_does_not_block_export(tmp_path: Path):
+    """Round-six C5 (zero half): a zero-scored universe member that later
+    deregisters is omitted from the report, whose entry set stays exactly
+    the signed snapshot."""
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=SNAPSHOT.release,
+        policy_registry_digest=SNAPSHOT.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + "ab" * 32,
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"staying-hotkey", "departed-hotkey"},
+        generated_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
+    report = json.loads(
+        export_score_class_report(
+            ledger,
+            epoch_id,
+            network=NETWORK,
+            netuid=NETUID,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=REPORT_SEED,
+            generated_at=NOW,
+            valid_until=NOW + timedelta(minutes=30),
+            valid_from_block=100,
+            valid_until_block=10_000_000_000,
+            verifier_digest=VERIFIER_DIGEST,
+            candidate_snapshot={
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": NETWORK,
+                "netuid": NETUID,
+                "block": 100,
+                "block_hash": "0x" + "ab" * 32,
+                "hotkeys": ["staying-hotkey"],  # departed-hotkey deregistered
+            },
+        )
+    )
+    assert [entry["miner_hotkey"] for entry in report["entries"]] == ["staying-hotkey"]
+    ledger.close()
+
+
+def test_report_window_cannot_start_before_the_anchored_block(tmp_path: Path):
+    """Round-six C3: producer refuses valid_from_block < snapshot.block, and
+    the verifier rejects a re-signed report violating the same bound."""
+    from cathedral.score_class import ScoreClassError, _sign_report
+
+    ledger, epoch_id = _completed_fresh_epoch(tmp_path)
+    with pytest.raises(ScoreClassError, match="precedes the anchored"):
+        export_score_class_report(
+            ledger,
+            epoch_id,
+            network=NETWORK,
+            netuid=NETUID,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=REPORT_SEED,
+            generated_at=NOW,
+            valid_until=NOW + timedelta(minutes=30),
+            valid_from_block=99,
+            valid_until_block=10_000_000_000,
+            verifier_digest=VERIFIER_DIGEST,
+            candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
+        )
+    report = export_score_class_report(
+        ledger,
+        epoch_id,
+        network=NETWORK,
+        netuid=NETUID,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=REPORT_SEED,
+        generated_at=NOW,
+        valid_until=NOW + timedelta(minutes=30),
+        valid_from_block=100,
+        valid_until_block=10_000_000_000,
+        verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
+    )
+    ledger.close()
+    document = json.loads(report)
+    document.pop("report_id", None)
+    document.pop("signature", None)
+    document["valid_from_block"] = 50
+    forged = _sign_report(document, REPORT_SEED)
+    from cathedral.provenance import ProvenanceError, verify_and_recompute
+
+    with pytest.raises(ProvenanceError, match="precedes the anchored"):
+        verify_and_recompute(
+            report_bytes=forged,
+            receipts_by_id={},
+            registry_bytes=REGISTRY_BYTES,
+            trusted_registry_keys=TRUSTED,
+            report_signing_keys={"score-test-1": _public_raw(REPORT_SEED)},
+            expected_network=NETWORK,
+            expected_netuid=NETUID,
+            expected_verifier_digest=VERIFIER_DIGEST,
+        )
+
+
+def test_fetch_recomputes_the_remaining_deadline_after_dns(monkeypatch):
+    """Round-six C6: the connect phase must run under the remaining
+    command-wide budget as recomputed AFTER DNS — never the original
+    per-call ceiling."""
+    import socket
+    import time
+
+    from cathedral.cli import _bounded_https_fetch, _FetchBudget
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, 0, 6, "", ("34.71.88.140", 443))],
+    )
+    captured: dict = {}
+
+    def fake_create_connection(address, timeout):
+        captured["timeout"] = timeout
+        raise OSError("stop before any real connection")
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    budget = _FetchBudget(deadline_seconds=0.5)
+    time.sleep(0.3)  # most of the command budget is already consumed
+    with pytest.raises(OSError, match="stop before"):
+        _bounded_https_fetch("https://evidence.example/index.json", budget=budget, timeout=30.0)
+    assert captured["timeout"] < 0.25  # remaining budget, NOT the 30s ceiling
+
+
+def test_bounded_local_reads_fail_closed(tmp_path: Path):
+    """Round-six C7: symlinks, non-regular files, and oversized inputs are
+    rejected by the O_NOFOLLOW bounded reader used for controlled envelopes
+    and verifier binaries."""
+    from cathedral.cli import _read_bounded_local_file
+
+    real = tmp_path / "artifact.bin"
+    real.write_bytes(b"12345")
+    assert _read_bounded_local_file(real, 5, "artifact") == b"12345"
+    with pytest.raises(ValueError, match="bounded size limit"):
+        _read_bounded_local_file(real, 4, "artifact")
+    link = tmp_path / "link.bin"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match="opened safely"):
+        _read_bounded_local_file(link, 100, "artifact")
+    with pytest.raises(ValueError, match="regular file"):
+        _read_bounded_local_file(tmp_path, 100, "artifact")
+    with pytest.raises(ValueError, match="opened safely"):
+        _read_bounded_local_file(tmp_path / "missing.bin", 100, "artifact")

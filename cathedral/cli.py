@@ -64,6 +64,7 @@ from cathedral.receipt import (
     parse_receipt_json,
     verify_receipt,
 )
+from cathedral.replay import MAX_ENVELOPE_BYTES
 from cathedral.runtime import (
     MAX_BEARER_TOKEN_LENGTH,
     ConfidentialRuntime,
@@ -1353,7 +1354,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
 
         verifier_binary_blob = None
         if args.verifier_binary:
-            verifier_binary_blob = store.put_blob(Path(args.verifier_binary).read_bytes())
+            verifier_binary_blob = store.put_blob(
+                _read_bounded_local_file(
+                    args.verifier_binary, MAX_VERIFIER_FETCH_BYTES, "verifier binary"
+                )
+            )
 
         def _normalized_digest(value: str) -> str:
             text = str(value)
@@ -1433,26 +1438,31 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 "challenge anchor (persisted at begin_epoch)"
             )
         registered = {str(h) for h in snapshot_document["hotkeys"]}
-        row_outcomes = {
-            str(row["hotkey"]): ("verified" if row["receipt_id"] else "rejected")
-            for row in snapshot["rows"]
-        }
-        unregistered = set(row_outcomes) - registered
-        if unregistered:
+        # EVERY registered hotkey at the anchored snapshot is accounted for,
+        # and "verified" is asserted ONLY for entries the SIGNED report backs
+        # with positive verified work and a verified receipt reference — the
+        # ledger's mere possession of a receipt row (failed or zero-work)
+        # must never mint a manifest outcome the verifier will later reject.
+        # Only hotkeys appear — never machine identity or endpoints.
+        from decimal import Decimal as _Decimal
+
+        verified_hotkeys = set()
+        for entry in report.get("entries", []):
+            units_text = str(entry.get("metrics", {}).get("verified_work_units", "0"))
+            if entry.get("evidence") and _Decimal(units_text) > 0:
+                verified_hotkeys.add(str(entry["miner_hotkey"]))
+        stray_verified = verified_hotkeys - registered
+        if stray_verified:
             raise ValueError(
-                f"scored hotkeys are not registered at the anchored block: {sorted(unregistered)}"
+                "signed report carries positive entries outside the anchored "
+                f"snapshot: {sorted(stray_verified)}"
             )
-        # EVERY registered hotkey at the anchored snapshot is accounted for:
-        # verified with evidence, or rejected/no-verified-work. Only hotkeys
-        # appear - never machine identity or endpoints.
         candidate_rows = [
             {
                 "hotkey": hotkey,
-                "outcome": row_outcomes.get(hotkey, "rejected"),
+                "outcome": "verified" if hotkey in verified_hotkeys else "rejected",
                 "reason": (
-                    "receipt_verified"
-                    if row_outcomes.get(hotkey) == "verified"
-                    else "no_verified_work"
+                    "receipt_verified" if hotkey in verified_hotkeys else "no_verified_work"
                 ),
             }
             for hotkey in sorted(registered)
@@ -1707,6 +1717,37 @@ class _FetchBudget:
         self.remaining_seconds()
 
 
+def _read_bounded_local_file(path, max_bytes: int, label: str) -> bytes:
+    """Read a local artifact fail-closed: O_NOFOLLOW at open, post-open
+    fstat regular-file verification (the opened descriptor is what gets
+    read, so a swap after the check cannot redirect the read), and a
+    max+1 bounded read loop that rejects oversized input outright."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise ValueError(
+            f"{label} cannot be opened safely (missing, unreadable, or a symlink)"
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        chunks: list[bytes] = []
+        received = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, max_bytes + 1 - received))
+            if not chunk:
+                break
+            received += len(chunk)
+            if received > max_bytes:
+                raise ValueError(f"{label} exceeds the bounded size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 RESOLVER_SLOT_CAP = 16
 _RESOLVER_SLOTS = None
 _RESOLVER_SLOTS_GUARD = None
@@ -1837,10 +1878,25 @@ def _bounded_https_fetch(
         raise ValueError("evidence URL has no host")
     if budget is not None:
         budget.start_artifact()
-        timeout = min(timeout, budget.remaining_seconds())
+    # ONE total deadline for this fetch, drawn down by EVERY phase: the
+    # per-call ceiling and the command-wide budget both bound it, and the
+    # remaining time is RECOMPUTED after DNS and before every blocking
+    # connect, TLS, request/header, and body-read phase — DNS time consumes
+    # the same total, so a slow resolver can never re-arm a later phase.
+    fetch_deadline = _time.monotonic() + timeout
+
+    def _phase_timeout() -> float:
+        remaining = fetch_deadline - _time.monotonic()
+        if budget is not None:
+            remaining = min(remaining, budget.remaining_seconds())
+        if remaining <= 0:
+            raise ValueError("evidence fetch exceeded the total deadline")
+        return remaining
+
     peer_ip, peer_port = _resolved_public_address(
         host, parsed.port or 443, allow_private=allow_private, budget=budget
     )
+    _phase_timeout()  # DNS consumed shared time; fail now if exhausted
 
     class _PinnedConnection(_http.HTTPSConnection):
         def connect(self) -> None:
@@ -1848,30 +1904,29 @@ def _bounded_https_fetch(
             self.sock = self._context.wrap_socket(raw, server_hostname=host)
 
     context = _ssl.create_default_context()
-    connection = _PinnedConnection(host, peer_port, timeout=timeout, context=context)
+    connection = _PinnedConnection(host, peer_port, timeout=_phase_timeout(), context=context)
     try:
         target = parsed.path or "/"
         if parsed.query:
             raise ValueError("evidence URLs must be query-free")
+        connection.connect()  # TCP + TLS under the freshly computed bound
+        connection.sock.settimeout(_phase_timeout())  # request/header phase
         connection.request(
             "GET",
             target,
             headers={"Host": host, "User-Agent": "cathedral-provenance/1.0"},
         )
+        connection.sock.settimeout(_phase_timeout())
         response = connection.getresponse()
         if response.status != 200:
             raise ValueError(
                 f"evidence fetch failed with status {response.status} "
                 "(redirects and errors are never followed)"
             )
-        deadline = _time.monotonic() + timeout
         chunks: list[bytes] = []
         received = 0
         while True:
-            if _time.monotonic() > deadline:
-                raise ValueError("evidence fetch exceeded the total deadline")
-            if budget is not None:
-                budget.remaining_seconds()
+            connection.sock.settimeout(_phase_timeout())
             chunk = response.read(min(65536, max_bytes + 1 - received))
             if not chunk:
                 break
@@ -2455,24 +2510,54 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 envelope_path = (
                     Path(controlled_dir) / f"{str(envelope_digest).split(':', 1)[1]}.json"
                 )
-                if envelope_path.is_symlink() or not envelope_path.is_file():
-                    raise EvidenceError(f"controlled envelope file missing for {miner.hotkey!r}")
-                envelopes[miner.hotkey] = envelope_path.read_bytes()
+                try:
+                    envelopes[miner.hotkey] = _read_bounded_local_file(
+                        envelope_path,
+                        MAX_ENVELOPE_BYTES,
+                        f"controlled envelope for {miner.hotkey!r}",
+                    )
+                except ValueError as exc:
+                    raise EvidenceError(str(exc)) from exc
             verifier_info = manifest["verifier"]
             if not verifier_info["binary_blob"] or not verifier_info["command"]:
                 raise EvidenceError("manifest lacks verifier binary/command bindings for full mode")
             if getattr(args, "verifier_binary", None):
-                binary_path = Path(args.verifier_binary)
-                if binary_path.stat().st_size > MAX_VERIFIER_FETCH_BYTES:
-                    raise EvidenceError("verifier binary exceeds the bounded limit")
-                verifier_bytes = binary_path.read_bytes()
+                try:
+                    verifier_bytes = _read_bounded_local_file(
+                        args.verifier_binary,
+                        MAX_VERIFIER_FETCH_BYTES,
+                        "verifier binary",
+                    )
+                except ValueError as exc:
+                    raise EvidenceError(str(exc)) from exc
             else:
                 verifier_bytes = load_blob(
                     verifier_info["binary_blob"],
                     max_bytes=MAX_VERIFIER_FETCH_BYTES,
                 )
+            # The challenge anchor and the all-rejected determination come
+            # from the SIGNED, ALREADY-VERIFIED chain: verify_and_recompute
+            # proved the manifest candidate_set equals the report's signed
+            # snapshot binding (block, hash, hotkeys), so these values are
+            # exactly what the epoch's nonces were derived from. Without
+            # them, positive FULL would fail and an all-rejected epoch would
+            # silently stay receipts-only.
+            candidate_snapshot = manifest["candidate_set"]
+            active_candidates = [
+                row for row in candidate_snapshot["candidates"] if row["outcome"] != "retired"
+            ]
+            all_rejected = bool(active_candidates) and all(
+                row["outcome"] == "rejected" for row in active_candidates
+            )
             result = provenance_module.replay_positive_miners(
                 result,
+                candidates_all_rejected=all_rejected,
+                challenge_anchor={
+                    "block": int(candidate_snapshot["block"]),
+                    "block_hash": str(candidate_snapshot["block_hash"]),
+                    "network": args.network,
+                    "netuid": int(args.netuid),
+                },
                 registry=provenance_module.load_registry(
                     registry_bytes,
                     registry_keys,
@@ -2980,8 +3065,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--challenge-anchor-hash",
             default=None,
-            help="hash of the finalized anchor block; nonces derive from it "
-            "under the cathedral-tdx-challenge-v1 domain",
+            help="hash of the finalized anchor block; nonces derive from the "
+            "normalized height AND hash under the cathedral-tdx-challenge-v2 "
+            "domain",
         )
         command.add_argument(
             "--evidence-retention-dir",
