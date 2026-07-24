@@ -9,7 +9,7 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 | Item | Status | Evidence |
 |---|---|---|
 | 1. Evidence bundle + retention + controlled disclosure | IMPLEMENTED, locally tested | mandatory production retention (preflight + admission + ledger gates), TDX-only token-free envelopes, `runtime export-evidence`, `provenance export-controlled`; suites in tests/test_evidence.py, test_replay.py, test_ledger_envelope_migration.py |
-| 2. Concurrent thin + full-provenance modes | IMPLEMENTED, locally tested | subnet two-mode validator: shadow = single-flight background worker (timing-proven ≥10s audit cannot delay thin ticks); authority requires FULL assurance and derives its own UID vector; ONE metagraph snapshot per tick supplies the UID map, the current block, and the independent candidate-membership set; authority state fences are one atomic flock check-and-reserve (two-thread counterexample in tests) |
+| 2. Concurrent thin + full-provenance modes | IMPLEMENTED, locally tested | subnet two-mode validator: shadow = single-flight background worker (timing-proven ≥10s audit cannot delay thin ticks); authority requires FULL assurance, derives its own UID vector, and RESERVES its durable fence (index+policy+report lines and chain identity, one flock hold) BEFORE any PASS is emitted; candidate membership is proven by EXACT equality against the HISTORICAL metagraph at the anchored block via the validator's own chain queries (current-metagraph drift is not an input; unavailable history is NOT_PROVEN) |
 | 3. Versioned reward mechanisms | IMPLEMENTED | `validated_supply_v1` (units-proportional shares + fixed 10% burn) pinned in manifests, provenance recompute, and validator config |
 | 4. Public artifact/index surfaces | IMPLEMENTED, NOT DEPLOYED | content-addressed store + signed index with full recent-row validation and verified history carry; manifests carry a versioned `candidate_set` anchored to an independently fetched SN39 metagraph snapshot (`cathedral_candidate_snapshot_v1`: network/netuid/block/block_hash + exact hotkeys, no machine identity); deploy blocked pending review |
 | 5. TTY + JSONL logs | IMPLEMENTED, locally tested | hardened EventLoggers both repos (recursive redaction, control-char neutralization, 0600 O_NOFOLLOW) |
@@ -76,21 +76,31 @@ recorded, justified exception — not a silent suppression.
   SN39 block hash; cross-epoch evidence reuse fails cryptographically with
   no replay cache involved. Production CPU scoring REFUSES to start without
   a challenge anchor.
-- **Independent candidate set.** `runtime export-evidence` requires a
-  `cathedral_candidate_snapshot_v1` file (independently fetched SN39
-  metagraph: network/netuid/block/block_hash + exact registered hotkeys)
-  and accounts for EVERY registered hotkey (verified/rejected/retired).
-  Full validators re-fetch the metagraph themselves and reject manifests
-  whose candidates are not registered on chain or whose anchored block hash
-  does not match the independently queried chain.
+- **Independent candidate set.** The finalized-block challenge anchor is
+  persisted ON THE EPOCH at `begin_epoch` (validated block+hash pair with
+  its audience); nonce derivation and the durable record are read-back
+  asserted equal. `runtime export-score-class` requires the
+  `cathedral_candidate_snapshot_v1` the epoch observed (captured with the
+  supported `cathedral-candidate-snapshot` command), refuses any snapshot
+  whose block/hash differ from the epoch's stored anchor, accounts for
+  EVERY historically registered hotkey with an explicit row, and binds the
+  snapshot's digest/block/hash/full sorted hotkey set into the SIGNED
+  report. `runtime export-evidence` must reuse that exact snapshot (digest
+  equality) — a later, unrelated snapshot can never be substituted. Full
+  validators verify candidates by EXACT equality against
+  `Subtensor.metagraph(netuid, block=anchored_block)` +
+  `get_block_hash(block)` from their own chain connection; unavailable or
+  malformed history is NOT_PROVEN, omission or fabrication FAILS.
 
 ## Deployment preconditions (all blocked pending independent review)
 
 Registry freshness hotfix (owner-managed, separate); confidential branch
 `feature/sn39-launch`; subnet branch `feature/sn39-provenance-launch`
 (provenance extra pinned to the immutable confidential commit); epoch-loop
-update (export-score-class + export-evidence + retention env, plus per-epoch
-`--challenge-anchor-block/--challenge-anchor-hash` from the finalized SN39
-block and a freshly fetched `--candidate-snapshot` metagraph artifact);
-nginx `/v1/evidence/` location; score-class/index signing keys created on
-the VM; key bundle + digests published into docs and `config/provenance/`.
+update (export-score-class + export-evidence + retention env; per-epoch
+`cathedral-candidate-snapshot --network finney --netuid 39 --block <final>`
+feeding BOTH `--challenge-anchor-block/--challenge-anchor-hash` at epoch
+begin and `--candidate-snapshot` at export time — the exporter enforces
+that they agree); nginx `/v1/evidence/` location; score-class/index signing
+keys created on the VM; key bundle + digests published into docs and
+`config/provenance/`.
