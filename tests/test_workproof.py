@@ -117,13 +117,13 @@ def test_signer_only_assertion_never_reaches_full():
     """A verified quote + signed receipt WITHOUT published work artifacts
     must fail at verification (when artifact checking is requested) and can
     never reach FULL assurance."""
-    from cathedral.provenance import ProvenanceError
-    from tests.test_provenance import _verify as verify_chain, exported  # noqa: F401
+    import tempfile
+    from pathlib import Path
 
     # Re-create the standard exported chain fixture inline.
     import tests.test_provenance as tp
-    from pathlib import Path
-    import tempfile
+    from cathedral.provenance import ProvenanceError
+    from tests.test_provenance import _verify as verify_chain
 
     with tempfile.TemporaryDirectory() as scratch:
         ledger, epoch_id = tp._completed_receipt_epoch(Path(scratch))
