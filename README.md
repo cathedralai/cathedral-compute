@@ -17,9 +17,12 @@ second scoring mechanism.
 - **Testing:** Bittensor testnet SN292. It remains the non-paying integration
   lane for proving worker setup, attestation, work, scoring, and UID mapping.
 
-SN39 currently has no eligible confidential miners, so its signed zero-supply
-fallback assigns the complete vector to burn UID 0. See
-[`BUILD_STATUS.md`](BUILD_STATUS.md) for current evidence.
+SN39 currently has one worker admitted by fresh Intel TDX evidence and
+validator-dispatched verified work. The launch mechanism assigns 90% to
+validated TDX supply and forces 10% to the burn destination. This is a narrow
+Intel TDX CPU launch claim, not a general confidential-compute or GPU claim.
+See [`BUILD_STATUS.md`](BUILD_STATUS.md) for the exact chain evidence and
+remaining assurance boundary.
 
 ## Start Mining
 
@@ -61,9 +64,15 @@ cathedral worker serve --help
   stale, and revoked workers.
 - On testnet SN292, a dedicated Cathedral validator maps the proven worker
   hotkey to UID 41 and computes UID 41 = 1.0 in a dry run.
-- On mainnet SN39, the production validator submitted its first confidential
-  vector at block 8614435. With no eligible miners, the on-chain vector has one
-  nonzero destination: burn UID 0 = 1.0.
+- On mainnet SN39, validator UID 30 submitted the validated-supply launch
+  vector in extrinsic
+  `0x4ef1307460f6bcdf3acc17dc7a1070f0918cf1080d74fb9409897353fe6cb371`
+  at block 8694350. The historical chain row contains exactly worker UID 163
+  and burn UID 204 in the mechanism's 90/10 split.
+- The positive worker's controlled raw Intel TDX evidence replays through the
+  pinned verifier. Whole-epoch FULL provenance remains `NOT_PROVEN` because
+  zero-scored candidates do not yet carry candidate-specific replayable
+  negative evidence.
 
 Mainnet chain broadcast is live. Testnet SN292 remains dry-run and does not pay
 token emissions.
