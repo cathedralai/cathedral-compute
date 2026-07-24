@@ -496,6 +496,8 @@ def test_zero_replays_never_mint_full_even_when_all_rejected(tmp_path):
         "verifier_command": ("/opt/cathedral/bin/verifier",),
         "verifier_artifacts": ("/opt/cathedral/bin/verifier",),
         "candidates_all_rejected": True,
+        "independent_candidates": {"zero-hotkey"},
+        "independent_block_hash": "0x" + "ab" * 32,
     }
 
     # (a) The pinned verifier bytes MUST authenticate even with zero
@@ -516,3 +518,118 @@ def test_zero_replays_never_mint_full_even_when_all_rejected(tmp_path):
             _verify(report, {}), **{**kwargs, "candidates_all_rejected": False}
         )
     assert plain.assurance_level == "receipts_only"
+
+
+def test_full_requires_the_independent_candidate_oracle(tmp_path):
+    """Round-seven followup finding 1: mutually consistent Cathedral
+    artifacts are NOT an oracle. FULL demands the independently captured
+    historical candidate set + block hash, equal to the report's signed
+    binding: a missing oracle, an omitted registered hotkey, and a
+    fabricated anchor each fail closed BEFORE any replay."""
+    import hashlib
+
+    from cathedral.ledger import Ledger
+    from cathedral.provenance import load_registry, replay_positive_miners
+    from tests.test_receipt import _completed_zero_epoch
+
+    ledger = Ledger(tmp_path / "oracle-ledger.sqlite")
+    epoch_id = _completed_zero_epoch(ledger, 11)
+    report = _export_score_class(ledger, epoch_id)
+    ledger.close()
+    registry = load_registry(REGISTRY_BYTES, TRUSTED, now=NOW, max_age_seconds=172800)
+    junk = b"verifier-bytes"
+    base = {
+        "registry": registry,
+        "envelopes_by_hotkey": {},
+        "attestation_bindings": {},
+        "verifier_binary": junk,
+        "verifier_blob_digest": "sha256:" + hashlib.sha256(junk).hexdigest(),
+        "verifier_command": ("/opt/cathedral/bin/verifier",),
+        "verifier_artifacts": ("/opt/cathedral/bin/verifier",),
+        "candidates_all_rejected": True,
+    }
+
+    # Missing oracle: fail closed, before anything else.
+    with pytest.raises(ProvenanceError, match="not an oracle"):
+        replay_positive_miners(_verify(report, {}), **base)
+
+    # Omitted hotkey: the chain says a second hotkey was registered at the
+    # anchored block; the mutually consistent report+manifest omitted it.
+    with pytest.raises(ProvenanceError, match=r"omitted from report.*omitted-real-miner"):
+        replay_positive_miners(
+            _verify(report, {}),
+            independent_candidates={"zero-hotkey", "omitted-real-miner"},
+            independent_block_hash="0x" + "ab" * 32,
+            **base,
+        )
+
+    # Fabricated candidate: the report claims a hotkey that history never
+    # registered at the anchored block.
+    with pytest.raises(ProvenanceError, match="not registered at the anchored block"):
+        replay_positive_miners(
+            _verify(report, {}),
+            independent_candidates={"only-other-miner"},
+            independent_block_hash="0x" + "ab" * 32,
+            **base,
+        )
+    # An empty independent capture is malformed history, never a pass.
+    with pytest.raises(ProvenanceError, match="empty or malformed"):
+        replay_positive_miners(
+            _verify(report, {}),
+            independent_candidates=set(),
+            independent_block_hash="0x" + "ab" * 32,
+            **base,
+        )
+
+    # Fabricated anchor: an independent hash that disagrees with the bound
+    # snapshot can never reach FULL.
+    with pytest.raises(ProvenanceError, match="fabricated anchor"):
+        replay_positive_miners(
+            _verify(report, {}),
+            independent_candidates={"zero-hotkey"},
+            independent_block_hash="0x" + "cd" * 32,
+            **base,
+        )
+
+
+def test_vector_rows_are_validated_before_comparison(exported):
+    """Round-seven followup finding 2: NaN, negative, duplicate, malformed,
+    and unknown-field vector rows FAIL the comparison. Previously a NaN or
+    negative external_component was silently discarded (<= 0 filter), so a
+    corrupted vector could 'agree' with the recomputation."""
+    report, receipts = exported
+    result = _verify(report, receipts)
+
+    def row(**overrides):
+        base = {
+            "miner_hotkey": "public-hotkey",
+            "weight": 1.0,
+            "base_component": 0.0,
+            "external_component": 1.0,
+        }
+        base.update(overrides)
+        return base
+
+    # The exact prior leak: a NaN row vanished and the vector "agreed".
+    agree, notes = compare_with_vector(result, {"weights": [row(external_component=float("nan"))]})
+    assert not agree and "non-finite" in notes[0]
+
+    agree, notes = compare_with_vector(result, {"weights": [row(external_component=-0.4)]})
+    assert not agree and "negative" in notes[0]
+
+    # A duplicate that hid behind the <= 0 filter is now caught.
+    agree, notes = compare_with_vector(result, {"weights": [row(), row(external_component=0.0)]})
+    assert not agree and "duplicates" in notes[0]
+
+    agree, notes = compare_with_vector(result, {"weights": [row(external_component="1.0")]})
+    assert not agree and "not numeric" in notes[0]
+
+    agree, notes = compare_with_vector(result, {"weights": [row(surprise=1)]})
+    assert not agree and "unknown fields" in notes[0]
+
+    agree, notes = compare_with_vector(result, {"weights": [{"weight": 1.0}]})
+    assert not agree and "miner_hotkey" in notes[0]
+
+    # A well-formed matching vector still agrees.
+    agree, notes = compare_with_vector(result, {"weights": [row()]})
+    assert agree and notes == []

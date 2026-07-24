@@ -128,6 +128,11 @@ class ProvenanceResult:
     generated_at: str
     valid_until: str
     assurance_level: str = ASSURANCE_RECEIPTS_ONLY
+    # The report's SIGNED candidate-snapshot binding ({digest, block,
+    # block_hash, hotkeys}); the independent-oracle gate in
+    # replay_positive_miners compares externally captured chain state
+    # against exactly this.
+    candidate_snapshot: dict[str, Any] | None = None
     miners: list[MinerProvenance] = field(default_factory=list)
     # Per-hotkey recomputed share BEFORE UID mapping and burn, summing to 1.0
     # across positive miners (or empty if no positive verified supply).
@@ -640,9 +645,15 @@ def verify_and_recompute(
         source_epoch=int(document["source_epoch"]),
         generated_at=str(document["generated_at"]),
         valid_until=str(document["valid_until"]),
+        candidate_snapshot=dict(document["candidate_snapshot"]),
         miners=miners,
         recomputed_hotkey_weights=recomputed,
     )
+
+
+_VECTOR_ROW_FIELDS = frozenset(
+    {"miner_hotkey", "weight", "base_component", "external_component", "uid"}
+)
 
 
 def compare_with_vector(
@@ -662,21 +673,33 @@ def compare_with_vector(
     vector_rows = signed_vector.get("weights")
     if not isinstance(vector_rows, list):
         return False, ["signed vector has no weights list"]
+    # EVERY row is validated BEFORE any comparison: a non-finite, negative,
+    # duplicate, structurally malformed, or unknown-field row fails the
+    # comparison outright - it can never be silently discarded into
+    # "agreement".
     vector_ext: dict[str, float] = {}
+    seen_hotkeys: set[str] = set()
     for row in vector_rows:
         if not isinstance(row, Mapping):
             return False, ["signed vector weight row is not an object"]
+        unknown = {str(key) for key in row} - _VECTOR_ROW_FIELDS
+        if unknown:
+            return False, [f"signed vector row carries unknown fields: {sorted(unknown)}"]
         hotkey = row.get("miner_hotkey")
-        external = row.get("external_component", row.get("weight"))
-        if not isinstance(hotkey, str):
+        if not isinstance(hotkey, str) or not hotkey:
             return False, ["signed vector weight row has no miner_hotkey"]
-        try:
-            external_value = float(external)
-        except (TypeError, ValueError):
+        if hotkey in seen_hotkeys:
+            return False, [f"signed vector duplicates hotkey {hotkey!r}"]
+        seen_hotkeys.add(hotkey)
+        external = row.get("external_component", row.get("weight"))
+        if isinstance(external, bool) or not isinstance(external, (int, float)):
             return False, [f"signed vector row for {hotkey!r} is not numeric"]
+        external_value = float(external)
+        if not math.isfinite(external_value):
+            return False, [f"signed vector row for {hotkey!r} is non-finite"]
+        if external_value < 0.0:
+            return False, [f"signed vector row for {hotkey!r} is negative"]
         if external_value > 0.0:
-            if hotkey in vector_ext:
-                return False, [f"signed vector duplicates hotkey {hotkey!r}"]
             vector_ext[hotkey] = external_value
 
     recomputed = result.recomputed_hotkey_weights
@@ -703,8 +726,20 @@ def replay_positive_miners(
     max_evidence_age_seconds: float = 3600.0,
     deadline_monotonic: float | None = None,
     challenge_anchor: Mapping[str, Any] | None = None,
+    independent_candidates: object = None,
+    independent_block_hash: str | None = None,
 ) -> ProvenanceResult:
     """Upgrade a receipts-only result to FULL assurance via raw replay.
+
+    FULL additionally REQUIRES an independent historical candidate oracle:
+    ``independent_candidates`` (the exact hotkey set registered on the SN39
+    metagraph AT the anchored block, captured by the VERIFIER's own chain
+    access) and ``independent_block_hash`` (get_block_hash(block) from the
+    same access). Two mutually consistent Cathedral-produced artifacts -
+    the signed report and the manifest - are NOT an oracle: they could
+    omit a real registered hotkey together. Equality with the report's
+    signed snapshot binding is mandatory; a missing, malformed, or
+    mismatched oracle fails closed before any replay.
 
     Every positive miner must have a controlled envelope whose bytes match
     the public manifest's ``envelope_digest``, reproduce the recorded
@@ -715,7 +750,42 @@ def replay_positive_miners(
     """
     from dataclasses import replace as dataclass_replace
 
+    from cathedral.challenge import ChallengeError, normalize_block_hash
     from cathedral.replay import ReplayError, authenticate_verifier_bytes, replay_evidence
+
+    bound_snapshot = result.candidate_snapshot
+    if not isinstance(bound_snapshot, Mapping):
+        raise ProvenanceError(
+            "result carries no signed candidate-snapshot binding; verify the "
+            "report before attempting a FULL upgrade"
+        )
+    if independent_candidates is None or independent_block_hash is None:
+        raise ProvenanceError(
+            "FULL provenance requires the INDEPENDENTLY captured historical "
+            "candidate set and block hash for the anchored block; mutually "
+            "consistent Cathedral artifacts are not an oracle"
+        )
+    independent_set = {str(hotkey) for hotkey in independent_candidates}
+    if not independent_set or any(not hotkey for hotkey in independent_set):
+        raise ProvenanceError("the independent historical candidate set is empty or malformed")
+    try:
+        normalized_independent_hash = normalize_block_hash(independent_block_hash)
+    except ChallengeError as exc:
+        raise ProvenanceError(f"the independent block hash is malformed: {exc}") from exc
+    if normalized_independent_hash != str(bound_snapshot["block_hash"]):
+        raise ProvenanceError(
+            "the independently captured block hash does not match the "
+            "report's anchored snapshot; a fabricated anchor never reaches FULL"
+        )
+    bound_hotkeys = set(bound_snapshot["hotkeys"])
+    if independent_set != bound_hotkeys:
+        omitted = sorted(independent_set - bound_hotkeys)
+        fabricated = sorted(bound_hotkeys - independent_set)
+        raise ProvenanceError(
+            "the report's candidate snapshot does not equal the independent "
+            f"historical oracle (omitted from report: {omitted}; not "
+            f"registered at the anchored block: {fabricated})"
+        )
 
     upgraded: list[MinerProvenance] = []
     replayed_count = 0

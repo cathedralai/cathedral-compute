@@ -1117,15 +1117,24 @@ def test_cli_full_replay_wires_anchor_and_all_rejected_state(
         return dataclasses.replace(result, assurance_level="full")
 
     monkeypatch.setattr(provenance_module, "replay_positive_miners", spy)
-    code = cli_main(
-        [
-            *_verify_cli_args(tmp_path, full_dir),
-            "--controlled-dir",
-            str(controlled),
-            "--verifier-binary",
-            str(verifier_path),
-        ]
+    independent_path = tmp_path / "independent-snapshot.json"
+    independent_path.write_text(
+        json.dumps(CANDIDATE_SNAPSHOT_DOC, sort_keys=True, separators=(",", ":"))
     )
+    base_arguments = [
+        *_verify_cli_args(tmp_path, full_dir),
+        "--controlled-dir",
+        str(controlled),
+        "--verifier-binary",
+        str(verifier_path),
+    ]
+    # Without the independent oracle, FULL refuses outright.
+    assert cli_main(base_arguments) != 0
+    output = capsys.readouterr()
+    assert "independent-candidate-snapshot" in output.out + output.err
+    assert not captured  # the replay was never even attempted
+
+    code = cli_main([*base_arguments, "--independent-candidate-snapshot", str(independent_path)])
     capsys.readouterr()
     assert code == 0
     assert real is not provenance_module.replay_positive_miners
@@ -1136,6 +1145,8 @@ def test_cli_full_replay_wires_anchor_and_all_rejected_state(
         "network": NETWORK,
         "netuid": NETUID,
     }
+    assert captured["independent_candidates"] == ["public-hotkey"]
+    assert captured["independent_block_hash"] == "ab" * 32
 
 
 def test_cli_all_rejected_epoch_fails_closed_without_rejection_evidence(
@@ -1213,12 +1224,16 @@ def test_cli_all_rejected_epoch_fails_closed_without_rejection_evidence(
     controlled = tmp_path / "controlled"
     controlled.mkdir()
     audit_out = tmp_path / "audit.json"
+    independent_path = tmp_path / "independent-snapshot.json"
+    independent_path.write_text(json.dumps(snapshot_doc, sort_keys=True))
     arguments = [
         *_verify_cli_args(tmp_path, tmp_path / "evidence"),
         "--controlled-dir",
         str(controlled),
         "--verifier-binary",
         str(verifier_path),
+        "--independent-candidate-snapshot",
+        str(independent_path),
         "--audit-out",
         str(audit_out),
     ]

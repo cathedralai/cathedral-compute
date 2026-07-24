@@ -2497,6 +2497,33 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         controlled_dir = getattr(args, "controlled_dir", None)
         if controlled_dir:
             from cathedral import provenance as provenance_module
+            from cathedral.score_class import validate_candidate_snapshot
+
+            independent_path = getattr(args, "independent_candidate_snapshot", None)
+            if not independent_path:
+                raise EvidenceError(
+                    "FULL assurance requires --independent-candidate-snapshot: "
+                    "an independently captured historical candidate set for "
+                    "the anchored block (Cathedral's own artifacts are not an "
+                    "oracle)"
+                )
+            independent_document = _strict_json_object(
+                _read_bounded_local_file(
+                    independent_path, 4 * 1024 * 1024, "independent candidate snapshot"
+                ),
+                "independent candidate snapshot",
+            )
+            independent_binding = validate_candidate_snapshot(
+                independent_document,
+                network=args.network,
+                netuid=int(args.netuid),
+            )
+            if int(independent_binding["block"]) != int(manifest["candidate_set"]["block"]):
+                raise EvidenceError(
+                    "independent candidate snapshot was captured at block "
+                    f"{independent_binding['block']}, not the anchored block "
+                    f"{manifest['candidate_set']['block']}"
+                )
 
             bindings = {row["hotkey"]: row for row in manifest["attestations"]}
             envelopes: dict[str, bytes] = {}
@@ -2552,6 +2579,8 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             result = provenance_module.replay_positive_miners(
                 result,
                 candidates_all_rejected=all_rejected,
+                independent_candidates=independent_binding["hotkeys"],
+                independent_block_hash=independent_binding["block_hash"],
                 challenge_anchor={
                     "block": int(candidate_snapshot["block"]),
                     "block_hash": str(candidate_snapshot["block_hash"]),
@@ -3379,6 +3408,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--controlled-dir",
         help="controlled-disclosure envelope directory; enables FULL assurance "
         "(raw-evidence replay through the pinned verifier)",
+    )
+    p_prov_verify.add_argument(
+        "--independent-candidate-snapshot",
+        help="cathedral_candidate_snapshot_v1 JSON captured by YOUR OWN chain "
+        "access at the anchored block (cathedral-candidate-snapshot --block "
+        "<anchor>); REQUIRED with --controlled-dir - FULL never trusts "
+        "Cathedral-produced artifacts as the candidate oracle",
     )
     p_prov_verify.add_argument(
         "--verifier-binary",

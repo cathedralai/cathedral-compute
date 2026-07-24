@@ -394,6 +394,12 @@ def test_zero_positive_miners_never_full(tmp_path: Path):
         source_epoch=11,
         generated_at="2026-07-24T00:00:00.000000Z",
         valid_until="2026-07-24T01:00:00.000000Z",
+        candidate_snapshot={
+            "digest": "sha256:" + "5" * 64,
+            "block": 100,
+            "block_hash": "ab" * 32,
+            "hotkeys": ["zero-hotkey"],
+        },
         miners=[],
         recomputed_hotkey_weights={},
     )
@@ -406,6 +412,8 @@ def test_zero_positive_miners_never_full(tmp_path: Path):
         verifier_blob_digest="sha256:" + "2" * 64,
         verifier_command=DECLARED,
         verifier_artifacts=DECLARED,
+        independent_candidates={"zero-hotkey"},
+        independent_block_hash="0x" + "ab" * 32,
     )
     assert upgraded.assurance_level == ASSURANCE_RECEIPTS_ONLY
 
