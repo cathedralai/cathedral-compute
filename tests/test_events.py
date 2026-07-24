@@ -149,3 +149,30 @@ def test_bearer_header_and_named_fields_never_leak(tmp_path):
     for secret in ("sekrit-token-123", "sekrit-2", "sekrit-3", "sekrit-4"):
         assert secret not in text
     assert "[REDACTED]" in text
+
+
+def test_top_level_sensitive_field_names_are_redacted():
+    """Round-seven F4 leak counterexamples: a TOP-LEVEL named token/api_key/
+    secret field value must never reach the JSONL (or any) surface — the
+    same name-based redaction that already guards nested levels."""
+    stream = io.StringIO()
+    logger = EventLogger(mode="thin", jsonl=stream, tty=None)
+    record = logger.event(
+        "CONFIG_LOADED",
+        stage="startup",
+        status=PASS,
+        token="tok-TOPLEVELLEAK-12345",
+        api_key="ak-TOPLEVELLEAK-67890",
+        client_secret="cs-TOPLEVELLEAK-abcde",
+        publisher_hmac="hm-TOPLEVELLEAK-fghij",
+        nested={"password": "pw-NESTEDLEAK-1"},
+        harmless="visible-value",
+    )
+    surface = stream.getvalue()
+    assert record["token"] == "[REDACTED]"
+    assert record["api_key"] == "[REDACTED]"
+    assert record["client_secret"] == "[REDACTED]"
+    assert record["publisher_hmac"] == "[REDACTED]"
+    assert record["nested"]["password"] == "[REDACTED]"
+    assert record["harmless"] == "visible-value"
+    assert "LEAK" not in surface

@@ -190,7 +190,10 @@ class EventLogger:
             record["remediation"] = _redact(str(remediation))
         for key, value in fields.items():
             if key not in record:
-                record[key] = _scrub(value)
+                # Sensitive field NAMES redact at EVERY nesting level - the
+                # top-level kwargs included, so event(token=...) can never
+                # write the raw value to any surface.
+                record[key] = "[REDACTED]" if _SENSITIVE_FIELD_RE.match(str(key)) else _scrub(value)
         self._write_jsonl(record)
         self._write_tty(record)
         return record
