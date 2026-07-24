@@ -44,9 +44,28 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
    thin/shadow default carries revocation to burn). Making the revoked
    state FULL requires an exhaustive candidate-set artifact with
    independently replayable rejection evidence — designed, not built.
-8. **pip 26.1.2 upgrade** in the production venv and clean-install docs; the
-   `ecdsa` Minerva advisory transitive exception (P-256 signing unreachable:
-   SR25519 wallet + Ed25519 artifacts) is recorded, not suppressed.
+8. **pip 26.1.2 upgrade** in every managed venv. Clean installs and the
+   production venvs must run `python -m pip install --upgrade 'pip>=26.1.2'`
+   (fixes PYSEC-2026-196/2875/2876) before installing packages; this is a
+   deploy-checklist step because it needs the production hosts.
+
+## Dependency advisory record (do not suppress)
+
+**ecdsa 0.19.2 — PYSEC-2026-1325 (Minerva timing, P-256 sign/keygen/ECDH).**
+Dependency-path evidence, collected 2026-07-24 on the launch venvs:
+`pip show ecdsa` → `Required-by: substrate-interface` ONLY, and only in the
+cathedralconfidential *dev* extra venv (the subnet validator venv does not
+install it; `bittensor` uses its own sr25519/ed25519 stacks). `grep -rn
+"import ecdsa|from ecdsa" cathedral/ scaffold/` → zero hits: no launch-path
+code imports it directly. substrate-interface uses ecdsa only for
+ECDSA-type keypairs (`KeypairType.ECDSA`); every SN39 wallet operation is
+SR25519 and every launch artifact signature is Ed25519 (`cryptography`),
+so the vulnerable P-256 signing path has no caller in this program.
+Verification-only use is unaffected per the advisory. Mitigations: the
+dependency stays out of the shipped validator distribution's required
+set; upstream fix adoption is tracked in the release checklist; any
+future ECDSA keypair use requires a new security review. This is a
+recorded, justified exception — not a silent suppression.
 
 ## Deployment preconditions (all blocked pending independent review)
 
