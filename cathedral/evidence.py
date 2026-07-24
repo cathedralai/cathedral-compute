@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from cathedral.policy_registry import (
+    MAX_REGISTRY_BYTES,
     PolicyRegistryError,
     canonical_json,
     parse_registry_json,
@@ -50,10 +51,67 @@ LEGACY_MANIFEST_SCHEMA = "cathedral_evidence_manifest_v1"
 INDEX_SCHEMA = "cathedral_evidence_index_v1"
 INDEX_DOMAIN = b"cathedral-evidence-index-v1\x00"
 MAX_INDEX_RECENT = 96
-# The supported manifest cardinality: at most this many candidates, and
-# (since every receipt belongs to exactly one verified candidate) at most
-# this many receipt rows. Verifier-side artifact budgets derive from it.
-MAX_MANIFEST_CANDIDATES = 4096
+
+# ---------------------------------------------------------------------------
+# Launch byte/cardinality budget (docs/BUDGET.md, "Evidence byte budget")
+#
+# The manifest grammar and the verifier's aggregate command budget are ONE
+# coherent contract: every per-kind artifact cap below is enforced at export
+# (a producer can never publish an artifact the verifier must refuse) and at
+# every verify read site, and the supported receipt cardinality is DERIVED so
+# that the worst-case maximal valid epoch — every artifact at its cap, FULL
+# mode included (verifier binary, independent snapshot, publisher vector, one
+# controlled envelope per verified candidate) — fits inside the verifier's
+# 64 MiB aggregate byte budget. A manifest the grammar accepts is therefore
+# always verifiable; the aggregate cap only ever stops non-compliant inputs.
+# ---------------------------------------------------------------------------
+MAX_INDEX_ARTIFACT_BYTES = 256 * 1024
+MAX_MANIFEST_ARTIFACT_BYTES = 2 * 1024 * 1024
+MAX_REGISTRY_ARTIFACT_BYTES = MAX_REGISTRY_BYTES  # 1 MiB, policy_registry pin
+MAX_REPORT_ARTIFACT_BYTES = 2 * 1024 * 1024
+MAX_RECEIPT_ARTIFACT_BYTES = 64 * 1024
+# SAT grammar worst case (cathedral/lanes/sat.py): 65,536 literals over
+# <= 8192 clauses encodes to ~410 KiB of canonical JSON; 512 KiB bounds it.
+MAX_WORK_ITEM_ARTIFACT_BYTES = 512 * 1024
+MAX_WORK_RESULT_ARTIFACT_BYTES = 64 * 1024
+# A real CPU-TDX envelope (quote + certificate chain, base64 JSON) is tens of
+# KiB; 256 KiB is the launch disclosure contract, enforced at retention time
+# so an oversized envelope can never silently invalidate a published epoch.
+MAX_CONTROLLED_ENVELOPE_BYTES = 256 * 1024
+MAX_SNAPSHOT_ARTIFACT_BYTES = 1024 * 1024
+MAX_VECTOR_ARTIFACT_BYTES = 1024 * 1024
+# Mirrors cathedral.replay.MAX_VERIFIER_BINARY_BYTES (asserted by test).
+MAX_VERIFIER_ARTIFACT_BYTES = 32 * 1024 * 1024
+# The verifier's ONE aggregate byte budget for a whole verify command.
+VERIFY_AGGREGATE_BUDGET_BYTES = 64 * 1024 * 1024
+# Fixed per-command overhead: index + manifest + registry + report +
+# verifier binary + publisher vector + independent candidate snapshot.
+VERIFY_FIXED_OVERHEAD_BYTES = (
+    MAX_INDEX_ARTIFACT_BYTES
+    + MAX_MANIFEST_ARTIFACT_BYTES
+    + MAX_REGISTRY_ARTIFACT_BYTES
+    + MAX_REPORT_ARTIFACT_BYTES
+    + MAX_VERIFIER_ARTIFACT_BYTES
+    + MAX_VECTOR_ARTIFACT_BYTES
+    + MAX_SNAPSHOT_ARTIFACT_BYTES
+)
+# Worst-case bytes one verified candidate can add to a FULL verify: its
+# receipt, its two work-proof artifacts, and its controlled envelope.
+PER_VERIFIED_CANDIDATE_BYTES = (
+    MAX_RECEIPT_ARTIFACT_BYTES
+    + MAX_WORK_ITEM_ARTIFACT_BYTES
+    + MAX_WORK_RESULT_ARTIFACT_BYTES
+    + MAX_CONTROLLED_ENVELOPE_BYTES
+)
+# The supported candidate-set cardinality (any outcome). Candidate rows cost
+# manifest bytes only; 1024 covers the SN39 metagraph with margin and keeps
+# the worst-case manifest inside MAX_MANIFEST_ARTIFACT_BYTES.
+MAX_MANIFEST_CANDIDATES = 1024
+# The supported VERIFIED cardinality (receipt rows / controlled envelopes),
+# derived from the aggregate budget: 28 at the caps above.
+MAX_MANIFEST_RECEIPTS = (
+    VERIFY_AGGREGATE_BUDGET_BYTES - VERIFY_FIXED_OVERHEAD_BYTES
+) // PER_VERIFIED_CANDIDATE_BYTES
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DISCLOSURES = frozenset({"public", "controlled"})
 
@@ -492,7 +550,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         raise EvidenceError("evidence manifest score_report is invalid")
     _require_digest(report["blob"], "report blob")
     receipts = document["receipts"]
-    if not isinstance(receipts, list) or len(receipts) > MAX_MANIFEST_CANDIDATES:
+    if not isinstance(receipts, list) or len(receipts) > MAX_MANIFEST_RECEIPTS:
         raise EvidenceError("evidence manifest receipts is invalid")
     for row in receipts:
         if (
@@ -508,7 +566,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         _require_digest(row["work_item_blob"], "work item blob")
         _require_digest(row["result_blob"], "work result blob")
     attestations = document["attestations"]
-    if not isinstance(attestations, list):
+    if not isinstance(attestations, list) or len(attestations) > MAX_MANIFEST_CANDIDATES:
         raise EvidenceError("evidence manifest attestations is invalid")
     for row in attestations:
         if (
@@ -567,6 +625,14 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         if row["hotkey"] in seen_candidates:
             raise EvidenceError("evidence manifest duplicates a candidate")
         seen_candidates.add(row["hotkey"])
+    verified_count = sum(1 for row in candidates if row["outcome"] == "verified")
+    if verified_count > MAX_MANIFEST_RECEIPTS:
+        raise EvidenceError(
+            "evidence manifest verified-candidate count exceeds the launch "
+            f"receipt budget ({verified_count} > {MAX_MANIFEST_RECEIPTS}); "
+            "every verified candidate needs a receipt, two work artifacts, "
+            "and a controlled envelope inside the verifier's aggregate byte cap"
+        )
     wire = document["wire_report_sha256"]
     if wire is not None and (not isinstance(wire, str) or not re.fullmatch(r"[0-9a-f]{64}", wire)):
         raise EvidenceError("evidence manifest wire_report_sha256 is invalid")
@@ -746,6 +812,12 @@ class RetentionStore:
         source_epoch: int | None = None,
         epoch_id: int | None = None,
     ) -> str:
+        if kind == "admission_evidence" and len(data) > MAX_CONTROLLED_ENVELOPE_BYTES:
+            raise EvidenceError(
+                "controlled envelope exceeds the launch disclosure cap "
+                f"({len(data)} > {MAX_CONTROLLED_ENVELOPE_BYTES} bytes); an "
+                "unfetchable envelope would silently unprove the epoch later"
+            )
         digest = digest_bytes(data)
         path = self.root / "blobs" / "sha256" / digest.split(":", 1)[1]
         _reject_symlink(path)

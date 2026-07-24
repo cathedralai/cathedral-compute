@@ -43,7 +43,47 @@ DNS through a process-global resolver slot pool, bounded local reads
 (`O_NOFOLLOW`, post-open regular-file verification, max+1 reads), bounded
 subprocess execution for the verifier, and size caps on every artifact
 class (registry, report, receipts, envelopes, verifier binary, vectors,
-work items).
+work items). FULL-mode LOCAL inputs — the independent candidate snapshot,
+every controlled envelope (streamed one at a time, never a retained
+multi-envelope set), and an operator-supplied verifier binary — are
+charged to the SAME artifact/byte/deadline budget as public evidence
+reads.
+
+## Evidence byte budget (coherence contract)
+
+The manifest grammar and the verifier's aggregate budget are ONE derived
+contract (`cathedral/evidence.py`): every per-kind cap is enforced at
+export/retention (a producer can never publish an artifact the verifier
+must refuse) and at every verify read site, and the supported verified
+cardinality is DERIVED so a maximal valid epoch always fits the 64 MiB
+aggregate under one total command deadline.
+
+| Artifact class | Cap |
+|---|---|
+| Evidence index | 256 KiB |
+| Epoch manifest | 2 MiB |
+| Policy registry | 1 MiB |
+| Score-class report | 2 MiB |
+| Assurance receipt | 64 KiB |
+| Work item (SAT grammar worst case ~410 KiB) | 512 KiB |
+| Work result | 64 KiB |
+| Controlled envelope (enforced at retention) | 256 KiB |
+| Independent candidate snapshot | 1 MiB |
+| Publisher signed vector | 1 MiB |
+| Pinned verifier binary | 32 MiB |
+| **Aggregate per verify command** | **64 MiB** |
+
+Derived cardinality: fixed overhead (index + manifest + registry +
+report + verifier + vector + snapshot) plus `N x (receipt + work item +
+work result + envelope)` must fit the aggregate, giving
+`MAX_MANIFEST_RECEIPTS = 28` verified candidates and
+`MAX_MANIFEST_CANDIDATES = 1024` candidate rows (any outcome; candidate
+rows cost manifest bytes only and 1024 covers the SN39 metagraph with
+margin). The manifest grammar rejects a 29th receipt row or a 29th
+`verified` outcome outright, so an epoch the grammar accepts can never be
+starved by the aggregate cap; the cap only ever stops non-compliant
+input. Raising any number here is a reviewed contract change, never a
+config drift — and never a multi-gigabyte cap.
 
 ## Rollback
 
