@@ -654,6 +654,29 @@ def verify_and_recompute(
 _VECTOR_ROW_FIELDS = frozenset(
     {"miner_hotkey", "weight", "base_component", "external_component", "uid"}
 )
+_VECTOR_ROW_REQUIRED = ("weight", "base_component", "external_component")
+_BURN_SNAPSHOT_FIELDS = frozenset({"burn_uid", "forced_burn_percentage"})
+
+# The validated_supply_v1 burn contract (docs/BUDGET.md): a FIXED 10% burn to
+# the configured burn destination whenever verified supply exists, and 100%
+# burn when it does not. The floor is part of the versioned mechanism id;
+# changing it requires a new mechanism version pinned everywhere.
+VALIDATED_SUPPLY_V1_BURN_FRACTION = 0.10
+
+
+def _row_component(row: Mapping[str, Any], hotkey: str, name: str) -> float | str:
+    """Return the validated finite nonnegative component, or an error note."""
+    if name not in row:
+        return f"signed vector row for {hotkey!r} lacks an explicit {name}"
+    value = row[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"signed vector row for {hotkey!r} is not numeric ({name})"
+    number = float(value)
+    if not math.isfinite(number):
+        return f"signed vector row for {hotkey!r} is non-finite ({name})"
+    if number < 0.0:
+        return f"signed vector row for {hotkey!r} is negative ({name})"
+    return number
 
 
 def compare_with_vector(
@@ -662,23 +685,49 @@ def compare_with_vector(
     *,
     abs_tol: float = 1e-9,
 ) -> tuple[bool, list[str]]:
-    """Compare the recomputed per-hotkey weights against Cathedral's signed
-    vector's external components. Returns ``(agree, discrepancies)``.
+    """Validate the signed vector's complete ``validated_supply_v1`` contract
+    and compare its NORMALIZED confidential external shares against the
+    recomputed unit shares. Returns ``(agree, discrepancies)``.
 
-    The comparison is symmetric: a hotkey earning in the signed vector without
-    verified provenance is exactly as much of a discrepancy as a verified
-    hotkey the vector omits.
+    Contract enforced before any share comparison (all fail-closed):
+
+      * every row carries EXPLICIT ``weight``, ``base_component``, and
+        ``external_component`` (no fallback), each finite and nonnegative,
+        composing exactly (``weight == base + external``);
+      * ``burn_snapshot`` is present with the fixed validated_supply_v1 burn:
+        10% (``forced_burn_percentage == 10.0``, integer ``burn_uid``
+        destination) with verified supply, 100% burn with none;
+      * no non-confidential base mass rides along (``sum(base) == 0``) and
+        the vector conserves emission (``sum(weight) + burn == 1``).
+
+    The signed vector distributes the post-burn external mass (e.g. 0.9 for
+    the 90% TDX class + 10% burn launch shape) while the recomputation yields
+    pre-burn unit shares summing to 1.0, so external components are
+    normalized by their own total before comparison — raw 0.9 mass is never
+    compared to a recomputed 1.0 share. The comparison is symmetric: a
+    hotkey earning in the signed vector without verified provenance is
+    exactly as much of a discrepancy as a verified hotkey the vector omits.
     """
-    discrepancies: list[str] = []
+    if result.mechanism_id != "validated_supply_v1":
+        return False, [
+            (
+                f"unsupported mechanism {result.mechanism_id!r}: this comparison "
+                "validates the validated_supply_v1 vector contract only"
+            )
+        ]
     vector_rows = signed_vector.get("weights")
     if not isinstance(vector_rows, list):
         return False, ["signed vector has no weights list"]
     # EVERY row is validated BEFORE any comparison: a non-finite, negative,
-    # duplicate, structurally malformed, or unknown-field row fails the
-    # comparison outright - it can never be silently discarded into
-    # "agreement".
+    # duplicate, structurally malformed, unknown-field, or component-less row
+    # fails the comparison outright - it can never be silently discarded
+    # into "agreement".
     vector_ext: dict[str, float] = {}
     seen_hotkeys: set[str] = set()
+    seen_uids: set[int] = set()
+    total_weight = 0.0
+    total_base = 0.0
+    total_external = 0.0
     for row in vector_rows:
         if not isinstance(row, Mapping):
             return False, ["signed vector weight row is not an object"]
@@ -691,23 +740,125 @@ def compare_with_vector(
         if hotkey in seen_hotkeys:
             return False, [f"signed vector duplicates hotkey {hotkey!r}"]
         seen_hotkeys.add(hotkey)
-        external = row.get("external_component", row.get("weight"))
-        if isinstance(external, bool) or not isinstance(external, (int, float)):
-            return False, [f"signed vector row for {hotkey!r} is not numeric"]
-        external_value = float(external)
-        if not math.isfinite(external_value):
-            return False, [f"signed vector row for {hotkey!r} is non-finite"]
-        if external_value < 0.0:
-            return False, [f"signed vector row for {hotkey!r} is negative"]
-        if external_value > 0.0:
-            vector_ext[hotkey] = external_value
+        components: dict[str, float] = {}
+        for name in _VECTOR_ROW_REQUIRED:
+            value = _row_component(row, hotkey, name)
+            if isinstance(value, str):
+                return False, [value]
+            components[name] = value
+        weight = components["weight"]
+        base = components["base_component"]
+        external = components["external_component"]
+        if not math.isclose(weight, base + external, rel_tol=0.0, abs_tol=abs_tol):
+            return False, [
+                (
+                    f"signed vector row for {hotkey!r} does not compose: "
+                    f"weight={weight!r} != base_component+external_component="
+                    f"{base + external!r}"
+                )
+            ]
+        if "uid" in row:
+            uid = row["uid"]
+            if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+                return False, [f"signed vector row for {hotkey!r} has an invalid uid"]
+            if uid in seen_uids:
+                return False, [f"signed vector duplicates uid {uid}"]
+            seen_uids.add(uid)
+        total_weight += weight
+        total_base += base
+        total_external += external
+        if external > 0.0:
+            vector_ext[hotkey] = external
 
+    # The signed validated_supply_v1 burn contract: explicit, well-formed,
+    # and exactly the fixed floor the versioned mechanism id freezes.
+    burn_snapshot = signed_vector.get("burn_snapshot")
+    if not isinstance(burn_snapshot, Mapping) or frozenset(burn_snapshot) != _BURN_SNAPSHOT_FIELDS:
+        return False, [
+            (
+                "signed vector burn_snapshot is missing or malformed (exactly "
+                "burn_uid and forced_burn_percentage are required)"
+            )
+        ]
+    burn_uid = burn_snapshot["burn_uid"]
+    if isinstance(burn_uid, bool) or not isinstance(burn_uid, int) or burn_uid < 0:
+        return False, [
+            (
+                "signed vector burn_uid must be the explicit non-negative burn "
+                "destination uid; validated_supply_v1 always burns"
+            )
+        ]
+    percentage = burn_snapshot["forced_burn_percentage"]
+    if isinstance(percentage, bool) or not isinstance(percentage, (int, float)):
+        return False, ["signed vector forced_burn_percentage is not numeric"]
+    burn_fraction = float(percentage) / 100.0
+    if not math.isfinite(burn_fraction) or not 0.0 <= burn_fraction <= 1.0:
+        return False, ["signed vector forced_burn_percentage is outside 0..100"]
+
+    # Mechanism-wide invariants hold for EVERY epoch shape: only the
+    # verified confidential class plus the burn may carry mass, the burn is
+    # exactly what validated_supply_v1 fixes for the epoch's supply (10%
+    # with verified supply, 100% without), and the vector plus its declared
+    # burn must conserve the whole emission — a base-mass row can never
+    # ride along, not even under a 100% burn.
+    if not math.isclose(total_base, 0.0, rel_tol=0.0, abs_tol=abs_tol):
+        return False, [
+            (
+                f"signed vector carries non-confidential base mass "
+                f"{total_base:.9f}; validated_supply_v1 pays only the "
+                "verified confidential class plus the fixed burn"
+            )
+        ]
     recomputed = result.recomputed_hotkey_weights
-    for hotkey in sorted(set(recomputed) | set(vector_ext)):
+    if recomputed:
+        if not math.isclose(
+            burn_fraction, VALIDATED_SUPPLY_V1_BURN_FRACTION, rel_tol=0.0, abs_tol=abs_tol
+        ):
+            return False, [
+                (
+                    f"signed vector burn {burn_fraction:.9f} violates the fixed "
+                    f"validated_supply_v1 floor {VALIDATED_SUPPLY_V1_BURN_FRACTION:.2f} "
+                    "for an epoch with verified supply"
+                )
+            ]
+    elif not math.isclose(burn_fraction, 1.0, rel_tol=0.0, abs_tol=abs_tol):
+        return False, [
+            (
+                f"signed vector burn {burn_fraction:.9f} != 1.0: an epoch with "
+                "no verified supply must burn the complete vector"
+            )
+        ]
+    if not math.isclose(total_weight + burn_fraction, 1.0, rel_tol=0.0, abs_tol=abs_tol):
+        return False, [
+            (
+                f"signed vector does not conserve emission: weights "
+                f"{total_weight:.9f} + burn {burn_fraction:.9f} != 1.0"
+            )
+        ]
+    if recomputed and total_external <= 0.0:
+        return False, [
+            (
+                "signed vector assigns no confidential external mass while "
+                "the recomputation has verified supply"
+            )
+        ]
+
+    # Normalized confidential shares: the vector's external components carry
+    # the post-burn class mass; dividing by their own total yields the same
+    # 1.0-sum basis as the recomputed unit shares.
+    vector_share = (
+        {hotkey: value / total_external for hotkey, value in vector_ext.items()}
+        if total_external > 0.0
+        else {}
+    )
+    discrepancies: list[str] = []
+    for hotkey in sorted(set(recomputed) | set(vector_share)):
         mine = recomputed.get(hotkey, 0.0)
-        theirs = vector_ext.get(hotkey, 0.0)
+        theirs = vector_share.get(hotkey, 0.0)
         if not math.isclose(mine, theirs, rel_tol=0.0, abs_tol=abs_tol):
-            discrepancies.append(f"{hotkey}: recomputed={mine:.9f} signed_vector={theirs:.9f}")
+            discrepancies.append(
+                f"{hotkey}: recomputed_share={mine:.9f} signed_external_share={theirs:.9f}"
+            )
     return (not discrepancies), discrepancies
 
 

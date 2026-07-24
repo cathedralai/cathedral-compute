@@ -23,6 +23,7 @@ from cathedral.policy_registry import canonical_json
 from cathedral.provenance import (
     MECHANISMS,
     ProvenanceError,
+    ProvenanceResult,
     compare_with_vector,
     verify_and_recompute,
 )
@@ -345,58 +346,58 @@ def test_mechanism_registry_is_versioned_and_frozen():
     assert MECHANISMS["validated_supply_v1"]([]) == {}
 
 
+def _launch_vector(rows, *, burn_percentage: float = 10.0, burn_uid: int | None = 0) -> dict:
+    """The validated_supply_v1 wire shape: component rows plus the signed
+    burn snapshot (fixed 10% burn with verified supply, 100% without)."""
+    return {
+        "burn_snapshot": {"burn_uid": burn_uid, "forced_burn_percentage": burn_percentage},
+        "weights": [dict(row) for row in rows],
+    }
+
+
+def _launch_row(hotkey: str, external: float, *, base: float = 0.0, **overrides) -> dict:
+    row = {
+        "miner_hotkey": hotkey,
+        "weight": base + external,
+        "base_component": base,
+        "external_component": external,
+    }
+    row.update(overrides)
+    return row
+
+
 def test_vector_comparison_agreement_and_discrepancies(exported):
     report, receipts = exported
     result = _verify(report, receipts)
-    matching = {
-        "weights": [
-            {
-                "miner_hotkey": "public-hotkey",
-                "weight": 1.0,
-                "base_component": 0.0,
-                "external_component": 1.0,
-            }
-        ]
-    }
+    # The launch shape: the verified miner carries the whole 90% TDX-class
+    # mass and the fixed 10% burn is declared in the burn snapshot. The raw
+    # 0.9 external mass must compare as a NORMALIZED share (1.0), never
+    # against the recomputed 1.0 unit share directly.
+    matching = _launch_vector([_launch_row("public-hotkey", 0.9)])
     agree, discrepancies = compare_with_vector(result, matching)
     assert agree and discrepancies == []
 
-    drifted = {
-        "weights": [
-            {
-                "miner_hotkey": "public-hotkey",
-                "weight": 0.8,
-                "base_component": 0.0,
-                "external_component": 0.8,
-            }
-        ]
-    }
+    # Drifted attribution: half the class mass leaks to an unverified
+    # hotkey. Both the shortfall and the stranger are discrepancies.
+    drifted = _launch_vector(
+        [_launch_row("public-hotkey", 0.45), _launch_row("unverified-hotkey", 0.45)]
+    )
     agree, discrepancies = compare_with_vector(result, drifted)
-    assert not agree and "public-hotkey" in discrepancies[0]
-
-    stranger = {
-        "weights": [
-            {
-                "miner_hotkey": "public-hotkey",
-                "weight": 1.0,
-                "base_component": 0.0,
-                "external_component": 1.0,
-            },
-            {
-                "miner_hotkey": "unverified-hotkey",
-                "weight": 0.4,
-                "base_component": 0.0,
-                "external_component": 0.4,
-            },
-        ]
-    }
-    agree, discrepancies = compare_with_vector(result, stranger)
     assert not agree
+    assert any("public-hotkey" in item for item in discrepancies)
     assert any("unverified-hotkey" in item for item in discrepancies)
 
-    empty_vector = {"weights": []}
-    agree, discrepancies = compare_with_vector(result, empty_vector)
-    assert not agree  # earning miner missing from the signed vector is a finding
+    # Symmetric omission: a structurally valid vector paying the WRONG
+    # miner flags both the missing earner and the stranger.
+    swapped = _launch_vector([_launch_row("unverified-hotkey", 0.9)])
+    agree, discrepancies = compare_with_vector(result, swapped)
+    assert not agree
+    assert any("public-hotkey" in item for item in discrepancies)
+    assert any("unverified-hotkey" in item for item in discrepancies)
+
+    # An empty vector against verified supply cannot even conserve emission.
+    agree, discrepancies = compare_with_vector(result, _launch_vector([]))
+    assert not agree and "conserve" in discrepancies[0]
 
 
 def test_candidate_omission_cannot_inflate_a_survivor(exported):
@@ -601,35 +602,207 @@ def test_vector_rows_are_validated_before_comparison(exported):
     result = _verify(report, receipts)
 
     def row(**overrides):
-        base = {
-            "miner_hotkey": "public-hotkey",
-            "weight": 1.0,
-            "base_component": 0.0,
-            "external_component": 1.0,
-        }
+        base = _launch_row("public-hotkey", 0.9)
         base.update(overrides)
         return base
 
     # The exact prior leak: a NaN row vanished and the vector "agreed".
-    agree, notes = compare_with_vector(result, {"weights": [row(external_component=float("nan"))]})
+    agree, notes = compare_with_vector(
+        result, _launch_vector([row(external_component=float("nan"))])
+    )
     assert not agree and "non-finite" in notes[0]
 
-    agree, notes = compare_with_vector(result, {"weights": [row(external_component=-0.4)]})
+    agree, notes = compare_with_vector(result, _launch_vector([row(external_component=-0.4)]))
     assert not agree and "negative" in notes[0]
 
     # A duplicate that hid behind the <= 0 filter is now caught.
-    agree, notes = compare_with_vector(result, {"weights": [row(), row(external_component=0.0)]})
+    agree, notes = compare_with_vector(
+        result,
+        _launch_vector([row(), row(weight=0.0, external_component=0.0)]),
+    )
     assert not agree and "duplicates" in notes[0]
 
-    agree, notes = compare_with_vector(result, {"weights": [row(external_component="1.0")]})
+    agree, notes = compare_with_vector(result, _launch_vector([row(external_component="1.0")]))
     assert not agree and "not numeric" in notes[0]
 
-    agree, notes = compare_with_vector(result, {"weights": [row(surprise=1)]})
+    agree, notes = compare_with_vector(result, _launch_vector([row(surprise=1)]))
     assert not agree and "unknown fields" in notes[0]
 
-    agree, notes = compare_with_vector(result, {"weights": [{"weight": 1.0}]})
+    agree, notes = compare_with_vector(result, _launch_vector([{"weight": 0.9}]))
     assert not agree and "miner_hotkey" in notes[0]
 
     # A well-formed matching vector still agrees.
-    agree, notes = compare_with_vector(result, {"weights": [row()]})
+    agree, notes = compare_with_vector(result, _launch_vector([row()]))
     assert agree and notes == []
+
+
+# ---------------------------------------------------------------------------
+# Complete validated_supply_v1 signed-vector contract (Codex finding 1)
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_result(weights: dict[str, float], mechanism_id: str = "validated_supply_v1"):
+    """A recomputation result carrying only what compare_with_vector reads."""
+    return ProvenanceResult(
+        report_id="sha256:" + "0" * 64,
+        previous_report_id=None,
+        signing_key_id="score-test-1",
+        policy_release=1,
+        policy_digest="sha256:" + "1" * 64,
+        verifier_digest=VERIFIER_DIGEST,
+        mechanism_id=mechanism_id,
+        source_epoch=11,
+        generated_at="2026-07-11T12:00:00.000000Z",
+        valid_until="2026-07-11T12:30:00.000000Z",
+        recomputed_hotkey_weights=dict(weights),
+    )
+
+
+def test_launch_vector_normalizes_the_ninety_percent_class():
+    """The finding's exact counterexample: a 90% TDX class plus 10% burn is
+    a VALID launch vector. Its raw 0.9 external mass must be normalized to
+    shares before comparison — never compared against the recomputed
+    1.0-sum unit shares directly."""
+    result = _synthetic_result({"alpha": 0.6, "bravo": 0.4})
+    vector = _launch_vector([_launch_row("alpha", 0.54), _launch_row("bravo", 0.36)])
+    agree, notes = compare_with_vector(result, vector)
+    assert agree and notes == []
+
+    # And a proportional drift inside the same mass is still caught.
+    drifted = _launch_vector([_launch_row("alpha", 0.45), _launch_row("bravo", 0.45)])
+    agree, notes = compare_with_vector(result, drifted)
+    assert not agree
+    assert any("alpha" in note for note in notes)
+
+
+def test_vector_rows_require_explicit_complete_components():
+    """No fallback: a row missing any of weight/base_component/
+    external_component fails outright. Previously a missing
+    external_component silently fell back to the row's weight."""
+    result = _synthetic_result({"alpha": 1.0})
+    for missing in ("weight", "base_component", "external_component"):
+        row = _launch_row("alpha", 0.9)
+        row.pop(missing)
+        agree, notes = compare_with_vector(result, _launch_vector([row]))
+        assert not agree and f"lacks an explicit {missing}" in notes[0]
+
+
+def test_vector_row_composition_is_enforced():
+    """weight must equal base_component + external_component exactly."""
+    result = _synthetic_result({"alpha": 1.0})
+    row = _launch_row("alpha", 0.9)
+    row["external_component"] = 0.8  # weight stays 0.9
+    agree, notes = compare_with_vector(result, _launch_vector([row]))
+    assert not agree and "does not compose" in notes[0]
+
+
+def test_vector_burn_snapshot_grammar_is_enforced():
+    result = _synthetic_result({"alpha": 1.0})
+    rows = [_launch_row("alpha", 0.9)]
+
+    payload = {"weights": [dict(row) for row in rows]}  # no burn_snapshot at all
+    agree, notes = compare_with_vector(result, payload)
+    assert not agree and "burn_snapshot is missing or malformed" in notes[0]
+
+    extra = _launch_vector(rows)
+    extra["burn_snapshot"]["surprise"] = 1
+    agree, notes = compare_with_vector(result, extra)
+    assert not agree and "burn_snapshot is missing or malformed" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_uid=None))
+    assert not agree and "burn_uid" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_uid=True))
+    assert not agree and "burn_uid" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_percentage="10"))
+    assert not agree and "not numeric" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_percentage=200.0))
+    assert not agree and "outside 0..100" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_percentage=-5.0))
+    assert not agree and "outside 0..100" in notes[0]
+
+    agree, notes = compare_with_vector(result, _launch_vector(rows, burn_percentage=float("nan")))
+    assert not agree and "outside 0..100" in notes[0]
+
+
+def test_vector_burn_floor_is_fixed_for_verified_supply():
+    """With verified supply the burn is EXACTLY the fixed 10% floor. The
+    pre-contract 'full mass, zero burn' shape is now a policy violation."""
+    result = _synthetic_result({"alpha": 1.0})
+
+    legacy_full_mass = _launch_vector([_launch_row("alpha", 1.0)], burn_percentage=0.0)
+    agree, notes = compare_with_vector(result, legacy_full_mass)
+    assert not agree and "violates the fixed" in notes[0]
+
+    over_burn = _launch_vector([_launch_row("alpha", 0.75)], burn_percentage=25.0)
+    agree, notes = compare_with_vector(result, over_burn)
+    assert not agree and "violates the fixed" in notes[0]
+
+
+def test_vector_base_mass_and_conservation_are_enforced():
+    result = _synthetic_result({"alpha": 1.0})
+
+    # Base-mass smuggling that still conserves emission: rejected.
+    smuggled = _launch_vector([_launch_row("alpha", 0.45), _launch_row("legacy", 0.0, base=0.45)])
+    agree, notes = compare_with_vector(result, smuggled)
+    assert not agree and "non-confidential base mass" in notes[0]
+
+    # Mass leakage: weights + burn must account for the whole emission.
+    leaked = _launch_vector([_launch_row("alpha", 0.7)])
+    agree, notes = compare_with_vector(result, leaked)
+    assert not agree and "conserve" in notes[0]
+
+
+def test_vector_zero_supply_requires_the_full_burn():
+    """No verified supply: the complete vector burns. Explicit revocation
+    zero rows stay valid; ANY riding mass — base or external — fails."""
+    empty = _synthetic_result({})
+
+    agree, notes = compare_with_vector(empty, _launch_vector([], burn_percentage=100.0))
+    assert agree and notes == []
+
+    zero_rows = _launch_vector([_launch_row("revoked", 0.0)], burn_percentage=100.0)
+    agree, notes = compare_with_vector(empty, zero_rows)
+    assert agree and notes == []
+
+    agree, notes = compare_with_vector(empty, _launch_vector([], burn_percentage=10.0))
+    assert not agree and "must burn the complete vector" in notes[0]
+
+    base_rider = _launch_vector([_launch_row("rider", 0.0, base=0.5)], burn_percentage=100.0)
+    agree, notes = compare_with_vector(empty, base_rider)
+    assert not agree and "non-confidential base mass" in notes[0]
+
+    external_rider = _launch_vector([_launch_row("rider", 0.5)], burn_percentage=100.0)
+    agree, notes = compare_with_vector(empty, external_rider)
+    assert not agree and "conserve" in notes[0]
+
+
+def test_vector_uid_rows_are_validated():
+    result = _synthetic_result({"alpha": 0.6, "bravo": 0.4})
+    valid = _launch_vector([_launch_row("alpha", 0.54, uid=7), _launch_row("bravo", 0.36, uid=9)])
+    agree, notes = compare_with_vector(result, valid)
+    assert agree and notes == []
+
+    duplicate_uid = _launch_vector(
+        [_launch_row("alpha", 0.54, uid=7), _launch_row("bravo", 0.36, uid=7)]
+    )
+    agree, notes = compare_with_vector(result, duplicate_uid)
+    assert not agree and "duplicates uid" in notes[0]
+
+    for bad_uid in (True, -1, "7", 1.5, None):
+        vector = _launch_vector(
+            [_launch_row("alpha", 0.54, uid=bad_uid), _launch_row("bravo", 0.36)]
+        )
+        agree, notes = compare_with_vector(result, vector)
+        assert not agree and "invalid uid" in notes[0]
+
+
+def test_vector_comparison_refuses_unknown_mechanisms():
+    """The contract is versioned WITH the mechanism: a result recomputed
+    under an unknown mechanism can never 'agree' with this validator."""
+    result = _synthetic_result({"alpha": 1.0}, mechanism_id="validated_supply_v99")
+    agree, notes = compare_with_vector(result, _launch_vector([_launch_row("alpha", 0.9)]))
+    assert not agree and "unsupported mechanism" in notes[0]
