@@ -40,7 +40,21 @@ from cathedral.attest import collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
-from cathedral.evidence import MAX_MANIFEST_CANDIDATES
+from cathedral.evidence import (
+    MAX_CONTROLLED_ENVELOPE_BYTES,
+    MAX_INDEX_ARTIFACT_BYTES,
+    MAX_MANIFEST_ARTIFACT_BYTES,
+    MAX_MANIFEST_RECEIPTS,
+    MAX_RECEIPT_ARTIFACT_BYTES,
+    MAX_REGISTRY_ARTIFACT_BYTES,
+    MAX_REPORT_ARTIFACT_BYTES,
+    MAX_SNAPSHOT_ARTIFACT_BYTES,
+    MAX_VECTOR_ARTIFACT_BYTES,
+    MAX_VERIFIER_ARTIFACT_BYTES,
+    MAX_WORK_ITEM_ARTIFACT_BYTES,
+    MAX_WORK_RESULT_ARTIFACT_BYTES,
+    VERIFY_AGGREGATE_BUDGET_BYTES,
+)
 from cathedral.gpu import (
     GpuIdentityRegistry,
     gpu_profile_from_registry,
@@ -65,7 +79,6 @@ from cathedral.receipt import (
     parse_receipt_json,
     verify_receipt,
 )
-from cathedral.replay import MAX_ENVELOPE_BYTES
 from cathedral.runtime import (
     MAX_BEARER_TOKEN_LENGTH,
     ConfidentialRuntime,
@@ -1280,6 +1293,15 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 "immutable manifest published without it could never verify "
                 "under production pins"
             )
+        from cathedral.provenance import MECHANISM_REVISIONS
+
+        pinned_pair_revision = MECHANISM_REVISIONS.get(args.mechanism)
+        if pinned_pair_revision is None or int(args.mechanism_revision) != pinned_pair_revision:
+            raise ValueError(
+                f"mechanism pair ({args.mechanism!r}, revision="
+                f"{args.mechanism_revision!r}) is not a frozen supported pair; "
+                f"production exports publish exactly {sorted(MECHANISM_REVISIONS.items())}"
+            )
         epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
         epoch_row = ledger.get_epoch(epoch_id)
         if epoch_row is None or epoch_row["status"] != "published":
@@ -1300,6 +1322,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 f"{args.class_id}/{args.source_id}; run 'runtime export-score-class' first"
             )
         report_bytes = bytes(export["report_body"])
+        if len(report_bytes) > MAX_REPORT_ARTIFACT_BYTES:
+            raise ValueError(
+                "signed report exceeds the launch report artifact cap; the "
+                "verifier could never fetch it"
+            )
         report = json.loads(report_bytes)
 
         registry_bytes = _read_bounded_registry_file(args.policy_registry, "policy registry")
@@ -1357,6 +1384,20 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                     raise ValueError(
                         f"persisted work artifacts for {receipt_id!r} do not "
                         "match the receipt's signed digests"
+                    )
+                # Byte-budget coherence: never publish an artifact the
+                # verifier's per-kind fetch caps must refuse.
+                if len(body) > MAX_RECEIPT_ARTIFACT_BYTES:
+                    raise ValueError(
+                        f"receipt {receipt_id!r} exceeds the launch receipt artifact cap"
+                    )
+                if len(work_item_body) > MAX_WORK_ITEM_ARTIFACT_BYTES:
+                    raise ValueError(
+                        f"work item for {receipt_id!r} exceeds the launch work artifact cap"
+                    )
+                if len(result_body) > MAX_WORK_RESULT_ARTIFACT_BYTES:
+                    raise ValueError(
+                        f"work result for {receipt_id!r} exceeds the launch work artifact cap"
                     )
                 manifest_receipts.append(
                     {
@@ -1562,6 +1603,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         # EVERY pre-publication exception releases the lock descriptor and
         # flock (a leaked exclusive flock would deadlock the in-process
         # retry forever).
+        if len(manifest_bytes) > MAX_MANIFEST_ARTIFACT_BYTES:
+            raise ValueError(
+                "built manifest exceeds the launch manifest artifact cap; the "
+                "verifier could never fetch it"
+            )
         with store.index_transaction() as index_txn:
             # The manifest blob and immutable epoch copy publish inside the
             # SAME critical section as the index update: a crash after the
@@ -1610,6 +1656,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             )
             from cathedral.evidence import verify_index as _self_check_index
 
+            if len(index_bytes) > MAX_INDEX_ARTIFACT_BYTES:
+                raise ValueError(
+                    "built index exceeds the launch index artifact cap; the "
+                    "verifier could never fetch it"
+                )
             # The completed signed index must VERIFY (signature, shape,
             # ordering, latest consistency) before it is published - a
             # rebuild from a corrupted store can never publish a
@@ -1687,19 +1738,24 @@ def _verify_wire_vector(
         raise ValueError("weight vector is expired")
 
 
+# Legacy default for miscellaneous evidence fetches; every named artifact
+# class in the verify pipeline uses its per-kind cap from cathedral.evidence
+# (docs/BUDGET.md "Evidence byte budget"), so the worst-case maximal valid
+# epoch provably fits the aggregate command budget.
 MAX_EVIDENCE_FETCH_BYTES = 4 * 1024 * 1024
-MAX_VERIFIER_FETCH_BYTES = 32 * 1024 * 1024
-MAX_COMMAND_FETCH_BYTES = 64 * 1024 * 1024
-# Coherent with the supported manifest cardinality: an epoch may carry up to
-# MAX_MANIFEST_CANDIDATES verified candidates, each needing THREE
-# content-addressed artifacts (receipt + work item + work result), plus the
-# fixed per-command overhead (index, manifest, registry, report, verifier
-# binary, publisher vector) with slack. Memory and network stay bounded by
-# the per-artifact size caps, the aggregate byte cap, and the deadline —
-# this cap only stops count-based denial of service, and it must never make
-# a valid maximal epoch unverifiable.
+MAX_VERIFIER_FETCH_BYTES = MAX_VERIFIER_ARTIFACT_BYTES
+MAX_COMMAND_FETCH_BYTES = VERIFY_AGGREGATE_BUDGET_BYTES
+# Coherent with the supported manifest RECEIPT cardinality: an epoch may
+# carry up to MAX_MANIFEST_RECEIPTS verified candidates, each needing THREE
+# content-addressed artifacts (receipt + work item + work result) plus one
+# controlled envelope in FULL mode, plus the fixed per-command overhead
+# (index, manifest, registry, report, verifier binary, publisher vector,
+# independent snapshot) with slack. Memory and network stay bounded by the
+# per-artifact size caps, the aggregate byte cap, and the deadline — this
+# cap only stops count-based denial of service, and it must never make a
+# valid maximal epoch unverifiable.
 COMMAND_ARTIFACT_OVERHEAD = 16
-MAX_COMMAND_ARTIFACTS = 3 * MAX_MANIFEST_CANDIDATES + COMMAND_ARTIFACT_OVERHEAD
+MAX_COMMAND_ARTIFACTS = 4 * MAX_MANIFEST_RECEIPTS + COMMAND_ARTIFACT_OVERHEAD
 DEFAULT_COMMAND_DEADLINE_SECONDS = 120.0
 
 
@@ -2089,6 +2145,11 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
             digest = str(row["envelope_digest"])
             blob_path = retention_root / "blobs" / "sha256" / digest.split(":", 1)[1]
             data = _read_retained_blob(blob_path, digest)
+            if len(data) > MAX_CONTROLLED_ENVELOPE_BYTES:
+                raise ValueError(
+                    f"retained envelope {digest} exceeds the launch disclosure "
+                    "cap; an authorized verifier could never fetch it"
+                )
             envelopes.append(
                 (
                     digest,
@@ -2361,9 +2422,9 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
     def load_index_bytes() -> bytes:
         if store is not None:
             return _read_local_artifact(
-                store.root / "index.json", MAX_EVIDENCE_FETCH_BYTES, "evidence index"
+                store.root / "index.json", MAX_INDEX_ARTIFACT_BYTES, "evidence index"
             )
-        return fetch_url("/index.json")
+        return fetch_url("/index.json", max_bytes=MAX_INDEX_ARTIFACT_BYTES)
 
     def load_blob(digest: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
         if store is not None:
@@ -2436,7 +2497,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             manifest_digest = index_document["latest"]["manifest"]
 
         started = time_mod.monotonic()
-        manifest = parse_manifest(load_blob(manifest_digest))
+        manifest = parse_manifest(load_blob(manifest_digest, max_bytes=MAX_MANIFEST_ARTIFACT_BYTES))
         if manifest["network"] != args.network or manifest["netuid"] != args.netuid:
             raise EvidenceError("evidence manifest network/netuid mismatch")
         if args.source_epoch is None:
@@ -2471,11 +2532,22 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     and index_document["latest"]["manifest"] != last_manifest
                 ):
                     raise EvidenceError("index equivocation: same epoch, different manifest")
+        # Dispatch is on the exact (mechanism id, revision) PAIR: both halves
+        # are pinned, and an unsupported pair fails HERE — before any
+        # recomputation and before any fence reservation.
         if manifest["reward_mechanism"]["id"] != args.mechanism:
             raise EvidenceError(
                 "manifest reward mechanism "
                 f"{manifest['reward_mechanism']['id']!r} does not match the "
                 f"pinned mechanism {args.mechanism!r}"
+            )
+        pinned_mechanism_revision = int(getattr(args, "mechanism_revision", 1))
+        if int(manifest["reward_mechanism"]["revision"]) != pinned_mechanism_revision:
+            raise EvidenceError(
+                "manifest reward mechanism revision "
+                f"{manifest['reward_mechanism']['revision']!r} does not match "
+                f"the pinned pair ({args.mechanism!r}, "
+                f"revision={pinned_mechanism_revision})"
             )
         if manifest["verifier"]["digest"] != args.verifier_digest:
             raise EvidenceError(
@@ -2498,7 +2570,9 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         registry_keys = _load_evidence_keyfile(
             args.registry_keys, args.registry_keys_digest, "registry keys"
         )
-        registry_bytes = load_blob(manifest["policy_registry"]["blob"])
+        registry_bytes = load_blob(
+            manifest["policy_registry"]["blob"], max_bytes=MAX_REGISTRY_ARTIFACT_BYTES
+        )
         if (
             "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
             != manifest["policy_registry"]["digest"]
@@ -2507,12 +2581,17 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         report_keys = _load_evidence_keyfile(
             args.report_keys, args.report_keys_digest, "report keys"
         )
-        report_bytes = load_blob(manifest["score_report"]["blob"])
-        receipts_by_id = {row["receipt_id"]: load_blob(row["blob"]) for row in manifest["receipts"]}
+        report_bytes = load_blob(
+            manifest["score_report"]["blob"], max_bytes=MAX_REPORT_ARTIFACT_BYTES
+        )
+        receipts_by_id = {
+            row["receipt_id"]: load_blob(row["blob"], max_bytes=MAX_RECEIPT_ARTIFACT_BYTES)
+            for row in manifest["receipts"]
+        }
         work_artifacts_by_receipt = {
             row["receipt_id"]: (
-                load_blob(row["work_item_blob"]),
-                load_blob(row["result_blob"]),
+                load_blob(row["work_item_blob"], max_bytes=MAX_WORK_ITEM_ARTIFACT_BYTES),
+                load_blob(row["result_blob"], max_bytes=MAX_WORK_RESULT_ARTIFACT_BYTES),
             )
             for row in manifest["receipts"]
         }
@@ -2535,6 +2614,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             expected_netuid=args.netuid,
             expected_verifier_digest=args.verifier_digest,
             mechanism_id=args.mechanism,
+            mechanism_revision=pinned_mechanism_revision,
             registry_max_age_seconds=args.registry_max_age_secs,
             work_artifacts_by_receipt=work_artifacts_by_receipt,
             candidate_set=manifest["candidate_set"],
@@ -2565,8 +2645,10 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     "oracle)"
                 )
             independent_document = _strict_json_object(
-                _read_bounded_local_file(
-                    independent_path, 4 * 1024 * 1024, "independent candidate snapshot"
+                _read_local_artifact(
+                    independent_path,
+                    MAX_SNAPSHOT_ARTIFACT_BYTES,
+                    "independent candidate snapshot",
                 ),
                 "independent candidate snapshot",
             )
@@ -2583,59 +2665,57 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 )
 
             bindings = {row["hotkey"]: row for row in manifest["attestations"]}
-            envelopes: dict[str, bytes] = {}
-            for miner in result.miners:
-                if not miner.receipt_verified:
-                    continue
-                binding = bindings.get(miner.hotkey)
-                envelope_digest = binding.get("envelope_digest") if binding else None
-                if not envelope_digest:
-                    raise EvidenceError(f"no controlled envelope binding for {miner.hotkey!r}")
-                envelope_path = (
-                    Path(controlled_dir) / f"{str(envelope_digest).split(':', 1)[1]}.json"
-                )
-                try:
-                    envelopes[miner.hotkey] = _read_bounded_local_file(
-                        envelope_path,
-                        MAX_ENVELOPE_BYTES,
-                        f"controlled envelope for {miner.hotkey!r}",
+
+            class _StreamedEnvelopes:
+                """Controlled envelopes read lazily, one at a time, during
+                the replay loop — never a retained multi-envelope set — with
+                every read charged to the SAME command artifact/byte/deadline
+                budget as public evidence fetches (symlinks, oversize, and
+                budget exhaustion all fail closed at the read)."""
+
+                def get(self, hotkey: str) -> bytes | None:
+                    binding = bindings.get(hotkey)
+                    envelope_digest = binding.get("envelope_digest") if binding else None
+                    if not envelope_digest:
+                        return None
+                    envelope_path = (
+                        Path(controlled_dir) / f"{str(envelope_digest).split(':', 1)[1]}.json"
                     )
-                except ValueError as exc:
-                    raise EvidenceError(str(exc)) from exc
+                    return _read_local_artifact(
+                        envelope_path,
+                        MAX_CONTROLLED_ENVELOPE_BYTES,
+                        f"controlled envelope for {hotkey!r}",
+                    )
+
             verifier_info = manifest["verifier"]
             if not verifier_info["binary_blob"] or not verifier_info["command"]:
                 raise EvidenceError("manifest lacks verifier binary/command bindings for full mode")
             if getattr(args, "verifier_binary", None):
-                try:
-                    verifier_bytes = _read_bounded_local_file(
-                        args.verifier_binary,
-                        MAX_VERIFIER_FETCH_BYTES,
-                        "verifier binary",
-                    )
-                except ValueError as exc:
-                    raise EvidenceError(str(exc)) from exc
+                verifier_bytes = _read_local_artifact(
+                    args.verifier_binary,
+                    MAX_VERIFIER_FETCH_BYTES,
+                    "verifier binary",
+                )
             else:
                 verifier_bytes = load_blob(
                     verifier_info["binary_blob"],
                     max_bytes=MAX_VERIFIER_FETCH_BYTES,
                 )
-            # The challenge anchor and the all-rejected determination come
+            # The challenge anchor and the per-candidate outcome map come
             # from the SIGNED, ALREADY-VERIFIED chain: verify_and_recompute
             # proved the manifest candidate_set equals the report's signed
             # snapshot binding (block, hash, hotkeys), so these values are
-            # exactly what the epoch's nonces were derived from. Without
-            # them, positive FULL would fail and an all-rejected epoch would
-            # silently stay receipts-only.
+            # exactly what the epoch's nonces were derived from. The outcome
+            # map gates the epoch-level FULL claim: any active rejected
+            # candidate keeps the result receipts_only (NOT PROVEN) because
+            # rejections are not independently replayable.
             candidate_snapshot = manifest["candidate_set"]
-            active_candidates = [
-                row for row in candidate_snapshot["candidates"] if row["outcome"] != "retired"
-            ]
-            all_rejected = bool(active_candidates) and all(
-                row["outcome"] == "rejected" for row in active_candidates
-            )
             result = provenance_module.replay_positive_miners(
                 result,
-                candidates_all_rejected=all_rejected,
+                candidate_outcomes={
+                    str(row["hotkey"]): str(row["outcome"])
+                    for row in candidate_snapshot["candidates"]
+                },
                 independent_candidates=independent_binding["hotkeys"],
                 independent_block_hash=independent_binding["block_hash"],
                 challenge_anchor={
@@ -2649,7 +2729,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     registry_keys,
                     max_age_seconds=args.registry_max_age_secs,
                 ),
-                envelopes_by_hotkey=envelopes,
+                envelopes_by_hotkey=_StreamedEnvelopes(),
                 attestation_bindings=bindings,
                 verifier_binary=verifier_bytes,
                 verifier_blob_digest=verifier_info["binary_blob"],
@@ -2701,6 +2781,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             "policy_digest": result.policy_digest,
             "verifier_digest": result.verifier_digest,
             "mechanism": result.mechanism_id,
+            "mechanism_revision": result.mechanism_revision,
             "manifest": manifest_digest,
             "recomputed_hotkey_weights": result.recomputed_hotkey_weights,
         }
@@ -2709,6 +2790,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             started = time_mod.monotonic()
             vector_bytes = _bounded_https_fetch(
                 args.publisher_url.rstrip("/") + "/v1/validator/weights/next",
+                max_bytes=MAX_VECTOR_ARTIFACT_BYTES,
                 allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
                 budget=command_budget,
             )
@@ -2720,10 +2802,27 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 network=args.network,
                 netuid=args.netuid,
             )
-            agree, discrepancies = provenance.compare_with_vector(result, vector)
+            agree, discrepancies = provenance.compare_with_vector(
+                result, vector, wire_report_sha256=manifest["wire_report_sha256"]
+            )
+            vector_metadata = vector.get("policy_metadata")
+            external_status = (
+                vector_metadata.get("external_scores")
+                if isinstance(vector_metadata, dict)
+                else None
+            ) or {}
             audit["vector_id"] = vector.get("vector_id")
             audit["vector_agrees"] = agree
             audit["vector_discrepancies"] = discrepancies
+            # The SIGNED binding the agreement was checked against, for the
+            # operator trail: which ingested report/epoch the publisher
+            # asserts this vector was composed from.
+            audit["vector_report_binding"] = {
+                "manifest_wire_report_sha256": manifest["wire_report_sha256"],
+                "latest_epoch": external_status.get("latest_epoch"),
+                "latest_report_sha256": external_status.get("latest_report_sha256"),
+                "latest_body_sha256": external_status.get("latest_body_sha256"),
+            }
             if agree:
                 logger.event(
                     "VECTOR_COMPARE_AGREES",
@@ -2752,6 +2851,8 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 )
 
         audit["assurance"] = result.assurance_level
+        if result.not_proven_reasons:
+            audit["not_proven_reasons"] = list(result.not_proven_reasons)
         full = result.assurance_level == "full"
         passed = audit["result"] == "PASS"
         succeeded = passed and (full or bool(getattr(args, "allow_receipts_only", False)))
@@ -2775,18 +2876,42 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     "the failing stage; nothing was recorded as verified."
                 ),
             )
-        elif not full:
+            if args.audit_out:
+                Path(args.audit_out).expanduser().write_text(
+                    json.dumps(audit, sort_keys=True, indent=2) + "\n"
+                )
+            return 1
+        if not full:
             audit["result"] = "NOT_PROVEN"
+        # The atomic reservation COMPLETES before any terminal PASS or
+        # NOT_PROVEN event is emitted and before the audit record reports
+        # acceptance: a conflicting concurrent reservation raises into the
+        # failure path below, which emits ONLY a terminal FAIL — an
+        # accepting terminal event can never precede a failed reservation.
+        if fence_path is not None:
+            _reserve_fences(
+                fence_path,
+                index_epoch=int(index_document["latest"]["source_epoch"]),
+                index_manifest=str(index_document["latest"]["manifest"]),
+                policy_release=int(result.policy_release),
+                policy_digest=str(result.policy_digest),
+                report_id=str(result.report_id),
+                previous_report_id=result.previous_report_id,
+                source_epoch=int(result.source_epoch),
+            )
+        if not full:
             from cathedral.events import NOT_PROVEN as _NOT_PROVEN
 
+            reasons = "; ".join(result.not_proven_reasons)[:300]
             logger.event(
                 "PROVENANCE_RESULT",
                 stage="result",
                 status=_NOT_PROVEN,
                 detail=(
                     "receipts-only (PARTIAL) provenance: signed statements are "
-                    "internally consistent, but no raw evidence was replayed. "
-                    f"source_epoch={audit.get('source_epoch')}"
+                    "internally consistent, but the epoch was not fully "
+                    f"replayed. source_epoch={audit.get('source_epoch')}"
+                    + (f" ({reasons})" if reasons else "")
                 ),
                 remediation=(
                     "Obtain the controlled envelope package and rerun with "
@@ -2802,19 +2927,6 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     f"assurance=full source_epoch={audit.get('source_epoch')} "
                     f"weights={audit.get('recomputed_hotkey_weights')}"
                 ),
-            )
-        if fence_path is not None and audit["result"] in ("PASS", "NOT_PROVEN"):
-            # Atomic reserve BEFORE the result is reported: a conflicting
-            # concurrent reservation fails the run instead of being kept.
-            _reserve_fences(
-                fence_path,
-                index_epoch=int(index_document["latest"]["source_epoch"]),
-                index_manifest=str(index_document["latest"]["manifest"]),
-                policy_release=int(result.policy_release),
-                policy_digest=str(result.policy_digest),
-                report_id=str(result.report_id),
-                previous_report_id=result.previous_report_id,
-                source_epoch=int(result.source_epoch),
             )
         if args.audit_out:
             Path(args.audit_out).expanduser().write_text(
@@ -2834,6 +2946,9 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             ),
         )
         if args.audit_out:
+            # The audit must never report acceptance for a run that raised —
+            # including a fence-reservation conflict AFTER the checks passed.
+            audit["result"] = "FAIL"
             audit["error"] = str(exc)[:512]
             Path(args.audit_out).expanduser().write_text(
                 json.dumps(audit, sort_keys=True, indent=2) + "\n"
@@ -3454,6 +3569,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--verifier-digest", required=True, help="pinned TDX verifier implementation digest"
     )
     p_prov_verify.add_argument("--mechanism", default="validated_supply_v1")
+    p_prov_verify.add_argument(
+        "--mechanism-revision",
+        type=int,
+        default=1,
+        help="pinned reward-mechanism revision; verification dispatches on "
+        "the exact (id, revision) pair and refuses any other",
+    )
     p_prov_verify.add_argument(
         "--source-epoch", type=int, help="verify a specific epoch (default: index latest)"
     )
