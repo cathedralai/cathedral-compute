@@ -228,8 +228,18 @@ def test_invented_positive_miner_without_receipt_is_rejected(exported):
             }
         )
 
-    with pytest.raises(ProvenanceError, match="exactly one receipt"):
+    # Even a compromised signer that forges BOTH the entry and the snapshot
+    # binding still fails the deeper receipt requirement.
+    def invent_with_snapshot(document):
+        invent(document)
+        document["candidate_snapshot"]["hotkeys"] = sorted(
+            [*document["candidate_snapshot"]["hotkeys"], "sybil-hotkey"]
+        )
+
+    with pytest.raises(ProvenanceError, match="outside its anchored snapshot"):
         _verify(_reforge(report, invent), receipts)
+    with pytest.raises(ProvenanceError, match="exactly one receipt"):
+        _verify(_reforge(report, invent_with_snapshot), receipts)
 
 
 def test_receipt_reassigned_to_another_hotkey_is_rejected(exported):
@@ -239,6 +249,10 @@ def test_receipt_reassigned_to_another_hotkey_is_rejected(exported):
         for entry in document["entries"]:
             if entry["miner_hotkey"] == "public-hotkey":
                 entry["miner_hotkey"] = "thief-hotkey"
+        document["candidate_snapshot"]["hotkeys"] = sorted(
+            "thief-hotkey" if hotkey == "public-hotkey" else hotkey
+            for hotkey in document["candidate_snapshot"]["hotkeys"]
+        )
 
     with pytest.raises(ProvenanceError, match="subject hotkey"):
         _verify(_reforge(report, reassign), receipts)
@@ -392,8 +406,9 @@ def test_vector_comparison_agreement_and_discrepancies(exported):
 
 
 def test_candidate_omission_cannot_inflate_a_survivor(exported):
-    """Defect-1 proof: a committed second verified candidate omitted from
-    the report fails the exhaustive accounting."""
+    """Defect-1 proof: candidate omission fails in BOTH directions — a
+    manifest set that drifts from the report's anchored snapshot, and a
+    report that drops an entry for an anchored candidate."""
     report, receipts = exported
     candidate_set = {
         "source": "sn39_metagraph",
@@ -407,8 +422,20 @@ def test_candidate_omission_cannot_inflate_a_survivor(exported):
             {"hotkey": "omitted-miner", "outcome": "verified", "reason": "receipt_verified"},
         ],
     }
-    with pytest.raises(ProvenanceError, match="omits committed candidates"):
+    with pytest.raises(
+        ProvenanceError, match="does not equal the report's anchored snapshot"
+    ):
         _verify(report, receipts, candidate_set=candidate_set)
+
+    def drop_zero_entry(document):
+        document["entries"] = [
+            entry
+            for entry in document["entries"]
+            if entry["miner_hotkey"] != "zero-hotkey"
+        ]
+
+    with pytest.raises(ProvenanceError, match="omits anchored snapshot candidates"):
+        _verify(_reforge(report, drop_zero_entry), receipts)
 
 
 def test_current_block_outside_report_window_fails(exported):
@@ -418,3 +445,33 @@ def test_current_block_outside_report_window_fails(exported):
     with pytest.raises(ProvenanceError, match="outside the report's validity"):
         _verify(report, receipts, current_block=10_000)  # window is 70..80
     _verify(report, receipts, current_block=75)  # inside: verifies
+
+
+def test_report_snapshot_binding_shape_is_enforced(exported):
+    """Defect-4 verification side: a tampered snapshot binding (unsorted,
+    bad digest, missing field, unnormalized hash) is rejected even when the
+    signature itself is re-forged as valid."""
+    report, receipts = exported
+
+    def unsorted(document):
+        document["candidate_snapshot"]["hotkeys"] = list(
+            reversed(document["candidate_snapshot"]["hotkeys"])
+        )
+
+    def bad_digest(document):
+        document["candidate_snapshot"]["digest"] = "not-a-digest"
+
+    def missing_block(document):
+        document["candidate_snapshot"].pop("block")
+
+    def unnormalized_hash(document):
+        document["candidate_snapshot"]["block_hash"] = "0x" + "ab" * 32
+
+    for mutate, message in (
+        (unsorted, "sorted"),
+        (bad_digest, "digest is invalid"),
+        (missing_block, "missing or unknown fields"),
+        (unnormalized_hash, "block hash is invalid"),
+    ):
+        with pytest.raises(ProvenanceError, match=message):
+            _verify(_reforge(report, mutate), receipts)

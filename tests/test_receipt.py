@@ -730,6 +730,10 @@ def test_epoch_snapshot_must_match_the_exact_lifecycle_signed_in_receipt(tmp_pat
         ledger.add_lifecycle_snapshot(epoch_id, mismatched, snapshot_at=ISSUED_TEXT)
 
 
+ANCHOR_BLOCK = 100
+ANCHOR_HASH = "ab" * 32
+
+
 def _completed_receipt_epoch(tmp_path: Path, *, work_units: float = 3.5) -> tuple[Ledger, int]:
     snapshot = _snapshot()
     ledger = Ledger(tmp_path / "score-class-ledger.sqlite")
@@ -737,6 +741,10 @@ def _completed_receipt_epoch(tmp_path: Path, *, work_units: float = 3.5) -> tupl
         11,
         policy_registry_release=snapshot.release,
         policy_registry_digest=snapshot.digest,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
     )
     _snapshot_value, policy, claims, receipt = _issued_receipt(
         epoch_id=epoch_id, work_units=work_units
@@ -776,6 +784,23 @@ def _completed_receipt_epoch(tmp_path: Path, *, work_units: float = 3.5) -> tupl
     return ledger, epoch_id
 
 
+def _candidate_snapshot_for(
+    ledger: Ledger, epoch_id: int, *, extra_hotkeys: tuple[str, ...] = ()
+) -> dict:
+    """A cathedral_candidate_snapshot_v1 matching this epoch's durable anchor
+    and covering every scored hotkey (plus any extra registered candidates)."""
+    snapshot = ledger.score_class_snapshot(epoch_id)
+    hotkeys = {str(row["hotkey"]) for row in snapshot["rows"]} | set(extra_hotkeys)
+    return {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": snapshot["network"],
+        "netuid": snapshot["netuid"],
+        "block": snapshot["challenge_anchor_block"] or ANCHOR_BLOCK,
+        "block_hash": snapshot["challenge_anchor_hash"] or ANCHOR_HASH,
+        "hotkeys": sorted(hotkeys),
+    }
+
+
 def _export_score_class(
     ledger: Ledger,
     epoch_id: int,
@@ -783,6 +808,7 @@ def _export_score_class(
     generated_at: datetime = ISSUED,
     evidence_base_uri: str | None = None,
     previous_report_id: str | None = None,
+    candidate_snapshot: dict | None = None,
 ) -> bytes:
     return export_score_class_report(
         ledger,
@@ -798,8 +824,14 @@ def _export_score_class(
         valid_from_block=70,
         valid_until_block=80,
         verifier_digest="sha256:" + "d" * 64,
+        candidate_snapshot=(
+            candidate_snapshot
+            if candidate_snapshot is not None
+            else _candidate_snapshot_for(ledger, epoch_id)
+        ),
         evidence_base_uri=evidence_base_uri,
         previous_report_id=previous_report_id,
+        require_epoch_anchor=False,
     )
 
 
@@ -809,6 +841,10 @@ def _completed_zero_epoch(ledger: Ledger, source_epoch: int) -> int:
         source_epoch,
         policy_registry_release=snapshot.release,
         policy_registry_digest=snapshot.digest,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
     )
     ledger.complete_epoch(
         epoch_id,
@@ -845,7 +881,7 @@ def test_score_class_export_contains_exact_receipt_provenance_and_zero_revocatio
     stored = ledger.receipt_for_challenge(CHALLENGE_ID)
 
     assert raw == canonical_json(document)
-    assert document["schema"] == "cathedral_score_class_report_v1"
+    assert document["schema"] == "cathedral_score_class_report_v2"
     assert (document["network"], document["netuid"]) == ("local", 1)
     assert document["source_epoch"] == 11
     assert rows["public-hotkey"]["metrics"] == {"verified_work_units": "3.5"}
@@ -888,7 +924,18 @@ def test_score_class_export_rejects_receiptless_positive_work(tmp_path: Path):
     )
 
     with pytest.raises(ScoreClassError, match="lacks an assurance receipt"):
-        _export_score_class(ledger, epoch_id)
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": "local",
+                "netuid": 1,
+                "block": ANCHOR_BLOCK,
+                "block_hash": ANCHOR_HASH,
+                "hotkeys": ["legacy-hotkey"],
+            },
+        )
 
 
 def test_score_class_export_rejects_wrong_audience_and_corrupt_receipt(tmp_path: Path):
@@ -909,6 +956,14 @@ def test_score_class_export_rejects_wrong_audience_and_corrupt_receipt(tmp_path:
             valid_from_block=70,
             valid_until_block=80,
             verifier_digest="sha256:" + "d" * 64,
+            candidate_snapshot={
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": "local",
+                "netuid": 2,
+                "block": ANCHOR_BLOCK,
+                "block_hash": ANCHOR_HASH,
+                "hotkeys": ["public-hotkey", "zero-hotkey"],
+            },
         )
 
     ledger._connection.execute(
@@ -1123,6 +1178,21 @@ def test_runtime_cli_exports_validator_consumable_score_class(
     key_path.write_bytes(base64.b64encode(RECEIPT_SEED_2))
     key_path.chmod(0o600)
     output = tmp_path / "confidential-compute.json"
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": "local",
+                "netuid": 1,
+                "block": ANCHOR_BLOCK,
+                "block_hash": ANCHOR_HASH,
+                "hotkeys": ["public-hotkey", "zero-hotkey"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
     arguments = [
         "runtime",
@@ -1149,6 +1219,8 @@ def test_runtime_cli_exports_validator_consumable_score_class(
         "80",
         "--verifier-digest",
         "sha256:" + "d" * 64,
+        "--candidate-snapshot",
+        str(snapshot_path),
         "--output",
         str(output),
     ]
@@ -1237,3 +1309,195 @@ def test_offline_cli_returns_machine_readable_verification_categories(
     revoked = json.loads(capsys.readouterr().out)
     assert revoked["valid"] is False
     assert revoked["category"] == "key"
+
+
+def test_begin_epoch_validates_the_challenge_anchor_pair(tmp_path: Path):
+    """Defect-3: the anchor is a validated PAIR persisted at begin_epoch."""
+    ledger = Ledger(tmp_path / "anchor-ledger.sqlite")
+    with pytest.raises(LedgerError, match="supplied together as a validated pair"):
+        ledger.begin_epoch(1, challenge_anchor_block=100)
+    with pytest.raises(LedgerError, match="supplied together as a validated pair"):
+        ledger.begin_epoch(1, challenge_anchor_hash=ANCHOR_HASH)
+    with pytest.raises(LedgerError, match="anchor hash is invalid"):
+        ledger.begin_epoch(
+            1,
+            network="local",
+            netuid=1,
+            challenge_anchor_block=100,
+            challenge_anchor_hash="zz" * 32,
+        )
+    with pytest.raises(LedgerError, match="requires its audience"):
+        ledger.begin_epoch(
+            1, challenge_anchor_block=100, challenge_anchor_hash=ANCHOR_HASH
+        )
+    epoch_id = ledger.begin_epoch(
+        1,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + ANCHOR_HASH,  # 0x is normalized away
+    )
+    anchor = ledger.epoch_challenge_anchor(epoch_id)
+    assert anchor == {
+        "network": "local",
+        "netuid": 1,
+        "block": 100,
+        "block_hash": ANCHOR_HASH,
+    }
+    ledger.close()
+
+
+def test_anchored_epoch_refuses_a_different_completion_audience(tmp_path: Path):
+    ledger = Ledger(tmp_path / "audience-ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        1,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=100,
+        challenge_anchor_hash=ANCHOR_HASH,
+    )
+    with pytest.raises(LedgerError, match="does not match the epoch's anchored audience"):
+        ledger.complete_epoch(
+            epoch_id, set(), score_network="local", score_netuid=2
+        )
+    with pytest.raises(LedgerError, match="anchored score audience"):
+        ledger.complete_epoch(epoch_id, set())
+    ledger.close()
+
+
+def test_score_class_export_enforces_the_epoch_anchor_and_snapshot_shape(
+    tmp_path: Path,
+):
+    """Defect-3 counterexamples: block/hash mismatch, missing anchor,
+    duplicate and invalid hotkeys all refuse to sign."""
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+    good = _candidate_snapshot_for(ledger, epoch_id)
+
+    with pytest.raises(ScoreClassError, match="durable challenge anchor"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={**good, "block": ANCHOR_BLOCK + 1},
+        )
+    with pytest.raises(ScoreClassError, match="durable challenge anchor"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={**good, "block_hash": "cd" * 32},
+        )
+    with pytest.raises(ScoreClassError, match="duplicate hotkeys"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={
+                **good,
+                "hotkeys": [*good["hotkeys"], good["hotkeys"][0]],
+            },
+        )
+    with pytest.raises(ScoreClassError, match="invalid hotkey"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={**good, "hotkeys": [*good["hotkeys"], ""]},
+        )
+    with pytest.raises(ScoreClassError, match="missing or unknown fields"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            candidate_snapshot={**good, "endpoint": "https://leak.example"},
+        )
+    ledger.close()
+
+
+def test_score_class_export_requires_the_anchor_in_production(tmp_path: Path):
+    ledger = Ledger(tmp_path / "unanchored-ledger.sqlite")
+    epoch_id = ledger.begin_epoch(11)
+    ledger.complete_epoch(
+        epoch_id, {"zero-hotkey"}, generated_at=ISSUED_TEXT,
+        score_network="local", score_netuid=1,
+    )
+    snapshot = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": "local",
+        "netuid": 1,
+        "block": ANCHOR_BLOCK,
+        "block_hash": ANCHOR_HASH,
+        "hotkeys": ["zero-hotkey"],
+    }
+    with pytest.raises(ScoreClassError, match="no durable challenge anchor"):
+        export_score_class_report(
+            ledger,
+            epoch_id,
+            network="local",
+            netuid=1,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=RECEIPT_SEED_2,
+            generated_at=ISSUED,
+            valid_until=ISSUED + timedelta(minutes=5),
+            valid_from_block=70,
+            valid_until_block=80,
+            verifier_digest="sha256:" + "d" * 64,
+            candidate_snapshot=snapshot,
+            require_epoch_anchor=True,
+        )
+    ledger.close()
+
+
+def test_score_class_report_accounts_for_every_historical_candidate(
+    tmp_path: Path,
+):
+    """Defect-4: a registered hotkey with NO ledger row gets an explicit
+    zero row; a scored hotkey outside the snapshot refuses to sign; the
+    entry set equals the snapshot set exactly."""
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+    snapshot = _candidate_snapshot_for(
+        ledger, epoch_id, extra_hotkeys=("registered-idle-hotkey",)
+    )
+    # Omission must be checked BEFORE any successful export: once signed,
+    # replays intentionally return the originally bound bytes.
+    omitting = {
+        **snapshot,
+        "hotkeys": [h for h in snapshot["hotkeys"] if h != "public-hotkey"],
+    }
+    with pytest.raises(ScoreClassError, match="not registered in the anchored"):
+        _export_score_class(ledger, epoch_id, candidate_snapshot=omitting)
+
+    report = json.loads(
+        _export_score_class(ledger, epoch_id, candidate_snapshot=snapshot)
+    )
+    entries = {entry["miner_hotkey"]: entry for entry in report["entries"]}
+    assert set(entries) == set(snapshot["hotkeys"])
+    idle = entries["registered-idle-hotkey"]
+    assert idle["metrics"]["verified_work_units"] == "0"
+    assert idle["reason_codes"] == ["not_admitted"]
+    assert idle["evidence"] == []
+    assert report["candidate_snapshot"]["hotkeys"] == sorted(snapshot["hotkeys"])
+    assert report["candidate_snapshot"]["block"] == ANCHOR_BLOCK
+    assert report["candidate_snapshot"]["block_hash"] == ANCHOR_HASH
+    ledger.close()
+
+
+def test_score_class_export_retry_replays_the_originally_bound_snapshot(
+    tmp_path: Path,
+):
+    """Defect-3 retry idempotence: an exact retry returns byte-identical
+    output, and a retry with a DIFFERENT snapshot still returns the
+    originally signed bytes (the durable export chain is the authority)."""
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+    original_snapshot = _candidate_snapshot_for(ledger, epoch_id)
+    first = _export_score_class(
+        ledger, epoch_id, candidate_snapshot=original_snapshot
+    )
+    assert _export_score_class(
+        ledger, epoch_id, candidate_snapshot=original_snapshot
+    ) == first
+    swapped = _candidate_snapshot_for(
+        ledger, epoch_id, extra_hotkeys=("late-registration",)
+    )
+    replay = _export_score_class(ledger, epoch_id, candidate_snapshot=swapped)
+    assert replay == first
+    bound = json.loads(first)["candidate_snapshot"]
+    assert "late-registration" not in bound["hotkeys"]
+    ledger.close()

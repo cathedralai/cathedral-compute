@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -50,8 +51,10 @@ from cathedral.policy_registry import (
 )
 from cathedral.receipt import ReceiptError, parse_receipt_json, verify_receipt
 
-REPORT_SCHEMA = "cathedral_score_class_report_v1"
+REPORT_SCHEMA = "cathedral_score_class_report_v2"
 RECEIPT_SCHEMA = "cathedral_assurance_receipt_v2"
+_SNAPSHOT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SNAPSHOT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Domain separation MUST match cathedral.score_class exactly; a report signed
 # there is only verifiable here with the same prefixes.
@@ -74,6 +77,7 @@ _REPORT_KEYS = frozenset(
         "policy_digest",
         "verifier_digest",
         "previous_report_id",
+        "candidate_snapshot",
         "entries",
         "signing_key_id",
         "report_id",
@@ -313,6 +317,47 @@ def verify_report_structure(
             "score report verifier_digest does not match the pinned production verifier"
         )
 
+    snapshot = document.get("candidate_snapshot")
+    if not isinstance(snapshot, dict) or frozenset(snapshot) != {
+        "digest",
+        "block",
+        "block_hash",
+        "hotkeys",
+    }:
+        raise ProvenanceError(
+            "score report candidate_snapshot has missing or unknown fields"
+        )
+    if not isinstance(snapshot["digest"], str) or _SNAPSHOT_DIGEST_RE.fullmatch(
+        snapshot["digest"]
+    ) is None:
+        raise ProvenanceError("score report candidate_snapshot digest is invalid")
+    snapshot_block = snapshot["block"]
+    if (
+        isinstance(snapshot_block, bool)
+        or not isinstance(snapshot_block, int)
+        or snapshot_block < 0
+    ):
+        raise ProvenanceError("score report candidate_snapshot block is invalid")
+    if not isinstance(snapshot["block_hash"], str) or _SNAPSHOT_HASH_RE.fullmatch(
+        snapshot["block_hash"]
+    ) is None:
+        raise ProvenanceError(
+            "score report candidate_snapshot block hash is invalid"
+        )
+    snapshot_hotkeys = snapshot["hotkeys"]
+    if (
+        not isinstance(snapshot_hotkeys, list)
+        or any(
+            not isinstance(hotkey, str) or not hotkey for hotkey in snapshot_hotkeys
+        )
+        or len(set(snapshot_hotkeys)) != len(snapshot_hotkeys)
+        or sorted(snapshot_hotkeys) != snapshot_hotkeys
+    ):
+        raise ProvenanceError(
+            "score report candidate_snapshot hotkeys must be a sorted "
+            "duplicate-free list"
+        )
+
     previous = document.get("previous_report_id")
     if previous is not None and not isinstance(previous, str):
         raise ProvenanceError("score report previous_report_id is invalid")
@@ -413,34 +458,49 @@ def verify_and_recompute(
     if not isinstance(entries, list):
         raise ProvenanceError("score report has no entries list")
 
-    # Exhaustive candidate accounting: every enrolled candidate must appear
-    # in the report (verified with evidence or explicitly zero/rejected) and
-    # the report must not smuggle entries outside the committed set. An
-    # omitted honest miner can therefore never silently inflate another.
+    # Exhaustive candidate accounting: the report's OWN signed snapshot
+    # binding must exactly cover its entries (every historical candidate has
+    # an explicit row; no entry outside the anchored set), and the manifest's
+    # candidate_set must be the SAME anchored snapshot — identical block,
+    # hash, and hotkey set. Report, manifest, and recomputation therefore
+    # always range over one identical candidate universe.
+    bound_snapshot = document["candidate_snapshot"]
+    bound_hotkeys = set(bound_snapshot["hotkeys"])
+    report_hotkeys = {
+        entry.get("miner_hotkey") for entry in entries if isinstance(entry, dict)
+    }
+    omitted = bound_hotkeys - report_hotkeys
+    if omitted:
+        raise ProvenanceError(
+            f"report omits anchored snapshot candidates: {sorted(omitted)}"
+        )
+    stray = report_hotkeys - bound_hotkeys
+    if stray:
+        raise ProvenanceError(
+            f"report carries entries outside its anchored snapshot: "
+            f"{sorted(stray)}"
+        )
+
     candidate_outcomes: dict[str, str] = {}
     if candidate_set is not None:
         for row in candidate_set.get("candidates", []):
             candidate_outcomes[str(row["hotkey"])] = str(row["outcome"])
-        report_hotkeys = {
-            entry.get("miner_hotkey")
-            for entry in entries
-            if isinstance(entry, dict)
-        }
-        active = {
-            hotkey
-            for hotkey, outcome in candidate_outcomes.items()
-            if outcome != "retired"
-        }
-        missing = active - report_hotkeys
-        if missing:
+        manifest_hotkeys = set(candidate_outcomes)
+        if manifest_hotkeys != bound_hotkeys:
+            drift = sorted(manifest_hotkeys ^ bound_hotkeys)
             raise ProvenanceError(
-                f"report omits committed candidates: {sorted(missing)}"
+                "manifest candidate_set does not equal the report's anchored "
+                f"snapshot hotkey set (drift: {drift})"
             )
-        stray = report_hotkeys - set(candidate_outcomes)
-        if stray:
+        manifest_hash = (
+            str(candidate_set.get("block_hash", "")).lower().removeprefix("0x")
+        )
+        if int(candidate_set.get("block", -1)) != int(
+            bound_snapshot["block"]
+        ) or manifest_hash != bound_snapshot["block_hash"]:
             raise ProvenanceError(
-                f"report carries entries outside the committed candidate set: "
-                f"{sorted(stray)}"
+                "manifest candidate_set block/hash does not match the "
+                "report's anchored snapshot"
             )
 
     miners: list[MinerProvenance] = []

@@ -202,12 +202,26 @@ def _fresh_lifecycle(claims, policy, hotkey: str) -> LifecycleSnapshot:
     )
 
 
+CANDIDATE_SNAPSHOT_DOC = {
+    "schema": "cathedral_candidate_snapshot_v1",
+    "network": NETWORK,
+    "netuid": NETUID,
+    "block": 100,
+    "block_hash": "0x" + "ab" * 32,
+    "hotkeys": ["public-hotkey"],
+}
+
+
 def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
     ledger = Ledger(tmp_path / "ledger.sqlite")
     epoch_id = ledger.begin_epoch(
         11,
         policy_registry_release=SNAPSHOT.release,
         policy_registry_digest=SNAPSHOT.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + "ab" * 32,
     )
     policy = SNAPSHOT.to_policy(at=NOW)
     work_item_bytes, result_bytes = _work_fixture(CHALLENGE_ID, "public-hotkey")
@@ -437,6 +451,7 @@ def exported_evidence(tmp_path: Path, capsys):
         valid_from_block=1,
         valid_until_block=10_000_000_000,
         verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
         evidence_base_uri="https://evidence.example/receipts/",
     )
     ledger.close()
@@ -448,18 +463,7 @@ def exported_evidence(tmp_path: Path, capsys):
     evidence_dir = tmp_path / "evidence"
     snapshot_path = tmp_path / "candidate-snapshot.json"
     snapshot_path.write_text(
-        json.dumps(
-            {
-                "schema": "cathedral_candidate_snapshot_v1",
-                "network": NETWORK,
-                "netuid": NETUID,
-                "block": 100,
-                "block_hash": "0x" + "ab" * 32,
-                "hotkeys": ["public-hotkey"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        json.dumps(CANDIDATE_SNAPSHOT_DOC, sort_keys=True, separators=(",", ":"))
     )
 
     code = cli_main(
@@ -899,3 +903,61 @@ def test_corrupt_index_recovery_cannot_roll_back_highwater(tmp_path):
     )
     with pytest.raises(EvidenceError, match="durable\\s+high-water"):
         store.write_index(index_12)
+
+
+def test_evidence_export_refuses_a_swapped_candidate_snapshot(
+    tmp_path: Path, exported_evidence, capsys
+):
+    """Defect-3 evidence side: export-evidence must REUSE the exact snapshot
+    the signed report bound — a later, different snapshot fails; the exact
+    original stays idempotently retryable."""
+    evidence_dir, _summary = exported_evidence
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    export_args = [
+        "runtime",
+        "export-evidence",
+        "--ledger-db",
+        str(tmp_path / "ledger.sqlite"),
+        "--evidence-dir",
+        str(evidence_dir),
+        "--score-network",
+        NETWORK,
+        "--score-netuid",
+        str(NETUID),
+        "--policy-registry",
+        str(tmp_path / "registry.json"),
+        "--verifier-digest",
+        VERIFIER_DIGEST,
+        "--mechanism",
+        "validated_supply_v1",
+        "--source-revision",
+        "abc1234",
+        "--index-signing-key-id",
+        "evidence-index-test-1",
+        "--index-signing-key-file",
+        str(tmp_path / "index-signing.key"),
+        "--candidate-snapshot",
+        str(snapshot_path),
+    ]
+
+    for swap in (
+        {"hotkeys": ["late-arrival", "public-hotkey"]},
+        {"block": 101},
+        {"block_hash": "0x" + "cd" * 32},
+    ):
+        snapshot_path.write_text(
+            json.dumps(
+                {**CANDIDATE_SNAPSHOT_DOC, **swap},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        assert cli_main(export_args) != 0
+        assert "must reuse the exact frozen snapshot" in capsys.readouterr().err
+
+    # The exact original snapshot remains an idempotent retry.
+    snapshot_path.write_text(
+        json.dumps(CANDIDATE_SNAPSHOT_DOC, sort_keys=True, separators=(",", ":"))
+    )
+    assert cli_main(export_args) == 0
+    capsys.readouterr()

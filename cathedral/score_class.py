@@ -21,9 +21,11 @@ from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptError, parse_receipt_json
 
 
-REPORT_SCHEMA = "cathedral_score_class_report_v1"
+REPORT_SCHEMA = "cathedral_score_class_report_v2"
 REPORT_DOMAIN = b"cathedral-score-class-report-v1\x00"
 REPORT_ID_DOMAIN = b"cathedral-score-class-id-v1\x00"
+CANDIDATE_SNAPSHOT_SCHEMA = "cathedral_candidate_snapshot_v1"
+_BLOCK_HASH_RE = re.compile(r"^(0x)?[0-9a-f]{64}$")
 MAX_REPORT_BYTES = 1_048_576
 MAX_REPORT_ENTRIES = 4096
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -110,6 +112,54 @@ def _receipt_uri(base_uri: str | None, receipt_id: str) -> str | None:
     return base_uri + urllib.parse.quote(receipt_id, safe=":-") + ".json"
 
 
+def validate_candidate_snapshot(
+    document: Mapping[str, Any], *, network: str, netuid: int
+) -> dict[str, Any]:
+    """Validate a ``cathedral_candidate_snapshot_v1`` and return its normalized
+    binding: {digest, block, block_hash, hotkeys}.
+
+    The digest commits to the EXACT snapshot document (canonical JSON), so the
+    score report, the evidence manifest, and any later export can only ever be
+    built from the one snapshot the epoch actually observed."""
+    if not isinstance(document, Mapping):
+        raise ScoreClassError("candidate snapshot must be a JSON object")
+    if frozenset(document) != {
+        "schema",
+        "network",
+        "netuid",
+        "block",
+        "block_hash",
+        "hotkeys",
+    }:
+        raise ScoreClassError("candidate snapshot has missing or unknown fields")
+    if document["schema"] != CANDIDATE_SNAPSHOT_SCHEMA:
+        raise ScoreClassError("candidate snapshot schema is unsupported")
+    if document["network"] != network or document["netuid"] != netuid:
+        raise ScoreClassError("candidate snapshot audience does not match the report")
+    block = document["block"]
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        raise ScoreClassError("candidate snapshot block is invalid")
+    block_hash = document["block_hash"]
+    if not isinstance(block_hash, str) or _BLOCK_HASH_RE.fullmatch(
+        block_hash.strip().lower()
+    ) is None:
+        raise ScoreClassError("candidate snapshot block hash is invalid")
+    hotkeys = document["hotkeys"]
+    if not isinstance(hotkeys, list) or len(hotkeys) > MAX_REPORT_ENTRIES:
+        raise ScoreClassError("candidate snapshot hotkeys are invalid")
+    for hotkey in hotkeys:
+        if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
+            raise ScoreClassError("candidate snapshot carries an invalid hotkey")
+    if len(set(hotkeys)) != len(hotkeys):
+        raise ScoreClassError("candidate snapshot carries duplicate hotkeys")
+    return {
+        "digest": "sha256:" + hashlib.sha256(canonical_json(document)).hexdigest(),
+        "block": int(block),
+        "block_hash": block_hash.strip().lower().removeprefix("0x"),
+        "hotkeys": sorted(hotkeys),
+    }
+
+
 def _report_id(document: Mapping[str, Any]) -> str:
     material = {
         key: value for key, value in document.items() if key not in {"report_id", "signature"}
@@ -151,15 +201,20 @@ def export_score_class_report(
     valid_from_block: int,
     valid_until_block: int,
     verifier_digest: str,
+    candidate_snapshot: Mapping[str, Any],
     policy_digest: str | None = None,
     previous_report_id: str | None = None,
     evidence_base_uri: str | None = None,
+    require_epoch_anchor: bool = True,
 ) -> bytes:
     """Export one frozen epoch as a thin-subnet-compatible signed report.
 
     Every positive metric is derived from the exact signed assurance receipt
-    persisted atomically with that miner's verified challenge.  Zero rows are
-    retained so a complete report can explicitly revoke prior positive work.
+    persisted atomically with that miner's verified challenge.  The report
+    accounts for EVERY candidate in the anchored historical snapshot —
+    ledger-scored or not — with explicit zero rows, and binds the snapshot's
+    digest, block, hash, and full sorted hotkey set into the signed body so
+    manifest, report, and recomputation always cover the identical set.
     """
 
     if not isinstance(ledger, Ledger):
@@ -202,6 +257,26 @@ def export_score_class_report(
         raise ScoreClassError(str(exc)) from exc
     if (snapshot["network"], snapshot["netuid"]) != (network, netuid):
         raise ScoreClassError("frozen epoch audience does not match score report audience")
+    snapshot_binding = validate_candidate_snapshot(
+        candidate_snapshot, network=network, netuid=netuid
+    )
+    anchor_block = snapshot["challenge_anchor_block"]
+    anchor_hash = snapshot["challenge_anchor_hash"]
+    if anchor_block is None:
+        if require_epoch_anchor:
+            raise ScoreClassError(
+                "epoch has no durable challenge anchor; production reports "
+                "require begin_epoch to persist the finalized-block anchor"
+            )
+    elif (int(anchor_block), str(anchor_hash)) != (
+        snapshot_binding["block"],
+        snapshot_binding["block_hash"],
+    ):
+        raise ScoreClassError(
+            "candidate snapshot block/hash does not match the epoch's durable "
+            "challenge anchor; the report must bind the snapshot the epoch's "
+            "nonces were actually derived from"
+        )
     selected_policy_digest = policy_digest or snapshot["policy_registry_digest"]
     checked_policy_digest = _digest(selected_policy_digest, "policy digest")
     prior_export = ledger.previous_score_class_export(
@@ -224,11 +299,37 @@ def export_score_class_report(
     if not isinstance(rows, tuple) or len(rows) > MAX_REPORT_ENTRIES:
         raise ScoreClassError("score report has too many entries")
 
-    entries: list[dict[str, Any]] = []
+    # Exhaustive candidate accounting (defect 4): the report's entry set must
+    # be EXACTLY the anchored snapshot's hotkey set. A ledger row outside the
+    # snapshot means the epoch scored an unregistered hotkey — refuse; a
+    # snapshot candidate with no ledger row gets an explicit zero entry.
+    rows_by_hotkey: dict[str, Any] = {}
     for row in rows:
         hotkey = row["hotkey"]
         if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
             raise ScoreClassError("invalid miner hotkey in frozen epoch")
+        rows_by_hotkey[hotkey] = row
+    unregistered = set(rows_by_hotkey) - set(snapshot_binding["hotkeys"])
+    if unregistered:
+        raise ScoreClassError(
+            "frozen epoch scored hotkeys that are not registered in the "
+            f"anchored candidate snapshot: {sorted(unregistered)}"
+        )
+
+    entries: list[dict[str, Any]] = []
+    for hotkey in snapshot_binding["hotkeys"]:
+        row = rows_by_hotkey.get(hotkey)
+        if row is None:
+            entries.append(
+                {
+                    "miner_hotkey": hotkey,
+                    "metrics": {"verified_work_units": "0"},
+                    "asserted_score": None,
+                    "reason_codes": ["not_admitted"],
+                    "evidence": [],
+                }
+            )
+            continue
         frozen_units = _decimal(row["work_units"], "frozen work units")
         evidence: list[dict[str, Any]] = []
         reasons = ["no_verified_work"]
@@ -304,6 +405,7 @@ def export_score_class_report(
         "policy_digest": checked_policy_digest,
         "verifier_digest": checked_verifier_digest,
         "previous_report_id": checked_previous,
+        "candidate_snapshot": snapshot_binding,
         "entries": entries,
         "signing_key_id": signing_key_id,
     }

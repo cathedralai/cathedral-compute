@@ -1183,6 +1183,9 @@ def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
                 if args.generated_at is None
                 else _score_class_time(args.generated_at, "generated_at")
             )
+            snapshot_document = _strict_json_object(
+                Path(args.candidate_snapshot).read_bytes(), "candidate snapshot"
+            )
             report = export_score_class_report(
                 ledger,
                 epoch_id,
@@ -1201,9 +1204,11 @@ def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
                 valid_from_block=args.valid_from_block,
                 valid_until_block=args.valid_until_block,
                 verifier_digest=args.verifier_digest,
+                candidate_snapshot=snapshot_document,
                 policy_digest=args.policy_digest,
                 previous_report_id=args.previous_report_id,
                 evidence_base_uri=args.evidence_base_uri,
+                require_epoch_anchor=not args.development,
             )
         _write_score_class_report(args.output, report)
         document = json.loads(report)
@@ -1389,20 +1394,53 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             str(snapshot["generated_at"]).replace("Z", "+00:00")  # noqa: FURB162 - ledger text may carry either suffix
         ).astimezone(datetime.UTC)
         manifest_generated_at = frozen_generated.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        from cathedral.score_class import validate_candidate_snapshot
+
         snapshot_document = _strict_json_object(
             Path(args.candidate_snapshot).read_bytes(), "candidate snapshot"
         )
-        if (
-            snapshot_document.get("schema") != "cathedral_candidate_snapshot_v1"
-            or snapshot_document.get("network") != args.score_network
-            or snapshot_document.get("netuid") != args.score_netuid
-            or not isinstance(snapshot_document.get("hotkeys"), list)
-            or not isinstance(snapshot_document.get("block"), int)
-            or not isinstance(snapshot_document.get("block_hash"), str)
+        snapshot_binding = validate_candidate_snapshot(
+            snapshot_document,
+            network=args.score_network,
+            netuid=args.score_netuid,
+        )
+        # The evidence bundle REUSES the exact snapshot the signed report
+        # bound: digest, block, and hash must all match, and the epoch's
+        # durable challenge anchor must agree. A later, unrelated snapshot
+        # can never be substituted at evidence-export time.
+        report_binding = report.get("candidate_snapshot")
+        if not isinstance(report_binding, dict) or (
+            report_binding.get("digest"),
+            report_binding.get("block"),
+            report_binding.get("block_hash"),
+        ) != (
+            snapshot_binding["digest"],
+            snapshot_binding["block"],
+            snapshot_binding["block_hash"],
         ):
             raise ValueError(
-                "candidate snapshot must carry schema/network/netuid/block/"
-                "block_hash/hotkeys for the anchored SN39 metagraph"
+                "candidate snapshot does not match the one bound into the "
+                "signed score report; evidence export must reuse the exact "
+                "frozen snapshot"
+            )
+        if sorted(report_binding.get("hotkeys") or []) != snapshot_binding["hotkeys"]:
+            raise ValueError(
+                "candidate snapshot hotkeys do not match the signed report's "
+                "bound hotkey set"
+            )
+        epoch_anchor = ledger.epoch_challenge_anchor(epoch_id)
+        if epoch_anchor is not None and (
+            int(epoch_anchor["block"]),
+            str(epoch_anchor["block_hash"]),
+        ) != (snapshot_binding["block"], snapshot_binding["block_hash"]):
+            raise ValueError(
+                "candidate snapshot block/hash does not match the epoch's "
+                "durable challenge anchor"
+            )
+        if epoch_anchor is None and not args.development:
+            raise ValueError(
+                "production evidence export requires the epoch's durable "
+                "challenge anchor (persisted at begin_epoch)"
             )
         registered = {str(h) for h in snapshot_document["hotkeys"]}
         row_outcomes = {
@@ -3091,6 +3129,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_class.add_argument("--valid-from-block", type=int, required=True)
     p_export_class.add_argument("--valid-until-block", type=int, required=True)
     p_export_class.add_argument("--verifier-digest", required=True)
+    p_export_class.add_argument(
+        "--candidate-snapshot",
+        required=True,
+        help="cathedral_candidate_snapshot_v1 JSON captured from finalized "
+             "chain state; its digest, block, hash, and full sorted hotkey "
+             "set are bound into the signed report and must match the "
+             "epoch's durable challenge anchor",
+    )
     p_export_class.add_argument("--policy-digest")
     p_export_class.add_argument("--previous-report-id")
     p_export_class.add_argument("--evidence-base-uri")
