@@ -31,8 +31,6 @@ from typing import Any
 
 WORK_ITEM_SCHEMA = "cathedral_sat_manifest_v1"
 MAX_WORK_ARTIFACT_BYTES = 4 * 1024 * 1024
-MAX_CLAUSES = 100_000
-MAX_VARS = 100_000
 
 
 class WorkProofError(Exception):
@@ -96,32 +94,37 @@ def verify_work_artifacts(
         raise WorkProofError("work item schema is unsupported")
     if item["challenge_id"] != expected_challenge_id:
         raise WorkProofError("work item challenge does not match the receipt's challenge binding")
-    instance = item["instance"]
-    if not isinstance(instance, dict) or frozenset(instance) != {"n_vars", "clauses"}:
+    instance_document = item["instance"]
+    if not isinstance(instance_document, dict) or frozenset(instance_document) != {
+        "n_vars",
+        "clauses",
+    }:
         raise WorkProofError("work item instance is malformed")
-    n_vars = instance["n_vars"]
-    clauses = instance["clauses"]
-    if (
-        isinstance(n_vars, bool)
-        or not isinstance(n_vars, int)
-        or not 1 <= n_vars <= MAX_VARS
-        or not isinstance(clauses, list)
-        or not 1 <= len(clauses) <= MAX_CLAUSES
-    ):
+    # ONE shared contract with the producer (cathedral.lanes.sat): the SAME
+    # bounds (n_vars, clause count, per-clause and TOTAL literal limits,
+    # seed range, encoded size) and - critically - the challenge_id is
+    # RECOMPUTED from the canonical instance+seed exactly as the producer
+    # derives it. A fabricated item with an invented challenge_id, or one
+    # outside producer bounds, can never replay as real work.
+    from cathedral.lanes.sat import validate_sat_work_item
+    from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+
+    try:
+        work_item = SatWorkItem(
+            instance=SatInstance(
+                n_vars=instance_document["n_vars"],
+                clauses=instance_document["clauses"],
+            ),
+            seed=item["seed"],
+            challenge_id=item["challenge_id"],
+        )
+        validate_sat_work_item(work_item)
+    except (TypeError, ValueError) as exc:
+        raise WorkProofError(f"work item fails the producer contract: {exc}") from exc
+    n_vars = work_item.instance.n_vars
+    clauses = work_item.instance.clauses
+    if not clauses:
         raise WorkProofError("work item instance bounds are invalid")
-    for clause in clauses:
-        if (
-            not isinstance(clause, list)
-            or not clause
-            or any(
-                isinstance(literal, bool)
-                or not isinstance(literal, int)
-                or literal == 0
-                or abs(literal) > n_vars
-                for literal in clause
-            )
-        ):
-            raise WorkProofError("work item clause is malformed")
 
     result = _strict_canonical_json(result_bytes, "work result")
     if frozenset(result) != {
@@ -160,11 +163,15 @@ def verify_work_artifacts(
                 "claimed solve is not real work"
             )
 
-    # Validator-derived unit formula for supported SAT work: the clause
-    # count. Neither the miner's nor the signer's asserted number is
-    # trusted; the receipt's signed units must EQUAL the re-derivation, and
-    # the certificate's own units must agree.
-    derived_units = Decimal(len(clauses))
+    # THE versioned unit rule (sat_work_units_v1), shared verbatim with the
+    # producer: derived purely from the committed work item - canonical
+    # audit work earns its clause count, everything else is a bounded
+    # customer job at the fixed CUSTOMER_SAT_WORK_UNITS. Neither the
+    # miner's nor the signer's asserted number is trusted; the receipt's
+    # signed units must EQUAL this re-derivation.
+    from cathedral.lanes.sat import derived_work_units
+
+    derived_units = Decimal(str(derived_work_units(work_item)))
     certificate_units = result["work_units"]
     # The raw certificate's units are the MINER's claim - bound into the
     # result digest for auditability but never trusted. Only shape-check it;
@@ -174,5 +181,6 @@ def verify_work_artifacts(
     if expected_units != derived_units:
         raise WorkProofError(
             f"receipt-signed units {expected_units} != independently derived "
-            f"{derived_units}; a signer-only assertion never earns"
+            f"{derived_units} under sat_work_units_v1; a signer-only "
+            "assertion never earns"
         )
