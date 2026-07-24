@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh Cathedral SN39 signed policy publication before its 24-hour ceiling
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=12h
+AccuracySec=1min
+RandomizedDelaySec=10min
+Persistent=true
+Unit=cathedral-sn39-policy-republisher.service
+
+[Install]
+WantedBy=timers.target
+

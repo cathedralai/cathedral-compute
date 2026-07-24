@@ -1,0 +1,43 @@
+[Unit]
+Description=Cathedral SN39 signed policy freshness republisher
+Documentation=https://github.com/cathedralai/cathedralconfidential/blob/main/docs/POLICY_REGISTRY.md
+After=local-fs.target
+ConditionPathExists=/etc/cathedral/policy-registry-sn39.json
+ConditionPathExists=/etc/cathedral/policy-signing-sn39.key
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Restart=on-failure
+RestartSec=5min
+ExecStart=/home/polaris/cathedral-sn39/.venv/bin/python /home/polaris/cathedral-sn39/scripts/cathedral_measurement_approval.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
+AmbientCapabilities=
+CapabilityBoundingSet=
+DevicePolicy=closed
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadWritePaths=/etc/cathedral /var/lib/cathedral-confidential-sn39
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+LockPersonality=true
+MemoryDenyWriteExecute=true
