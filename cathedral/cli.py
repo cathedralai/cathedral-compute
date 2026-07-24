@@ -1630,7 +1630,7 @@ def _bounded_https_fetch(
     max_bytes: int = MAX_EVIDENCE_FETCH_BYTES,
     allow_private: bool = False,
     timeout: float = 30.0,
-    budget: "_FetchBudget | None" = None,
+    budget: _FetchBudget | None = None,
 ) -> bytes:
     """HTTPS-only bounded fetch pinned to the validated peer.
 
@@ -1662,7 +1662,7 @@ def _bounded_https_fetch(
     )
 
     class _PinnedConnection(_http.HTTPSConnection):
-        def connect(self) -> None:  # noqa: D401
+        def connect(self) -> None:
             raw = _socket.create_connection((peer_ip, peer_port), self.timeout)
             self.sock = self._context.wrap_socket(raw, server_hostname=host)
 
