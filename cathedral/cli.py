@@ -35,8 +35,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from cathedral import census as census_mod
-from cathedral.attest import collect_tdx_gpu
 from cathedral.assurance import AssuranceDimension
+from cathedral.attest import collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
@@ -48,7 +48,6 @@ from cathedral.gpu import (
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.ledger import Ledger
-from cathedral.poster import Poster
 from cathedral.policy_registry import (
     MAX_REGISTRY_BYTES,
     PolicyRegistryError,
@@ -57,6 +56,7 @@ from cathedral.policy_registry import (
     parse_registry_json,
     verify_registry,
 )
+from cathedral.poster import Poster
 from cathedral.receipt import (
     MAX_RECEIPT_BYTES,
     ReceiptError,
@@ -65,9 +65,9 @@ from cathedral.receipt import (
     verify_receipt,
 )
 from cathedral.runtime import (
+    MAX_BEARER_TOKEN_LENGTH,
     ConfidentialRuntime,
     EpochRun,
-    MAX_BEARER_TOKEN_LENGTH,
     MinerOutcome,
     MinerTarget,
     RuntimeConfig,
@@ -88,7 +88,7 @@ DEFAULT_WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
 
 def _utc_ts() -> str:
     """Current UTC timestamp in compact ISO format for operator logs."""
-    return datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _abbrev(s: str | None, prefix: int = 5, suffix: int = 4) -> str:
@@ -329,7 +329,7 @@ def cmd_work_prune(args: argparse.Namespace) -> int:
     if not getattr(args, "confirm", False):
         raise ValueError("work prune requires --confirm")
     try:
-        before = datetime.datetime.fromisoformat(args.resolved_before.replace("Z", "+00:00"))
+        before = datetime.datetime.fromisoformat(args.resolved_before.replace("Z", "+00:00"))  # noqa: FURB162 - intentional fail-closed/UTC-text semantics
     except (AttributeError, TypeError, ValueError):
         raise ValueError("--resolved-before must be a UTC ISO-8601 timestamp") from None
     if before.tzinfo is None or before.utcoffset() != datetime.timedelta(0):
@@ -367,7 +367,7 @@ def _load_policy(path: str) -> Policy:
         tdx_allowed_tcb_statuses = raw.get("tdx_allowed_tcb_statuses", ["UpToDate"])
         tdx_allowed_advisories = raw.get("tdx_allowed_advisories", [])
     else:
-        raise ValueError("measurements file must be a JSON array or object")
+        raise ValueError("measurements file must be a JSON array or object")  # noqa: TRY004 - intentional fail-closed/UTC-text semantics
     if not isinstance(measurements, list) or any(
         not isinstance(value, str) or not value for value in measurements
     ):
@@ -375,7 +375,7 @@ def _load_policy(path: str) -> Policy:
     if isinstance(min_tcb, bool) or not isinstance(min_tcb, int) or min_tcb < 0:
         raise ValueError("min_tcb must be a nonnegative integer")
     if not isinstance(tdx_strict, bool):
-        raise ValueError("tdx_strict must be a boolean")
+        raise ValueError("tdx_strict must be a boolean")  # noqa: TRY004 - intentional fail-closed/UTC-text semantics
     for name, values in (
         ("tdx_allowed_tcb_statuses", tdx_allowed_tcb_statuses),
         ("tdx_allowed_advisories", tdx_allowed_advisories),
@@ -1117,7 +1117,7 @@ def cmd_runtime_status(args: argparse.Namespace) -> int:
 
 def _score_class_time(value: str, label: str) -> datetime.datetime:
     try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))  # noqa: FURB162 - intentional fail-closed/UTC-text semantics
     except (AttributeError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be a timezone-aware ISO-8601 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() != datetime.timedelta(0):
@@ -1165,7 +1165,7 @@ def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
                     "for validator provenance"
                 )
             generated_at = (
-                datetime.datetime.now(datetime.timezone.utc)
+                datetime.datetime.now(datetime.UTC)
                 if args.generated_at is None
                 else _score_class_time(args.generated_at, "generated_at")
             )
@@ -1335,6 +1335,16 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         ]
 
         wire_digest = str(snapshot["report_digest"]).removeprefix("sha256:")
+        candidate_rows = [
+            {
+                "hotkey": str(row["hotkey"]),
+                "outcome": "verified" if row["receipt_id"] else "rejected",
+                "reason": (
+                    "receipt_verified" if row["receipt_id"] else "no_verified_work"
+                ),
+            }
+            for row in snapshot["rows"]
+        ]
         manifest_bytes = build_manifest(
             network=args.score_network,
             netuid=args.score_netuid,
@@ -1360,6 +1370,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             report_signing_key_id=str(report["signing_key_id"]),
             receipts=manifest_receipts,
             attestations=attestations,
+            candidate_set={
+                "source": "enrollment_registry",
+                "finalized_block": None,
+                "candidates": candidate_rows,
+            },
             wire_report_sha256=wire_digest,
         )
         manifest_digest = store.put_blob(manifest_bytes)
@@ -1391,7 +1406,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 try:
                     data = entry.read_bytes()
                     manifest_doc = parse_manifest(data)
-                except Exception:  # noqa: BLE001 - skip corrupt copies
+                except Exception:  # noqa: S112, BLE001 - skip corrupt copies
                     continue
                 rebuilt.append(
                     {
@@ -1512,9 +1527,9 @@ def _verify_wire_vector(
         raise ValueError("weight vector signature verification failed") from exc
     expires = payload.get("expires_at")
     if not isinstance(expires, str):
-        raise ValueError("weight vector has no expiry")
-    expiry = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
-    if expiry <= datetime.datetime.now(datetime.timezone.utc):
+        raise ValueError("weight vector has no expiry")  # noqa: TRY004 - intentional fail-closed/UTC-text semantics
+    expiry = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))  # noqa: FURB162 - intentional fail-closed/UTC-text semantics
+    if expiry <= datetime.datetime.now(datetime.UTC):
         raise ValueError("weight vector is expired")
 
 
@@ -1563,7 +1578,7 @@ def _bounded_https_fetch(
                 )
 
     class _NoRedirect(_request.HTTPRedirectHandler):
-        def redirect_request(self, *arguments, **keywords):  # noqa: D401
+        def redirect_request(self, *arguments, **keywords):
             raise ValueError("evidence fetches must not follow redirects")
 
     opener = _request.build_opener(_NoRedirect, _request.HTTPSHandler())
@@ -1611,7 +1626,7 @@ def _strict_json_object(data: bytes, label: str) -> dict:
         ),
     )
     if not isinstance(document, dict):
-        raise ValueError(f"{label} is not a JSON object")
+        raise ValueError(f"{label} is not a JSON object")  # noqa: TRY004 - intentional fail-closed/UTC-text semantics
     return document
 
 
@@ -1764,10 +1779,9 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
     fail-closed: exit 1 with a FAIL/NOT_PROVEN event naming the broken link.
     """
     import time as time_mod
-    import urllib.request
 
     from cathedral import provenance
-    from cathedral.events import EventLogger, FAIL, PASS
+    from cathedral.events import FAIL, PASS, EventLogger
     from cathedral.evidence import (
         EvidenceError,
         EvidenceStore,
@@ -1976,7 +1990,6 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         controlled_dir = getattr(args, "controlled_dir", None)
         if controlled_dir:
             from cathedral import provenance as provenance_module
-            from cathedral.evidence import digest_bytes as _digest_bytes
 
             bindings = {
                 row["hotkey"]: row for row in manifest["attestations"]
@@ -2855,7 +2868,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - intentional fail-closed/UTC-text semantics
         # Any exception text may echo request/response context that embeds a
         # credential (e.g. a token-mapping load error); sanitize before it
         # reaches logs, same as the outcome/run JSON and --pretty paths.

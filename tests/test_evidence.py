@@ -282,6 +282,17 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
                 "blob": "sha256:" + "4" * 64,
             }
         ],
+        candidate_set={
+            "source": "enrollment_registry",
+            "finalized_block": None,
+            "candidates": [
+                {
+                    "hotkey": "public-hotkey",
+                    "outcome": "verified",
+                    "reason": "receipt_verified",
+                }
+            ],
+        },
         attestations=[
             {
                 "hotkey": "public-hotkey",

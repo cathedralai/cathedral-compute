@@ -25,9 +25,10 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from cathedral.policy_registry import (
     PolicyRegistryError,
@@ -38,7 +39,12 @@ from cathedral.policy_registry import (
 # v2 added verifier command/artifact bindings and per-attestation
 # envelope_digest. v1 never shipped to any public surface; v1 documents are
 # rejected with an explicit versioned error, not a generic shape failure.
-MANIFEST_SCHEMA = "cathedral_evidence_manifest_v2"
+# v3 adds the exhaustive candidate-set binding: every enrolled candidate for
+# the epoch is accounted for as verified (with replayable evidence) or
+# rejected (explicit fail-closed outcome), so omission cannot inflate a
+# remaining miner and an all-rejected epoch is provable.
+MANIFEST_SCHEMA = "cathedral_evidence_manifest_v3"
+LEGACY_MANIFEST_SCHEMA_V2 = "cathedral_evidence_manifest_v2"
 LEGACY_MANIFEST_SCHEMA = "cathedral_evidence_manifest_v1"
 INDEX_SCHEMA = "cathedral_evidence_index_v1"
 INDEX_DOMAIN = b"cathedral-evidence-index-v1\x00"
@@ -61,9 +67,11 @@ _MANIFEST_KEYS = frozenset(
         "score_report",
         "receipts",
         "attestations",
+        "candidate_set",
         "wire_report_sha256",
     }
 )
+_CANDIDATE_OUTCOMES = frozenset({"verified", "rejected", "retired"})
 _INDEX_KEYS = frozenset(
     {
         "schema",
@@ -240,11 +248,11 @@ class EvidenceStore:
         roll the pointer back.
         """
 
-        def __init__(self, store: "EvidenceStore") -> None:
+        def __init__(self, store: EvidenceStore) -> None:
             self._store = store
             self._descriptor: int | None = None
 
-        def __enter__(self) -> "EvidenceStore._IndexTransaction":
+        def __enter__(self) -> EvidenceStore._IndexTransaction:
             import fcntl
 
             self._store.root.mkdir(parents=True, exist_ok=True)
@@ -292,7 +300,7 @@ class EvidenceStore:
                         )
             _atomic_write(self._store.root / "index.json", index_bytes)
 
-    def index_transaction(self) -> "EvidenceStore._IndexTransaction":
+    def index_transaction(self) -> EvidenceStore._IndexTransaction:
         return EvidenceStore._IndexTransaction(self)
 
     def write_index(self, index_bytes: bytes) -> None:
@@ -326,6 +334,7 @@ def build_manifest(
     report_signing_key_id: str,
     receipts: list[dict[str, str]],
     attestations: list[dict[str, str]],
+    candidate_set: dict[str, Any],
     wire_report_sha256: str | None,
 ) -> bytes:
     document: dict[str, Any] = {
@@ -362,6 +371,7 @@ def build_manifest(
         },
         "receipts": receipts,
         "attestations": attestations,
+        "candidate_set": candidate_set,
         "wire_report_sha256": wire_report_sha256,
     }
     validate_manifest(document)
@@ -371,10 +381,10 @@ def build_manifest(
 def validate_manifest(document: Mapping[str, Any]) -> None:
     if frozenset(document) != _MANIFEST_KEYS:
         raise EvidenceError("evidence manifest has missing or unknown fields")
-    if document["schema"] == LEGACY_MANIFEST_SCHEMA:
+    if document["schema"] in (LEGACY_MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA_V2):
         raise EvidenceError(
-            "evidence manifest schema v1 is superseded by v2 (verifier and "
-            "envelope bindings are required); v1 was never published"
+            "evidence manifest schema v1/v2 is superseded by v3 (exhaustive "
+            "candidate-set binding is required); neither was ever published"
         )
     if document["schema"] != MANIFEST_SCHEMA:
         raise EvidenceError("evidence manifest schema is unsupported")
@@ -482,6 +492,36 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         _require_digest(row["evidence_digest"], "attestation evidence digest")
         if row["envelope_digest"] is not None:
             _require_digest(row["envelope_digest"], "attestation envelope digest")
+    candidate_set = document["candidate_set"]
+    if (
+        not isinstance(candidate_set, Mapping)
+        or set(candidate_set) != {"source", "finalized_block", "candidates"}
+        or candidate_set["source"] != "enrollment_registry"
+    ):
+        raise EvidenceError("evidence manifest candidate_set is invalid")
+    block = candidate_set["finalized_block"]
+    if block is not None and (
+        isinstance(block, bool) or not isinstance(block, int) or block < 0
+    ):
+        raise EvidenceError("evidence manifest candidate finalized_block is invalid")
+    candidates = candidate_set["candidates"]
+    if not isinstance(candidates, list) or len(candidates) > 4096:
+        raise EvidenceError("evidence manifest candidates list is invalid")
+    seen_candidates: set[str] = set()
+    for row in candidates:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"hotkey", "outcome", "reason"}
+            or not isinstance(row["hotkey"], str)
+            or not row["hotkey"]
+            or row["outcome"] not in _CANDIDATE_OUTCOMES
+            or not isinstance(row["reason"], str)
+            or len(row["reason"]) > 200
+        ):
+            raise EvidenceError("evidence manifest candidate row is invalid")
+        if row["hotkey"] in seen_candidates:
+            raise EvidenceError("evidence manifest duplicates a candidate")
+        seen_candidates.add(row["hotkey"])
     wire = document["wire_report_sha256"]
     if wire is not None and (
         not isinstance(wire, str) or not re.fullmatch(r"[0-9a-f]{64}", wire)

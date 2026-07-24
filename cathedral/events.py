@@ -24,7 +24,7 @@ import os
 import re
 import sys
 from datetime import UTC, datetime
-from typing import Any, IO
+from typing import IO, Any
 
 PASS = "PASS"
 FAIL = "FAIL"

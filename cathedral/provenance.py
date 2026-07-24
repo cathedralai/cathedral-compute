@@ -35,10 +35,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from cathedral.policy_registry import (
     PolicyRegistryError,
@@ -141,7 +142,7 @@ def _parse_utc(value: object, label: str) -> datetime:
     if not isinstance(value, str):
         raise ProvenanceError(f"{label} is not a string timestamp")
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")  # noqa: DTZ007 - intentional fail-closed/UTC-text semantics
     except ValueError as exc:
         raise ProvenanceError(f"{label} is not a UTC report timestamp") from exc
     return parsed.replace(tzinfo=UTC)
@@ -357,6 +358,10 @@ def verify_and_recompute(
     enforce_chain: bool = False,
     now: datetime | None = None,
     registry_max_age_seconds: int = 86400,
+    candidate_set: Mapping[str, Any] | None = None,
+    expected_class_id: str = "confidential_compute",
+    expected_source_id: str = "cathedralconfidential",
+    current_block: int | None = None,
 ) -> ProvenanceResult:
     """Independently verify the full published evidence chain and recompute.
 
@@ -388,9 +393,53 @@ def verify_and_recompute(
         now=now,
     )
 
+    if document.get("class_id") != expected_class_id or document.get(
+        "source_id"
+    ) != expected_source_id:
+        raise ProvenanceError(
+            "score report class/source identity does not match the operator pins"
+        )
+    if current_block is not None and not (
+        int(document["valid_from_block"])
+        <= int(current_block)
+        < int(document["valid_until_block"])
+    ):
+        raise ProvenanceError(
+            "current finalized block is outside the report's validity window"
+        )
     entries = document.get("entries")
     if not isinstance(entries, list):
         raise ProvenanceError("score report has no entries list")
+
+    # Exhaustive candidate accounting: every enrolled candidate must appear
+    # in the report (verified with evidence or explicitly zero/rejected) and
+    # the report must not smuggle entries outside the committed set. An
+    # omitted honest miner can therefore never silently inflate another.
+    candidate_outcomes: dict[str, str] = {}
+    if candidate_set is not None:
+        for row in candidate_set.get("candidates", []):
+            candidate_outcomes[str(row["hotkey"])] = str(row["outcome"])
+        report_hotkeys = {
+            entry.get("miner_hotkey")
+            for entry in entries
+            if isinstance(entry, dict)
+        }
+        active = {
+            hotkey
+            for hotkey, outcome in candidate_outcomes.items()
+            if outcome != "retired"
+        }
+        missing = active - report_hotkeys
+        if missing:
+            raise ProvenanceError(
+                f"report omits committed candidates: {sorted(missing)}"
+            )
+        stray = report_hotkeys - set(candidate_outcomes)
+        if stray:
+            raise ProvenanceError(
+                f"report carries entries outside the committed candidate set: "
+                f"{sorted(stray)}"
+            )
 
     miners: list[MinerProvenance] = []
     positive: list[tuple[str, Decimal]] = []
@@ -418,6 +467,16 @@ def verify_and_recompute(
         receipt_id = None
         receipt_digest = None
         receipt_verified = False
+        if candidate_outcomes:
+            outcome = candidate_outcomes.get(hotkey)
+            if units > 0 and outcome != "verified":
+                raise ProvenanceError(
+                    f"positive entry {hotkey!r} is not a verified candidate"
+                )
+            if units == 0 and outcome == "verified":
+                raise ProvenanceError(
+                    f"verified candidate {hotkey!r} carries no verified work"
+                )
         if units > 0:
             # A positive miner must carry exactly one verifiable receipt.
             if len(evidence) != 1 or not isinstance(evidence[0], dict):
@@ -590,6 +649,7 @@ def replay_positive_miners(
     verifier_blob_digest: str,
     verifier_command: tuple[str, ...],
     verifier_artifacts: tuple[str, ...],
+    candidates_all_rejected: bool = False,
 ) -> ProvenanceResult:
     """Upgrade a receipts-only result to FULL assurance via raw replay.
 
@@ -653,7 +713,7 @@ def replay_positive_miners(
             # evidence was collected, from the SAME signed registry the
             # receipt binds.
             policy = registry.to_policy(at=issued_at)
-        except Exception as exc:  # noqa: BLE001 - normalize to ProvenanceError
+        except Exception as exc:
             raise ProvenanceError(
                 f"signed registry yields no usable policy at the receipt time: {exc}"
             ) from exc
@@ -680,16 +740,16 @@ def replay_positive_miners(
 
     result.miners = upgraded
     if replayed_count == 0:
-        # Nothing raw was authenticated or replayed. A zero-positive vector is
-        # never vacuously FULL: under the launch contract it could only be
-        # FULL if the published artifacts were exhaustive over the candidate
-        # set and the rejection/revocation evidence for EVERY candidate were
-        # independently replayed (or an equivalent signed policy exclusion
-        # verified). The current artifact model cannot prove that, so the
-        # revoked all-burn state stays receipts_only / NOT PROVEN and
-        # full-authority submission of it fails closed (recorded as a live
-        # launch blocker; thin/shadow carries revocation).
-        result.assurance_level = ASSURANCE_RECEIPTS_ONLY
+        # Nothing raw was replayed. A zero-positive vector is FULL only when
+        # the manifest's exhaustive candidate accounting proves EVERY active
+        # candidate was explicitly rejected/fail-closed for this epoch
+        # (candidates_all_rejected, established by the caller from the
+        # verified candidate set + report zero rows). That is the legitimate
+        # provable all-burn revocation state. Anything less stays
+        # receipts_only: an empty epoch is never vacuously FULL.
+        result.assurance_level = (
+            ASSURANCE_FULL if candidates_all_rejected else ASSURANCE_RECEIPTS_ONLY
+        )
         return result
     result.assurance_level = ASSURANCE_FULL
     return result
