@@ -50,6 +50,10 @@ LEGACY_MANIFEST_SCHEMA = "cathedral_evidence_manifest_v1"
 INDEX_SCHEMA = "cathedral_evidence_index_v1"
 INDEX_DOMAIN = b"cathedral-evidence-index-v1\x00"
 MAX_INDEX_RECENT = 96
+# The supported manifest cardinality: at most this many candidates, and
+# (since every receipt belongs to exactly one verified candidate) at most
+# this many receipt rows. Verifier-side artifact budgets derive from it.
+MAX_MANIFEST_CANDIDATES = 4096
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DISCLOSURES = frozenset({"public", "controlled"})
 
@@ -488,7 +492,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         raise EvidenceError("evidence manifest score_report is invalid")
     _require_digest(report["blob"], "report blob")
     receipts = document["receipts"]
-    if not isinstance(receipts, list):
+    if not isinstance(receipts, list) or len(receipts) > MAX_MANIFEST_CANDIDATES:
         raise EvidenceError("evidence manifest receipts is invalid")
     for row in receipts:
         if (
@@ -546,7 +550,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     if not isinstance(block_hash, str) or not re.fullmatch(r"(0x)?[0-9a-f]{64}", block_hash):
         raise EvidenceError("evidence manifest candidate block hash is invalid")
     candidates = candidate_set["candidates"]
-    if not isinstance(candidates, list) or len(candidates) > 4096:
+    if not isinstance(candidates, list) or len(candidates) > MAX_MANIFEST_CANDIDATES:
         raise EvidenceError("evidence manifest candidates list is invalid")
     seen_candidates: set[str] = set()
     for row in candidates:

@@ -40,6 +40,7 @@ from cathedral.attest import collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
+from cathedral.evidence import MAX_MANIFEST_CANDIDATES
 from cathedral.gpu import (
     GpuIdentityRegistry,
     gpu_profile_from_registry,
@@ -1264,6 +1265,21 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
 
     ledger = Ledger(args.ledger_db)
     try:
+        # Fail BEFORE any publication side effect: a production manifest is
+        # immutable, so exporting with a null/invalid source_revision would
+        # brick the epoch (production verification pins --source-revision
+        # and would reject it forever, and the immutable epoch copy blocks
+        # a corrected retry). Development keeps its explicit relaxation.
+        if not args.development and (
+            not isinstance(args.source_revision, str)
+            or re.fullmatch(r"[0-9a-f]{7,64}", args.source_revision) is None
+        ):
+            raise ValueError(
+                "production evidence export requires --source-revision "
+                "(7-64 lowercase hex of the pinned source commit); an "
+                "immutable manifest published without it could never verify "
+                "under production pins"
+            )
         epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
         epoch_row = ledger.get_epoch(epoch_id)
         if epoch_row is None or epoch_row["status"] != "published":
@@ -1542,55 +1558,56 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         # signature first; on any failure rebuild from the immutable
         # manifests instead of re-signing attacker-controlled rows. The
         # whole read -> carry -> sign -> publish sequence holds ONE
-        # exclusive index transaction so concurrent exporters cannot lose
-        # the latest pointer or history.
-        index_txn = store.index_transaction()
-        index_txn.__enter__()
-        # The manifest blob and immutable epoch copy publish inside the SAME
-        # critical section as the index update: a crash after the copy but
-        # before the index leaves only immutable artifacts, and the next
-        # export's rebuild-from-manifests recovery re-references them.
-        manifest_digest = store.put_blob(manifest_bytes)
-        store.put_epoch_copy(int(snapshot["source_epoch"]), manifest_bytes)
-        recent: list[dict[str, object]] = []
-        existing_index = index_txn.read()
-        if existing_index is not None:
-            from cathedral.evidence import verify_index as _verify_index
+        # exclusive index transaction — entered via the context manager so
+        # EVERY pre-publication exception releases the lock descriptor and
+        # flock (a leaked exclusive flock would deadlock the in-process
+        # retry forever).
+        with store.index_transaction() as index_txn:
+            # The manifest blob and immutable epoch copy publish inside the
+            # SAME critical section as the index update: a crash after the
+            # copy but before the index leaves only immutable artifacts, and
+            # the next export's rebuild-from-manifests recovery
+            # re-references them.
+            manifest_digest = store.put_blob(manifest_bytes)
+            store.put_epoch_copy(int(snapshot["source_epoch"]), manifest_bytes)
+            recent: list[dict[str, object]] = []
+            existing_index = index_txn.read()
+            if existing_index is not None:
+                from cathedral.evidence import verify_index as _verify_index
 
-            try:
-                previous = _verify_index(
-                    existing_index,
-                    {args.index_signing_key_id: index_public},
-                    expected_network=args.score_network,
-                    expected_netuid=args.score_netuid,
-                    max_age_seconds=None,
-                )
-                recent.append(dict(previous["latest"]))
-                recent.extend(dict(row) for row in previous["recent"])
-            except Exception:  # noqa: BLE001 - unverified history is rebuilt
-                recent = _rebuild_recent_from_manifests()
-        deduped: list[dict[str, object]] = []
-        seen_epochs = {int(snapshot["source_epoch"])}
-        for row in recent:
-            try:
-                row_epoch = int(row["source_epoch"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if row_epoch in seen_epochs:
-                continue
-            seen_epochs.add(row_epoch)
-            deduped.append({"source_epoch": row_epoch, "manifest": row.get("manifest")})
-        deduped.sort(key=lambda row: int(row["source_epoch"]), reverse=True)
-        index_bytes = build_signed_index(
-            network=args.score_network,
-            netuid=args.score_netuid,
-            latest_source_epoch=int(snapshot["source_epoch"]),
-            latest_manifest_digest=manifest_digest,
-            recent=deduped,
-            signing_key_id=args.index_signing_key_id,
-            private_key_seed=index_seed,
-        )
-        try:
+                try:
+                    previous = _verify_index(
+                        existing_index,
+                        {args.index_signing_key_id: index_public},
+                        expected_network=args.score_network,
+                        expected_netuid=args.score_netuid,
+                        max_age_seconds=None,
+                    )
+                    recent.append(dict(previous["latest"]))
+                    recent.extend(dict(row) for row in previous["recent"])
+                except Exception:  # noqa: BLE001 - unverified history is rebuilt
+                    recent = _rebuild_recent_from_manifests()
+            deduped: list[dict[str, object]] = []
+            seen_epochs = {int(snapshot["source_epoch"])}
+            for row in recent:
+                try:
+                    row_epoch = int(row["source_epoch"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if row_epoch in seen_epochs:
+                    continue
+                seen_epochs.add(row_epoch)
+                deduped.append({"source_epoch": row_epoch, "manifest": row.get("manifest")})
+            deduped.sort(key=lambda row: int(row["source_epoch"]), reverse=True)
+            index_bytes = build_signed_index(
+                network=args.score_network,
+                netuid=args.score_netuid,
+                latest_source_epoch=int(snapshot["source_epoch"]),
+                latest_manifest_digest=manifest_digest,
+                recent=deduped,
+                signing_key_id=args.index_signing_key_id,
+                private_key_seed=index_seed,
+            )
             from cathedral.evidence import verify_index as _self_check_index
 
             # The completed signed index must VERIFY (signature, shape,
@@ -1605,8 +1622,6 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 max_age_seconds=None,
             )
             index_txn.publish(index_bytes)
-        finally:
-            index_txn.__exit__(None, None, None)
         parse_manifest(manifest_bytes)  # final self-check before reporting
 
         print(
@@ -1675,28 +1690,38 @@ def _verify_wire_vector(
 MAX_EVIDENCE_FETCH_BYTES = 4 * 1024 * 1024
 MAX_VERIFIER_FETCH_BYTES = 32 * 1024 * 1024
 MAX_COMMAND_FETCH_BYTES = 64 * 1024 * 1024
-MAX_COMMAND_ARTIFACTS = 256
+# Coherent with the supported manifest cardinality: an epoch may carry up to
+# MAX_MANIFEST_CANDIDATES verified candidates, each needing THREE
+# content-addressed artifacts (receipt + work item + work result), plus the
+# fixed per-command overhead (index, manifest, registry, report, verifier
+# binary, publisher vector) with slack. Memory and network stay bounded by
+# the per-artifact size caps, the aggregate byte cap, and the deadline —
+# this cap only stops count-based denial of service, and it must never make
+# a valid maximal epoch unverifiable.
+COMMAND_ARTIFACT_OVERHEAD = 16
+MAX_COMMAND_ARTIFACTS = 3 * MAX_MANIFEST_CANDIDATES + COMMAND_ARTIFACT_OVERHEAD
 DEFAULT_COMMAND_DEADLINE_SECONDS = 120.0
 
 
 class _FetchBudget:
     """One command-wide budget: a single monotonic wall-clock deadline plus
     aggregate byte and artifact caps shared by EVERY remote operation (DNS,
-    connect, TLS, headers, every blob read)."""
+    connect, TLS, headers, every blob read) and every budget-charged local
+    evidence read."""
 
     def __init__(
         self,
         *,
         deadline_seconds: float = DEFAULT_COMMAND_DEADLINE_SECONDS,
         max_total_bytes: int = MAX_COMMAND_FETCH_BYTES,
-        max_artifacts: int = MAX_COMMAND_ARTIFACTS,
+        max_artifacts: int | None = None,
     ) -> None:
         import time as time_module
 
         self._clock = time_module.monotonic
         self.deadline = self._clock() + deadline_seconds
         self.bytes_remaining = max_total_bytes
-        self.artifacts_remaining = max_artifacts
+        self.artifacts_remaining = MAX_COMMAND_ARTIFACTS if max_artifacts is None else max_artifacts
 
     def remaining_seconds(self) -> float:
         remaining = self.deadline - self._clock()
@@ -1717,11 +1742,18 @@ class _FetchBudget:
         self.remaining_seconds()
 
 
-def _read_bounded_local_file(path, max_bytes: int, label: str) -> bytes:
+def _read_bounded_local_file(path, max_bytes: int, label: str, *, budget=None) -> bytes:
     """Read a local artifact fail-closed: O_NOFOLLOW at open, post-open
     fstat regular-file verification (the opened descriptor is what gets
     read, so a swap after the check cannot redirect the read), and a
-    max+1 bounded read loop that rejects oversized input outright."""
+    max+1 bounded read loop that rejects oversized input outright.
+
+    When a ``_FetchBudget`` is supplied the read is charged EXACTLY like a
+    remote fetch: one artifact slot before the open, and every chunk against
+    the aggregate byte cap AS IT IS READ — an oversized local file can never
+    be materialized past either limit before acceptance."""
+    if budget is not None:
+        budget.start_artifact()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(str(path), flags)
@@ -1742,6 +1774,8 @@ def _read_bounded_local_file(path, max_bytes: int, label: str) -> bytes:
             received += len(chunk)
             if received > max_bytes:
                 raise ValueError(f"{label} exceeds the bounded size limit")
+            if budget is not None:
+                budget.charge(len(chunk))
             chunks.append(chunk)
         return b"".join(chunks)
     finally:
@@ -1900,8 +1934,16 @@ def _bounded_https_fetch(
 
     class _PinnedConnection(_http.HTTPSConnection):
         def connect(self) -> None:
-            raw = _socket.create_connection((peer_ip, peer_port), self.timeout)
-            self.sock = self._context.wrap_socket(raw, server_hostname=host)
+            raw = _socket.create_connection((peer_ip, peer_port), _phase_timeout())
+            try:
+                # TCP consumed shared time: the TLS handshake runs under the
+                # RECOMPUTED absolute remainder, never the stale pre-connect
+                # timeout still armed on the raw socket.
+                raw.settimeout(_phase_timeout())
+                self.sock = self._context.wrap_socket(raw, server_hostname=host)
+            except BaseException:
+                raw.close()
+                raise
 
     context = _ssl.create_default_context()
     connection = _PinnedConnection(host, peer_port, timeout=_phase_timeout(), context=context)
@@ -1909,7 +1951,7 @@ def _bounded_https_fetch(
         target = parsed.path or "/"
         if parsed.query:
             raise ValueError("evidence URLs must be query-free")
-        connection.connect()  # TCP + TLS under the freshly computed bound
+        connection.connect()  # TCP + TLS, each under a freshly computed bound
         connection.sock.settimeout(_phase_timeout())  # request/header phase
         connection.request(
             "GET",
@@ -1927,7 +1969,11 @@ def _bounded_https_fetch(
         received = 0
         while True:
             connection.sock.settimeout(_phase_timeout())
-            chunk = response.read(min(65536, max_bytes + 1 - received))
+            # read1 performs AT MOST ONE underlying receive, so the absolute
+            # deadline above is re-checked between every receive; a server
+            # trickling one byte per almost-timeout can re-arm a per-receive
+            # inactivity timer, but never this loop's total deadline.
+            chunk = response.read1(min(65536, max_bytes + 1 - received))
             if not chunk:
                 break
             received += len(chunk)
@@ -2302,19 +2348,30 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
 
     store = EvidenceStore(args.evidence_dir) if args.evidence_dir else None
 
+    def _read_local_artifact(path, max_bytes: int, label: str) -> bytes:
+        """Local evidence reads carry the SAME bounds as remote fetches:
+        O_NOFOLLOW regular-file access, the per-artifact size cap enforced
+        during the read, and the command-wide artifact/byte budget charged
+        before/while bytes are accepted — never after materialization."""
+        try:
+            return _read_bounded_local_file(path, max_bytes, label, budget=command_budget)
+        except ValueError as exc:
+            raise EvidenceError(str(exc)) from exc
+
     def load_index_bytes() -> bytes:
         if store is not None:
-            data = store.read_index()
-            if data is None:
-                raise EvidenceError("evidence index is missing from the store")
-            return data
+            return _read_local_artifact(
+                store.root / "index.json", MAX_EVIDENCE_FETCH_BYTES, "evidence index"
+            )
         return fetch_url("/index.json")
 
     def load_blob(digest: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
         if store is not None:
-            command_budget.start_artifact()
-            data = store.get_blob(digest)
-            command_budget.charge(len(data))
+            data = _read_local_artifact(
+                store.blob_path(digest), max_bytes, f"evidence blob {digest}"
+            )
+            if digest_bytes(data) != digest:
+                raise EvidenceError(f"blob {digest} content is corrupt")
             return data
         data = fetch_url("/blobs/sha256/" + digest.split(":", 1)[1], max_bytes=max_bytes)
         if digest_bytes(data) != digest:
@@ -2696,10 +2753,29 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
 
         audit["assurance"] = result.assurance_level
         full = result.assurance_level == "full"
-        succeeded = audit["result"] == "PASS" and (
-            full or bool(getattr(args, "allow_receipts_only", False))
-        )
-        if not full:
+        passed = audit["result"] == "PASS"
+        succeeded = passed and (full or bool(getattr(args, "allow_receipts_only", False)))
+        if not passed:
+            # A CONCRETE check failed (e.g. the signed vector disagreed with
+            # the recomputation). The failure stays FAIL: it is never
+            # reclassified as NOT_PROVEN partial assurance, and it never
+            # reserves fences — fences record trusted observations, and this
+            # run proved the opposite.
+            logger.event(
+                "PROVENANCE_RESULT",
+                stage="result",
+                status=FAIL,
+                detail=(
+                    f"assurance={result.assurance_level} "
+                    f"source_epoch={audit.get('source_epoch')}: a concrete "
+                    "verification step failed (see the FAIL event above)"
+                ),
+                remediation=(
+                    "Fail closed: do not submit from this epoch. Investigate "
+                    "the failing stage; nothing was recorded as verified."
+                ),
+            )
+        elif not full:
             audit["result"] = "NOT_PROVEN"
             from cathedral.events import NOT_PROVEN as _NOT_PROVEN
 
@@ -2721,7 +2797,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             logger.event(
                 "PROVENANCE_RESULT",
                 stage="result",
-                status=PASS if succeeded else FAIL,
+                status=PASS,
                 detail=(
                     f"assurance=full source_epoch={audit.get('source_epoch')} "
                     f"weights={audit.get('recomputed_hotkey_weights')}"
