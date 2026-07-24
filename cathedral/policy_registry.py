@@ -544,13 +544,26 @@ def verify_registry(
     generated = _timestamp(document["generated_at"], "registry generated_at")
     valid_from = _timestamp(document["valid_from"], "registry valid_from")
     valid_until = _timestamp(document["valid_until"], "registry valid_until")
-    if not generated <= valid_from < valid_until:
+    if not valid_from < valid_until:
         raise PolicyRegistryError("registry validity window is invalid")
+    # Publication (generated_at) may precede activation (initial
+    # prepublication, generated <= valid_from) or follow it (a same-policy
+    # reissue at a higher release republishing unchanged material with a
+    # fresh timestamp), but never the window's end. The 24-hour staleness
+    # ceiling below still applies to every publication.
+    if generated >= valid_until:
+        raise PolicyRegistryError("registry publication time must precede expiry")
     check_time = historical_at or now or datetime.now(UTC)
     if check_time.tzinfo is None or check_time.utcoffset() != timedelta(0):
         raise PolicyRegistryError("registry verification time must be UTC")
     if not valid_from <= check_time < valid_until:
         raise PolicyRegistryError("registry is outside its validity window")
+    # A publication time in the real future is bogus regardless of the
+    # verification mode: historical verification pins check_time to a past
+    # instant, but the wall clock still bounds when a document can exist.
+    wall_clock = now if now is not None else datetime.now(UTC)
+    if generated > wall_clock + timedelta(minutes=5):
+        raise PolicyRegistryError("registry generation time is in the future")
     if historical_at is None:
         if (
             isinstance(max_age_seconds, bool)
@@ -558,8 +571,6 @@ def verify_registry(
             or max_age_seconds <= 0
         ):
             raise PolicyRegistryError("registry maximum age must be positive")
-        if generated > check_time + timedelta(minutes=5):
-            raise PolicyRegistryError("registry generation time is in the future")
         if check_time - generated > timedelta(seconds=max_age_seconds):
             raise PolicyRegistryError("registry is too stale for admission")
 
@@ -677,7 +688,8 @@ class PolicyRegistryState:
                         digest TEXT NOT NULL,
                         profile_states_json TEXT NOT NULL,
                         receipt_key_states_json TEXT NOT NULL DEFAULT '{}',
-                        accepted_at TEXT NOT NULL
+                        accepted_at TEXT NOT NULL,
+                        generated_at TEXT NOT NULL DEFAULT ''
                     )
                     """
                 )
@@ -689,6 +701,15 @@ class PolicyRegistryState:
                     connection.execute(
                         "ALTER TABLE policy_registry_state ADD COLUMN "
                         "receipt_key_states_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                if "generated_at" not in columns:
+                    # Backwards-compatible migration: a legacy row carries ''
+                    # (publication time unknown); the very next accept records
+                    # the real value and the monotonic guard applies from then
+                    # on.
+                    connection.execute(
+                        "ALTER TABLE policy_registry_state ADD COLUMN "
+                        "generated_at TEXT NOT NULL DEFAULT ''"
                     )
 
     def _connect(self) -> sqlite3.Connection:
@@ -702,7 +723,7 @@ class PolicyRegistryState:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT release, digest, profile_states_json, "
-                "receipt_key_states_json, accepted_at "
+                "receipt_key_states_json, accepted_at, generated_at "
                 "FROM policy_registry_state WHERE singleton = 1"
             ).fetchone()
         return MappingProxyType(dict(row)) if row is not None else None
@@ -810,7 +831,7 @@ class PolicyRegistryState:
             try:
                 row = connection.execute(
                     "SELECT release, digest, profile_states_json, "
-                    "receipt_key_states_json "
+                    "receipt_key_states_json, generated_at "
                     "FROM policy_registry_state WHERE singleton = 1"
                 ).fetchone()
                 if row is None:
@@ -830,11 +851,34 @@ class PolicyRegistryState:
                     )
                     if snapshot.release == prior_release:
                         if snapshot.digest == row["digest"]:
+                            if not str(row["generated_at"] or ""):
+                                # Migrated legacy row: backfill the publication
+                                # time from the digest-matched snapshot inside
+                                # this same transaction so a later release can
+                                # never move it backwards unnoticed.
+                                connection.execute(
+                                    "UPDATE policy_registry_state "
+                                    "SET generated_at = ? WHERE singleton = 1",
+                                    (
+                                        snapshot.generated_at.strftime(
+                                            "%Y-%m-%dT%H:%M:%SZ"
+                                        ),
+                                    ),
+                                )
                             connection.execute("COMMIT")
                             return
                         raise PolicyRegistryError("registry release was equivocated")
                     if snapshot.release < prior_release:
                         raise PolicyRegistryError("registry rollback rejected")
+                    prior_generated_text = str(row["generated_at"] or "")
+                    if prior_generated_text:
+                        prior_generated = _timestamp(
+                            prior_generated_text, "persisted registry generated_at"
+                        )
+                        if snapshot.generated_at < prior_generated:
+                            raise PolicyRegistryError(
+                                "registry publication time moved backwards"
+                            )
                     for profile_id, prior_state in prior_states.items():
                         current_state = states.get(profile_id)
                         if current_state is None:
@@ -896,14 +940,15 @@ class PolicyRegistryState:
                     """
                     INSERT INTO policy_registry_state(
                         singleton, release, digest, profile_states_json,
-                        receipt_key_states_json, accepted_at
-                    ) VALUES (1, ?, ?, ?, ?, ?)
+                        receipt_key_states_json, accepted_at, generated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(singleton) DO UPDATE SET
                         release=excluded.release,
                         digest=excluded.digest,
                         profile_states_json=excluded.profile_states_json,
                         receipt_key_states_json=excluded.receipt_key_states_json,
-                        accepted_at=excluded.accepted_at
+                        accepted_at=excluded.accepted_at,
+                        generated_at=excluded.generated_at
                     """,
                     (
                         snapshot.release,
@@ -911,6 +956,7 @@ class PolicyRegistryState:
                         canonical_json(states).decode("ascii"),
                         canonical_json(key_states).decode("ascii"),
                         datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        snapshot.generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     ),
                 )
             except BaseException:
