@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import selectors
@@ -555,12 +556,20 @@ def _run_tdx_verifier(
         if not isinstance(expected_report_data, bytes) or len(expected_report_data) != 64:
             return {}
         production_expected_hex = expected_report_data.hex()
-    timeout = _bounded_int_from_env(
+    timeout: float = _bounded_int_from_env(
         "CATHEDRAL_TDX_VERIFY_TIMEOUT", _DEFAULT_VERIFY_TIMEOUT, _MAX_VERIFY_TIMEOUT
     )
     if pinned_timeout is not None:
         # The replay caller's absolute command deadline caps this subprocess.
-        timeout = max(1, min(timeout, int(pinned_timeout)))
+        # The cap stays FLOATING POINT all the way down: a 0.4s remaining
+        # budget must never round up to a 1s grant, and an exhausted,
+        # negative, or non-finite budget refuses to launch at all.
+        if isinstance(pinned_timeout, bool) or not isinstance(pinned_timeout, (int, float)):
+            return {}
+        remaining = float(pinned_timeout)
+        if not math.isfinite(remaining) or remaining <= 0.0:
+            return {}  # reject: no meaningful replay budget remains
+        timeout = min(timeout, remaining)
     max_output = _bounded_int_from_env(
         "CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", _DEFAULT_MAX_OUTPUT, _MAX_VERIFY_OUTPUT
     )
@@ -716,7 +725,7 @@ def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
 def _read_bounded_subprocess(
     cmd: list[str],
     max_output: int,
-    timeout: int,
+    timeout: float,
     *,
     sanitized: bool = False,
     start_new_session: bool = True,

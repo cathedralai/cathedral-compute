@@ -427,3 +427,76 @@ def test_stale_envelope_nonce_rejected_by_committed_challenge(tmp_path: Path):
             _full_claims(),
             expected_challenge_digest="sha256:" + "9" * 64,  # other epoch
         )
+
+
+# ---------------------------------------------------------------------------
+# Sub-second replay budget (Codex finding 9)
+# ---------------------------------------------------------------------------
+
+
+def test_sub_second_replay_budget_is_preserved_to_the_subprocess(monkeypatch):
+    """A 0.4s remaining command budget must reach the subprocess as 0.4s.
+    The old int() floor plus max(1, ...) re-inflated any sub-second
+    remainder to a full second, extending the caller's absolute deadline."""
+    from cathedral import verify as verify_module
+
+    captured: dict = {}
+
+    def spy(cmd, max_output, timeout, **kwargs):
+        captured["timeout"] = timeout
+        return "{}", "", 0
+
+    monkeypatch.setattr(verify_module, "_read_bounded_subprocess", spy)
+    verify_module._run_tdx_verifier(
+        b"quote-bytes",
+        production_mode=True,
+        expected_report_data=bytes(64),
+        pinned_command=["/opt/cathedral/bin/verifier"],
+        pinned_timeout=0.4,
+    )
+    assert captured["timeout"] == pytest.approx(0.4)
+    assert captured["timeout"] < 1.0  # the exact prior inflation
+
+
+def test_exhausted_replay_budget_refuses_without_launching(monkeypatch):
+    """Zero, negative, or non-finite remaining budget rejects IMMEDIATELY:
+    the verifier subprocess is never spawned on an exhausted deadline."""
+    from cathedral import verify as verify_module
+
+    def never(cmd, max_output, timeout, **kwargs):
+        raise AssertionError("subprocess must never launch with no budget")
+
+    monkeypatch.setattr(verify_module, "_read_bounded_subprocess", never)
+    for exhausted in (0.0, -1.0, float("nan"), float("-inf"), float("inf"), True):
+        claims = verify_module._run_tdx_verifier(
+            b"quote-bytes",
+            production_mode=True,
+            expected_report_data=bytes(64),
+            pinned_command=["/opt/cathedral/bin/verifier"],
+            pinned_timeout=exhausted,
+        )
+        assert claims == {}
+
+
+def test_sub_second_timeout_kills_a_slow_verifier_promptly(tmp_path, monkeypatch):
+    """End-to-end wall clock: with 0.3s of budget a 5s verifier dies at
+    ~0.3s. Under the old rounding it survived a full second."""
+    import time
+
+    from cathedral import verify as verify_module
+
+    slow = tmp_path / "slow-verifier"
+    slow.write_text("#!/bin/sh\nsleep 5\n")
+    slow.chmod(0o700)
+
+    started = time.monotonic()
+    claims = verify_module._run_tdx_verifier(
+        b"quote-bytes",
+        production_mode=True,
+        expected_report_data=bytes(64),
+        pinned_command=[str(slow)],
+        pinned_timeout=0.3,
+    )
+    elapsed = time.monotonic() - started
+    assert claims == {}
+    assert elapsed < 0.9, elapsed
