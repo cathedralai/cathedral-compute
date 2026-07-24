@@ -1,6 +1,6 @@
 # Build Status
 
-Last verified: 2026-07-13
+Last verified: 2026-07-24
 
 **Mainnet SN39 chain submission is live.** Testnet SN292 remains the non-paying
 dry-run integration lane.
@@ -18,15 +18,26 @@ dry-run integration lane.
 - On testnet SN292, a dedicated thin validator repeatedly accepted fresh signed
   vectors, mapped the proven worker hotkey to UID 41, and computed dry-run
   UID41 = 1.0.
-- On mainnet SN39, the confidential validator hotkey at UID 144 submitted the
-  first live vector at block 8614435. The old validator is disabled.
-- Mainnet currently has no eligible confidential miners. The signed fail-closed
-  vector therefore has one nonzero destination: burn UID 0 = 1.0. An admitted
-  miner replaces burn only after verified work produces positive score.
+- On mainnet SN39, validator UID 30 submitted the current validated-supply
+  launch vector in extrinsic
+  `0x4ef1307460f6bcdf3acc17dc7a1070f0918cf1080d74fb9409897353fe6cb371`
+  at block 8694350 (block hash
+  `0x657b6b05db6a13dc4d215ed1fe7c7846522999aeebbbc193a8873522283c4016`).
+  A historical chain query at that block returns exactly
+  `[(163, 65535), (204, 7282)]` for validator UID 30: the admitted Intel TDX
+  worker plus the fixed burn destination.
+- The launch policy is `validated_supply_v1`: 90% validated Intel TDX CPU
+  supply and 10% forced burn. Attestation alone still pays nothing; the
+  admitted worker has validator-dispatched verified work.
+- Controlled positive-worker evidence replays through the pinned Intel TDX
+  verifier. Whole-epoch FULL provenance remains `NOT_PROVEN`: zero-scored
+  candidates have explicit zero rows but not candidate-specific replayable
+  negative evidence.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 469 passed, 3 skipped.
+- Repository test suite at the launch producer revision: 1,247 passed,
+  8 skipped.
 
 ## Operator: pretty epoch logs
 
@@ -110,14 +121,15 @@ automatically (in place, preserving all rows) the first time they are opened.
 
 Chain broadcast is live. The production validator:
 
-1. requires the signed `confidential_primary_v1` policy;
+1. requires the signed `validated_supply_v1` policy;
 2. verifies the `finney` / netuid 39 envelope and freshness;
 3. maps every positive hotkey against the live metagraph; and
 4. submits the complete confidential vector.
 
-The first monitored submission succeeded at 2026-07-13T18:56:54Z and updated
-the validator at block 8614435. The deployed scorer/validator change is merged
-in `cathedralai/cathedral` PR #378.
+The first monitored all-burn submission succeeded on 2026-07-13. The first
+monitored positive validated-supply submission above succeeded on 2026-07-24.
+The historical block and extrinsic are independently queryable from a Finney
+archive node.
 
 ### Testnet SN292
 
@@ -126,9 +138,12 @@ publication, and UID mapping, but does not submit weights or pay emissions.
 
 ## Remaining acceptance work
 
-1. Admit a registered SN39 miner and observe positive on-chain weight after a
-   verified work epoch.
-2. Make that miner stale or fail evidence and confirm its prior positive weight
+1. Make the admitted miner stale or fail evidence and confirm its prior positive weight
    is revoked to zero on chain.
-3. Replace the operator-assisted plain-HTTP worker path with production HTTPS
+2. Obtain an independent outside-operator reproduction of the signed release,
+   historical metagraph, exact extrinsic, public evidence recomputation, and
+   controlled positive TDX replay.
+3. Publish candidate-specific replayable negative evidence before claiming
+   whole-epoch FULL provenance.
+4. Replace the operator-assisted plain-HTTP worker path with production HTTPS
    and self-service signed enrollment.
