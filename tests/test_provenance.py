@@ -433,8 +433,8 @@ def test_current_block_outside_report_window_fails(exported):
     valid_from_block..valid_until_block rejects the report."""
     report, receipts = exported
     with pytest.raises(ProvenanceError, match="outside the report's validity"):
-        _verify(report, receipts, current_block=10_000)  # window is 70..80
-    _verify(report, receipts, current_block=75)  # inside: verifies
+        _verify(report, receipts, current_block=10_000)  # window is 100..200
+    _verify(report, receipts, current_block=150)  # inside: verifies
 
 
 def test_report_snapshot_binding_shape_is_enforced(exported):

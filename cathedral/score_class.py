@@ -278,6 +278,13 @@ def export_score_class_report(
             "challenge anchor; the report must bind the snapshot the epoch's "
             "nonces were actually derived from"
         )
+    if valid_from_block < snapshot_binding["block"]:
+        raise ScoreClassError(
+            f"valid_from_block {valid_from_block} precedes the anchored "
+            f"candidate snapshot block {snapshot_binding['block']}; the "
+            "report's validity window cannot start before the finalized "
+            "state it was derived from"
+        )
     selected_policy_digest = policy_digest or snapshot["policy_registry_digest"]
     checked_policy_digest = _digest(selected_policy_digest, "policy digest")
     prior_export = ledger.previous_score_class_export(
@@ -310,12 +317,17 @@ def export_score_class_report(
         if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
             raise ScoreClassError("invalid miner hotkey in frozen epoch")
         rows_by_hotkey[hotkey] = row
-    unregistered = set(rows_by_hotkey) - set(snapshot_binding["hotkeys"])
-    if unregistered:
-        raise ScoreClassError(
-            "frozen epoch scored hotkeys that are not registered in the "
-            f"anchored candidate snapshot: {sorted(unregistered)}"
-        )
+    for hotkey in sorted(set(rows_by_hotkey) - set(snapshot_binding["hotkeys"])):
+        row = rows_by_hotkey.pop(hotkey)
+        if _decimal(row["work_units"], "frozen work units") > 0:
+            raise ScoreClassError(
+                "frozen epoch carries POSITIVE work for a hotkey that is not "
+                f"registered in the anchored candidate snapshot: {hotkey!r}"
+            )
+        # A zero-valued historical row for a since-deregistered hotkey is
+        # simply omitted: it earns nothing, it is not a candidate, and the
+        # report's entry set must remain EXACTLY the signed snapshot — a
+        # departed miner must never permanently block future epochs.
 
     entries: list[dict[str, Any]] = []
     for hotkey in snapshot_binding["hotkeys"]:

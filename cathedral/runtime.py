@@ -1466,6 +1466,7 @@ class ConfidentialRuntime:
                     from cathedral.challenge import derive_challenge_nonce
 
                     nonce = derive_challenge_nonce(
+                        block=anchor["block"],
                         block_hash=anchor["block_hash"],
                         network=anchor["network"],
                         netuid=anchor["netuid"],

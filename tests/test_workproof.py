@@ -161,6 +161,7 @@ def test_challenge_derivation_is_deterministic_and_slot_unique():
     )
 
     kwargs = {
+        "block": 100,
         "block_hash": "0x" + "ab" * 32,
         "network": "finney",
         "netuid": 39,
@@ -173,6 +174,8 @@ def test_challenge_derivation_is_deterministic_and_slot_unique():
     assert first != derive_challenge_nonce(**{**kwargs, "source_epoch": 12})
     assert first != derive_challenge_nonce(**{**kwargs, "miner_hotkey": "other"})
     assert first != derive_challenge_nonce(**{**kwargs, "netuid": 40})
+    # v2 binds the finalized HEIGHT as well as the hash.
+    assert first != derive_challenge_nonce(**{**kwargs, "block": 101})
     # 0x prefix is normalized away.
     assert derive_challenge_nonce(**{**kwargs, "block_hash": "ab" * 32}) == first
     assert expected_challenge_digest(**kwargs).startswith("sha256:")

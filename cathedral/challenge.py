@@ -5,8 +5,8 @@ the scoring epoch, so an issuer could reuse it and a bounded replay cache
 eventually forgets. Instead the 32-byte challenge nonce is DERIVED, under a
 domain separator, from independently verifiable inputs:
 
-    nonce = sha256( DOMAIN || canonical{block_hash, network, netuid,
-                                        source_epoch, miner_hotkey} )
+    nonce = sha256( DOMAIN || canonical{block, block_hash, network,
+                                        netuid, source_epoch, miner_hotkey} )
 
 The finalized block hash is observable by anyone from the chain; the epoch,
 audience, and hotkey pin the nonce to exactly one (epoch, miner) slot. A
@@ -23,7 +23,7 @@ import hashlib
 import json
 import re
 
-CHALLENGE_DOMAIN = b"cathedral-tdx-challenge-v1\x00"
+CHALLENGE_DOMAIN = b"cathedral-tdx-challenge-v2\x00"
 _BLOCK_HASH_RE = re.compile(r"^(0x)?[0-9a-f]{64}$")
 
 
@@ -42,12 +42,15 @@ def normalize_block_hash(block_hash: str) -> str:
 
 def derive_challenge_nonce(
     *,
+    block: int,
     block_hash: str,
     network: str,
     netuid: int,
     source_epoch: int,
     miner_hotkey: str,
 ) -> bytes:
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        raise ChallengeError("block height is invalid")
     if not isinstance(network, str) or not network:
         raise ChallengeError("network is invalid")
     if isinstance(netuid, bool) or not isinstance(netuid, int) or netuid < 0:
@@ -58,6 +61,7 @@ def derive_challenge_nonce(
         raise ChallengeError("miner hotkey is invalid")
     material = json.dumps(
         {
+            "block": int(block),
             "block_hash": normalize_block_hash(block_hash),
             "miner_hotkey": miner_hotkey,
             "netuid": int(netuid),
@@ -73,6 +77,7 @@ def derive_challenge_nonce(
 
 def expected_challenge_digest(
     *,
+    block: int,
     block_hash: str,
     network: str,
     netuid: int,
@@ -81,6 +86,7 @@ def expected_challenge_digest(
 ) -> str:
     """The committed sha256 of the derived nonce, as recorded per attestation."""
     nonce = derive_challenge_nonce(
+        block=block,
         block_hash=block_hash,
         network=network,
         netuid=netuid,

@@ -339,6 +339,12 @@ def verify_report_structure(
         or _SNAPSHOT_HASH_RE.fullmatch(snapshot["block_hash"]) is None
     ):
         raise ProvenanceError("score report candidate_snapshot block hash is invalid")
+    if int(from_block) < snapshot_block:
+        raise ProvenanceError(
+            "score report valid_from_block precedes the anchored candidate "
+            "snapshot block; the validity window cannot start before the "
+            "finalized state the report was derived from"
+        )
     snapshot_hotkeys = snapshot["hotkeys"]
     if (
         not isinstance(snapshot_hotkeys, list)
@@ -744,7 +750,14 @@ def replay_positive_miners(
             )
         from cathedral.challenge import expected_challenge_digest
 
+        anchor_block = challenge_anchor.get("block")
+        if isinstance(anchor_block, bool) or not isinstance(anchor_block, int):
+            raise ProvenanceError(
+                "challenge anchor lacks its finalized block height; the v2 "
+                "derivation binds height AND hash"
+            )
         derived_digest = expected_challenge_digest(
+            block=anchor_block,
             block_hash=str(challenge_anchor["block_hash"]),
             network=str(challenge_anchor["network"]),
             netuid=int(challenge_anchor["netuid"]),
