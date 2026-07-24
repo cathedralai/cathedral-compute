@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -155,9 +154,7 @@ def _work_fixture(challenge_id: str, hotkey: str, n_clauses: int = 20):
 def _fresh_claims(policy, result_bytes: bytes = b"work-result-material"):
     verified_text = NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     claims = attestation_claims(b"raw-quote-secret", policy, verified_at=verified_text)
-    claims = with_verified_channel(
-        claims, b"channel-binding-material", verified_at=verified_text
-    )
+    claims = with_verified_channel(claims, b"channel-binding-material", verified_at=verified_text)
     work = evaluated_claim(
         ClaimStatus.PASSED,
         result_bytes,
@@ -282,6 +279,7 @@ def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
 # Store primitives
 # ---------------------------------------------------------------------------
 
+
 def test_blob_roundtrip_and_corruption_detection(tmp_path: Path):
     store = EvidenceStore(tmp_path / "evidence")
     digest = store.put_blob(b"artifact-bytes")
@@ -367,9 +365,7 @@ def test_signed_index_verification_and_tampering(tmp_path: Path):
         private_key_seed=INDEX_SEED,
     )
     keys = {"evidence-index-test-1": _public_raw(INDEX_SEED)}
-    document = verify_index(
-        index, keys, expected_network=NETWORK, expected_netuid=NETUID
-    )
+    document = verify_index(index, keys, expected_network=NETWORK, expected_netuid=NETUID)
     assert document["latest"]["source_epoch"] == 11
 
     with pytest.raises(EvidenceError, match="unknown key"):
@@ -421,6 +417,7 @@ def test_retention_store_is_private_and_journals_without_content(tmp_path: Path)
 # CLI roundtrip: export-score-class → export-evidence → provenance verify
 # ---------------------------------------------------------------------------
 
+
 def _write_key_file(path: Path, seed: bytes) -> None:
     path.write_text(base64.b64encode(seed).decode("ascii"))
     path.chmod(0o600)
@@ -428,9 +425,7 @@ def _write_key_file(path: Path, seed: bytes) -> None:
 
 def _write_pubkeys_file(path: Path, mapping: dict[str, bytes]) -> None:
     path.write_text(
-        json.dumps(
-            {kid: base64.b64encode(raw).decode("ascii") for kid, raw in mapping.items()}
-        )
+        json.dumps({kid: base64.b64encode(raw).decode("ascii") for kid, raw in mapping.items()})
     )
 
 
@@ -505,9 +500,7 @@ def _verify_cli_args(tmp_path: Path, evidence_dir: Path) -> list[str]:
     report_keys = tmp_path / "report-keys.json"
     _write_pubkeys_file(report_keys, {"score-test-1": _public_raw(REPORT_SEED)})
     index_keys = tmp_path / "index-keys.json"
-    _write_pubkeys_file(
-        index_keys, {"evidence-index-test-1": _public_raw(INDEX_SEED)}
-    )
+    _write_pubkeys_file(index_keys, {"evidence-index-test-1": _public_raw(INDEX_SEED)})
     return [
         "provenance",
         "verify",
@@ -537,9 +530,7 @@ def test_cli_export_then_receipts_only_verify_is_not_proven(
     evidence_dir, summary = exported_evidence
     assert summary["receipts"] == 1
     audit_path = tmp_path / "audit.json"
-    code = cli_main(
-        _verify_cli_args(tmp_path, evidence_dir) + ["--audit-out", str(audit_path)]
-    )
+    code = cli_main(_verify_cli_args(tmp_path, evidence_dir) + ["--audit-out", str(audit_path)])
     output = capsys.readouterr().out
     assert code == 1  # receipts-only can never be a clean PASS
     audit = json.loads(audit_path.read_text())
@@ -583,28 +574,21 @@ def test_cli_verify_fails_closed_on_tampered_receipt_blob(
     assert events[-1]["remediation"]
 
 
-def test_cli_verify_fails_closed_on_index_tampering(
-    tmp_path: Path, exported_evidence, capsys
-):
+def test_cli_verify_fails_closed_on_index_tampering(tmp_path: Path, exported_evidence, capsys):
     evidence_dir, _summary = exported_evidence
     index_path = evidence_dir / "index.json"
     document = json.loads(index_path.read_text())
     document["latest"]["source_epoch"] = 999
-    index_path.write_text(
-        json.dumps(document, sort_keys=True, separators=(",", ":"))
-    )
+    index_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
     code = cli_main(_verify_cli_args(tmp_path, evidence_dir))
     capsys.readouterr()
     assert code == 1
 
 
-def test_cli_verify_rejects_wrong_mechanism_pin(
-    tmp_path: Path, exported_evidence, capsys
-):
+def test_cli_verify_rejects_wrong_mechanism_pin(tmp_path: Path, exported_evidence, capsys):
     evidence_dir, _summary = exported_evidence
     code = cli_main(
-        _verify_cli_args(tmp_path, evidence_dir)
-        + ["--mechanism", "validated_supply_v2"]
+        _verify_cli_args(tmp_path, evidence_dir) + ["--mechanism", "validated_supply_v2"]
     )
     capsys.readouterr()
     assert code == 1
@@ -613,6 +597,7 @@ def test_cli_verify_rejects_wrong_mechanism_pin(
 # ---------------------------------------------------------------------------
 # Admission-evidence retention (controlled disclosure)
 # ---------------------------------------------------------------------------
+
 
 def test_retained_envelope_reproduces_the_ledger_evidence_digest(tmp_path: Path):
     from cathedral.common import ChannelBinding, ChannelBindingType, Evidence, EvidenceKind
@@ -732,22 +717,18 @@ def test_fence_reservation_conflicts_fail_never_keep_silently(tmp_path: Path):
     from cathedral.cli import _reserve_fences
 
     fence = tmp_path / "fences.json"
-    base = dict(
-        policy_release=6,
-        policy_digest="sha256:" + "0" * 64,
-        report_id="sha256:" + "1" * 64,
-        previous_report_id=None,
-        source_epoch=12,
-    )
+    base = {
+        "policy_release": 6,
+        "policy_digest": "sha256:" + "0" * 64,
+        "report_id": "sha256:" + "1" * 64,
+        "previous_report_id": None,
+        "source_epoch": 12,
+    }
     _reserve_fences(fence, index_epoch=12, index_manifest="sha256:" + "a" * 64, **base)
     with pytest.raises(ValueError, match="index rollback"):
-        _reserve_fences(
-            fence, index_epoch=11, index_manifest="sha256:" + "b" * 64, **base
-        )
+        _reserve_fences(fence, index_epoch=11, index_manifest="sha256:" + "b" * 64, **base)
     with pytest.raises(ValueError, match="index equivocation"):
-        _reserve_fences(
-            fence, index_epoch=12, index_manifest="sha256:" + "c" * 64, **base
-        )
+        _reserve_fences(fence, index_epoch=12, index_manifest="sha256:" + "c" * 64, **base)
     state = json.loads(fence.read_text())
     assert state["index_source_epoch"] == 12
     assert state["index_manifest"] == "sha256:" + "a" * 64
@@ -862,10 +843,14 @@ def test_production_refuses_the_private_host_bypass(tmp_path, capsys):
             "verify",
             "--evidence-dir",
             str(tmp_path),
-            "--registry-keys", "r.json",
-            "--report-keys", "p.json",
-            "--index-keys", "i.json",
-            "--verifier-digest", "sha256:" + "d" * 64,
+            "--registry-keys",
+            "r.json",
+            "--report-keys",
+            "p.json",
+            "--index-keys",
+            "i.json",
+            "--verifier-digest",
+            "sha256:" + "d" * 64,
             "--production",
             "--allow-private-evidence-host",
         ]
@@ -1037,9 +1022,7 @@ def test_resolver_slot_pool_survives_repeated_timeout_storms(monkeypatch):
 
     for _ in range(3 * RESOLVER_SLOT_CAP):
         started = time.monotonic()
-        with pytest.raises(
-            ValueError, match="exceeded the command deadline|capacity exhausted"
-        ):
+        with pytest.raises(ValueError, match="exceeded the command deadline|capacity exhausted"):
             _getaddrinfo_bounded("example.com", 443, 0.001)
         assert time.monotonic() - started < 0.5
         assert threading.active_count() <= baseline_threads + RESOLVER_SLOT_CAP + 1

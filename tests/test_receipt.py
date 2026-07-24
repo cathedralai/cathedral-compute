@@ -24,7 +24,8 @@ from cathedral.assurance import (
     evaluated_claim,
     with_verified_channel,
 )
-from cathedral.cli import _load_receipt_private_seed, cmd_receipt_verify, main as cli_main
+from cathedral.cli import _load_receipt_private_seed, cmd_receipt_verify
+from cathedral.cli import main as cli_main
 from cathedral.common import Attested, Policy, Tier
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.lifecycle import (
@@ -49,15 +50,16 @@ from cathedral.receipt import (
 from cathedral.runtime import SAT_WORK_POLICY_DIGEST
 from cathedral.score_class import ScoreClassError, export_score_class_report
 
-
 REGISTRY_SEED = bytes(range(32))
 RECEIPT_SEED_1 = bytes(range(32, 64))
 RECEIPT_SEED_2 = bytes(range(64, 96))
-REGISTRY_PUBLIC = Ed25519PrivateKey.from_private_bytes(
-    REGISTRY_SEED
-).public_key().public_bytes(
-    serialization.Encoding.Raw,
-    serialization.PublicFormat.Raw,
+REGISTRY_PUBLIC = (
+    Ed25519PrivateKey.from_private_bytes(REGISTRY_SEED)
+    .public_key()
+    .public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
 )
 TRUSTED = {"cathedral-policy-test-1": REGISTRY_PUBLIC}
 ISSUED = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
@@ -67,9 +69,13 @@ MANIFEST_DIGEST = "sha256:" + "b" * 64
 
 
 def _public(seed: bytes) -> str:
-    raw = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
+    raw = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
     )
     return base64.b64encode(raw).decode("ascii")
 
@@ -145,9 +151,7 @@ def _snapshot(
     now: datetime = ISSUED,
 ):
     return verify_registry(
-        canonical_json(
-            _registry_document(release=release, receipt_keys=receipt_keys)
-        ),
+        canonical_json(_registry_document(release=release, receipt_keys=receipt_keys)),
         TRUSTED,
         now=now,
         max_age_seconds=172800,
@@ -166,11 +170,7 @@ def _claims(policy: Policy, *, work_status: ClaimStatus = ClaimStatus.PASSED):
         b"work-result-material",
         SAT_WORK_POLICY_DIGEST,
         verified_at=ISSUED_TEXT,
-        reason=(
-            None
-            if work_status is ClaimStatus.PASSED
-            else ReasonCategory.WORK_INVALID
-        ),
+        reason=(None if work_status is ClaimStatus.PASSED else ReasonCategory.WORK_INVALID),
     )
     return claims.with_claim(AssuranceDimension.WORK, work)
 
@@ -247,14 +247,12 @@ def _resign(document: dict[str, object]) -> bytes:
     id_material = dict(document)
     id_material.pop("receipt_id", None)
     id_material.pop("signature", None)
-    document["receipt_id"] = "receipt-sha256:" + hashlib.sha256(
-        canonical_json(id_material)
-    ).hexdigest()
+    document["receipt_id"] = (
+        "receipt-sha256:" + hashlib.sha256(canonical_json(id_material)).hexdigest()
+    )
     unsigned = dict(document)
     unsigned.pop("signature", None)
-    signature = Ed25519PrivateKey.from_private_bytes(RECEIPT_SEED_1).sign(
-        canonical_json(unsigned)
-    )
+    signature = Ed25519PrivateKey.from_private_bytes(RECEIPT_SEED_1).sign(canonical_json(unsigned))
     document["signature"] = {
         "algorithm": "ed25519",
         "value_base64": base64.b64encode(signature).decode("ascii"),
@@ -266,9 +264,9 @@ def _reidentify(document: dict[str, object]) -> None:
     id_material = dict(document)
     id_material.pop("receipt_id", None)
     id_material.pop("signature", None)
-    document["receipt_id"] = "receipt-sha256:" + hashlib.sha256(
-        canonical_json(id_material)
-    ).hexdigest()
+    document["receipt_id"] = (
+        "receipt-sha256:" + hashlib.sha256(canonical_json(id_material)).hexdigest()
+    )
 
 
 def test_golden_receipt_signature_canonicalization_and_offline_verification():
@@ -295,9 +293,7 @@ def test_golden_receipt_signature_canonicalization_and_offline_verification():
 
 
 def test_historical_v1_receipt_remains_offline_verifiable():
-    receipt_bytes = Path("tests/fixtures/assurance-receipt-v1.json").read_bytes().rstrip(
-        b"\n"
-    )
+    receipt_bytes = Path("tests/fixtures/assurance-receipt-v1.json").read_bytes().rstrip(b"\n")
     verified = verify_receipt(receipt_bytes, _snapshot())
     assert verified.document["schema"] == "cathedral_assurance_receipt_v1"
     assert verified.receipt_id == (
@@ -429,9 +425,7 @@ def test_unicode_and_canonical_timestamp_rules_are_stable():
 
 
 def test_claim_digest_presence_and_explicit_zero_are_enforced():
-    snapshot, _policy, _claims_value, receipt = _issued_receipt(
-        work_status=ClaimStatus.FAILED
-    )
+    snapshot, _policy, _claims_value, receipt = _issued_receipt(work_status=ClaimStatus.FAILED)
     assert receipt.document["work"]["work_units"] == "0"
     assert verify_receipt(receipt.receipt_bytes, snapshot)
 
@@ -479,9 +473,10 @@ def test_key_rotation_overlap_retirement_and_compromise_revocation(tmp_path: Pat
         now=datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC),
     )
     state.accept(rotated)
-    assert verify_receipt(
-        receipt.receipt_bytes, original, key_registry=rotated
-    ).receipt_id == receipt.receipt_id
+    assert (
+        verify_receipt(receipt.receipt_bytes, original, key_registry=rotated).receipt_id
+        == receipt.receipt_id
+    )
 
     revoked_old = _receipt_key(
         "receipt-test-1",
@@ -572,9 +567,7 @@ def test_unknown_and_expired_receipt_signing_keys_fail_closed():
     )
     expired = json.loads(valid.receipt_bytes)
     expired["issued_at"] = "2026-07-18T00:00:00.000000Z"
-    expired["lifecycle"]["worker_evidence_expires_at"] = (
-        "2026-07-18T01:00:00.000000Z"
-    )
+    expired["lifecycle"]["worker_evidence_expires_at"] = "2026-07-18T01:00:00.000000Z"
     with pytest.raises(ReceiptError, match="out of window"):
         verify_receipt(_resign(expired), expiring_snapshot)
 
@@ -583,9 +576,7 @@ def test_receipt_private_seed_file_is_bounded_and_permission_checked(tmp_path: P
     key_path = tmp_path / "receipt.key"
     key_path.write_bytes(base64.b64encode(RECEIPT_SEED_1) + b"\n")
     key_path.chmod(0o600)
-    assert _load_receipt_private_seed(
-        str(key_path), production_mode=True
-    ) == RECEIPT_SEED_1
+    assert _load_receipt_private_seed(str(key_path), production_mode=True) == RECEIPT_SEED_1
 
     key_path.chmod(0o644)
     with pytest.raises(ValueError, match="group/world"):
@@ -615,10 +606,7 @@ def test_existing_policy_state_schema_migrates_receipt_key_checkpoint(tmp_path: 
         )
     state = PolicyRegistryState(path, minimum_release=1)
     with sqlite3.connect(path) as connection:
-        columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(policy_registry_state)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(policy_registry_state)")}
     assert "receipt_key_states_json" in columns
     assert state.current() is None
 
@@ -631,9 +619,7 @@ def test_receipt_bytes_persist_atomically_with_work_resolution(tmp_path: Path):
         policy_registry_release=snapshot.release,
         policy_registry_digest=snapshot.digest,
     )
-    _snapshot_value, receipt_policy, receipt_claims, receipt = _issued_receipt(
-        epoch_id=epoch_id
-    )
+    _snapshot_value, receipt_policy, receipt_claims, receipt = _issued_receipt(epoch_id=epoch_id)
     ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
     ledger.resolve_challenge_with_receipt(
         CHALLENGE_ID,
@@ -1043,7 +1029,7 @@ def test_score_class_export_rejects_predecessor_that_appears_before_insert(
     def export_later() -> None:
         try:
             outcome["report"] = _export_score_class(later, second_epoch)
-        except BaseException as exc:  # surfaced deterministically in the main test thread
+        except BaseException as exc:  # noqa: BLE001 - surfaced deterministically in the main test thread
             outcome["error"] = exc
 
     thread = threading.Thread(target=export_later)
@@ -1127,7 +1113,7 @@ def test_concurrent_conflicting_duplicate_export_fails_closed(
                 epoch_id,
                 generated_at=generated_at,
             )
-        except BaseException as exc:  # surfaced deterministically in the main test thread
+        except BaseException as exc:  # noqa: BLE001 - surfaced deterministically in the main test thread
             outcome = exc
         with outcome_lock:
             outcomes.append(outcome)
@@ -1241,20 +1227,14 @@ def test_runtime_cli_exports_validator_consumable_score_class(
 def test_offline_cli_returns_machine_readable_verification_categories(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
-    snapshot, _policy, _claims_value, receipt = _issued_receipt()
+    _snapshot_value, _policy, _claims_value, receipt = _issued_receipt()
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_bytes(receipt.receipt_bytes)
     registry_path = tmp_path / "registry.json"
     registry_path.write_bytes(canonical_json(_registry_document()))
     keys_path = tmp_path / "keys.json"
     keys_path.write_text(
-        json.dumps(
-            {
-                "cathedral-policy-test-1": base64.b64encode(REGISTRY_PUBLIC).decode(
-                    "ascii"
-                )
-            }
-        ),
+        json.dumps({"cathedral-policy-test-1": base64.b64encode(REGISTRY_PUBLIC).decode("ascii")}),
         encoding="utf-8",
     )
     args = argparse.Namespace(
@@ -1327,9 +1307,7 @@ def test_begin_epoch_validates_the_challenge_anchor_pair(tmp_path: Path):
             challenge_anchor_hash="zz" * 32,
         )
     with pytest.raises(LedgerError, match="requires its audience"):
-        ledger.begin_epoch(
-            1, challenge_anchor_block=100, challenge_anchor_hash=ANCHOR_HASH
-        )
+        ledger.begin_epoch(1, challenge_anchor_block=100, challenge_anchor_hash=ANCHOR_HASH)
     epoch_id = ledger.begin_epoch(
         1,
         network="local",
@@ -1357,9 +1335,7 @@ def test_anchored_epoch_refuses_a_different_completion_audience(tmp_path: Path):
         challenge_anchor_hash=ANCHOR_HASH,
     )
     with pytest.raises(LedgerError, match="does not match the epoch's anchored audience"):
-        ledger.complete_epoch(
-            epoch_id, set(), score_network="local", score_netuid=2
-        )
+        ledger.complete_epoch(epoch_id, set(), score_network="local", score_netuid=2)
     with pytest.raises(LedgerError, match="anchored score audience"):
         ledger.complete_epoch(epoch_id, set())
     ledger.close()
@@ -1413,8 +1389,11 @@ def test_score_class_export_requires_the_anchor_in_production(tmp_path: Path):
     ledger = Ledger(tmp_path / "unanchored-ledger.sqlite")
     epoch_id = ledger.begin_epoch(11)
     ledger.complete_epoch(
-        epoch_id, {"zero-hotkey"}, generated_at=ISSUED_TEXT,
-        score_network="local", score_netuid=1,
+        epoch_id,
+        {"zero-hotkey"},
+        generated_at=ISSUED_TEXT,
+        score_network="local",
+        score_netuid=1,
     )
     snapshot = {
         "schema": "cathedral_candidate_snapshot_v1",
@@ -1452,9 +1431,7 @@ def test_score_class_report_accounts_for_every_historical_candidate(
     zero row; a scored hotkey outside the snapshot refuses to sign; the
     entry set equals the snapshot set exactly."""
     ledger, epoch_id = _completed_receipt_epoch(tmp_path)
-    snapshot = _candidate_snapshot_for(
-        ledger, epoch_id, extra_hotkeys=("registered-idle-hotkey",)
-    )
+    snapshot = _candidate_snapshot_for(ledger, epoch_id, extra_hotkeys=("registered-idle-hotkey",))
     # Omission must be checked BEFORE any successful export: once signed,
     # replays intentionally return the originally bound bytes.
     omitting = {
@@ -1464,9 +1441,7 @@ def test_score_class_report_accounts_for_every_historical_candidate(
     with pytest.raises(ScoreClassError, match="not registered in the anchored"):
         _export_score_class(ledger, epoch_id, candidate_snapshot=omitting)
 
-    report = json.loads(
-        _export_score_class(ledger, epoch_id, candidate_snapshot=snapshot)
-    )
+    report = json.loads(_export_score_class(ledger, epoch_id, candidate_snapshot=snapshot))
     entries = {entry["miner_hotkey"]: entry for entry in report["entries"]}
     assert set(entries) == set(snapshot["hotkeys"])
     idle = entries["registered-idle-hotkey"]
@@ -1487,15 +1462,9 @@ def test_score_class_export_retry_replays_the_originally_bound_snapshot(
     originally signed bytes (the durable export chain is the authority)."""
     ledger, epoch_id = _completed_receipt_epoch(tmp_path)
     original_snapshot = _candidate_snapshot_for(ledger, epoch_id)
-    first = _export_score_class(
-        ledger, epoch_id, candidate_snapshot=original_snapshot
-    )
-    assert _export_score_class(
-        ledger, epoch_id, candidate_snapshot=original_snapshot
-    ) == first
-    swapped = _candidate_snapshot_for(
-        ledger, epoch_id, extra_hotkeys=("late-registration",)
-    )
+    first = _export_score_class(ledger, epoch_id, candidate_snapshot=original_snapshot)
+    assert _export_score_class(ledger, epoch_id, candidate_snapshot=original_snapshot) == first
+    swapped = _candidate_snapshot_for(ledger, epoch_id, extra_hotkeys=("late-registration",))
     replay = _export_score_class(ledger, epoch_id, candidate_snapshot=swapped)
     assert replay == first
     bound = json.loads(first)["candidate_snapshot"]

@@ -6,15 +6,14 @@ import ast
 import hashlib
 import hmac
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 import cathedral.runtime as runtime_module
-
 from cathedral.assurance import ClaimStatus, attestation_claims
 from cathedral.common import (
     Attested,
@@ -32,15 +31,14 @@ from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.runtime import (
+    SAT_WORK_POLICY_DIGEST,
     ConfidentialRuntime,
     MinerTarget,
     RuntimeConfig,
     RuntimeError,
-    SAT_WORK_POLICY_DIGEST,
     _evidence_digest,
     _work_assurance,
 )
-
 
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
 
@@ -148,7 +146,7 @@ def verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | Non
     )
 
 
-setattr(verifier, "production_ready", True)
+verifier.production_ready = True
 
 
 def production_policy() -> Policy:
@@ -356,11 +354,11 @@ def test_production_runtime_rejects_unsigned_or_compatibility_policy(tmp_path: P
             Policy(allowed_measurements={"measurement"}),
             verifier=verifier,
             config=RuntimeConfig(
-            production_mode=True,
-            evidence_retention_dir=str(tmp_path / "retained-evidence"),
-            challenge_anchor_block=100,
-            challenge_anchor_hash="0x" + "ab" * 32,
-        ),
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -380,11 +378,11 @@ def test_production_runtime_rejects_forged_registry_metadata(tmp_path: Path) -> 
             forged,
             verifier=verifier,
             config=RuntimeConfig(
-            production_mode=True,
-            evidence_retention_dir=str(tmp_path / "retained-evidence"),
-            challenge_anchor_block=100,
-            challenge_anchor_hash="0x" + "ab" * 32,
-        ),
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -432,11 +430,11 @@ def test_production_runtime_rejects_custom_verifier_escape_hatch(tmp_path: Path)
             policy_refresher=lambda: policy,
             verifier=verifier,
             config=RuntimeConfig(
-            production_mode=True,
-            evidence_retention_dir=str(tmp_path / "retained-evidence"),
-            challenge_anchor_block=100,
-            challenge_anchor_hash="0x" + "ab" * 32,
-        ),
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -447,11 +445,11 @@ def test_production_runtime_requires_live_policy_refresher(tmp_path: Path) -> No
             Ledger(tmp_path / "ledger.sqlite"),
             production_policy(),
             config=RuntimeConfig(
-            production_mode=True,
-            evidence_retention_dir=str(tmp_path / "retained-evidence"),
-            challenge_anchor_block=100,
-            challenge_anchor_hash="0x" + "ab" * 32,
-        ),
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -720,8 +718,7 @@ def test_negative_customer_result_reaches_exact_attempt_cap_without_validator_se
 
     snapshot = ledger.customer_job(submitted.job_id)
     challenges = [
-        factory.log[f"sat:{hotkey}"][0]
-        for hotkey in ("worker-a", "worker-b", "worker-c")
+        factory.log[f"sat:{hotkey}"][0] for hotkey in ("worker-a", "worker-b", "worker-c")
     ]
     assert snapshot.status == "failed"
     assert snapshot.attempt_count == 3
@@ -812,12 +809,12 @@ def test_invalid_untrusted_certificate_still_produces_failed_work_claim():
 
 
 def test_evidence_audit_digest_commits_to_report_version_and_channel_binding():
-    common = dict(
-        kind=EvidenceKind.TDX,
-        quote=b"quote",
-        nonce=b"n" * 32,
-        miner_hotkey="miner",
-    )
+    common = {
+        "kind": EvidenceKind.TDX,
+        "quote": b"quote",
+        "nonce": b"n" * 32,
+        "miner_hotkey": "miner",
+    }
     legacy = Evidence(**common)
     first = Evidence(
         **common,
@@ -1147,7 +1144,7 @@ def test_abandon_completed_unblocks_begin_epoch_and_is_audited(tmp_path: Path) -
 
 
 def test_abandon_completed_requires_exact_blocking_epoch(tmp_path: Path) -> None:
-    runtime, ledger, _ = make_runtime(tmp_path, [], default_specs())
+    runtime, _ledger, _ = make_runtime(tmp_path, [], default_specs())
     run = runtime.run_epoch(1, CANARY)
     with pytest.raises(RuntimeError, match="exact completed"):
         runtime.abandon_completed(run.epoch_id + 1, "reason")

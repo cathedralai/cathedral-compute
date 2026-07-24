@@ -26,6 +26,7 @@ The authenticated binary bytes are materialized into a private 0700
 directory and executed from there — the caller-supplied path is never
 executed, so there is no check-to-use window.
 """
+
 from __future__ import annotations
 
 import base64
@@ -102,17 +103,13 @@ def _strict_json(data: bytes) -> dict[str, Any]:
         document = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_no_duplicates,
-            parse_constant=lambda _v: (_ for _ in ()).throw(
-                ValueError("non-finite envelope JSON")
-            ),
+            parse_constant=lambda _v: (_ for _ in ()).throw(ValueError("non-finite envelope JSON")),
         )
     except (ValueError, UnicodeDecodeError) as exc:
         raise ReplayError(f"controlled envelope is not strict JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise ReplayError("controlled envelope is not a JSON object")
-    canonical = json.dumps(
-        document, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if canonical != data:
         raise ReplayError("controlled envelope bytes are not canonical JSON")
     return document
@@ -147,7 +144,7 @@ def _channel_binding_from_canonical(raw: bytes | None) -> ChannelBinding | None:
     prefix = b"cathedral.channel-binding\x00"
     if not raw.startswith(prefix) or len(raw) < len(prefix) + 2 + 32:
         raise ReplayError("envelope channel binding is malformed")
-    body = raw[len(prefix):]
+    body = raw[len(prefix) :]
     name_length = int.from_bytes(body[:2], "big")
     name = body[2 : 2 + name_length]
     digest = body[2 + name_length :]
@@ -173,9 +170,7 @@ def parse_envelope(
     if len(envelope_bytes) > MAX_ENVELOPE_BYTES:
         raise ReplayError("controlled envelope is oversized")
     if _digest(envelope_bytes) != expected_envelope_digest:
-        raise ReplayError(
-            "controlled envelope bytes do not match the published manifest digest"
-        )
+        raise ReplayError("controlled envelope bytes do not match the published manifest digest")
     document = _strict_json(envelope_bytes)
     if frozenset(document) != _ENVELOPE_KEYS:
         raise ReplayError("controlled envelope has missing or unknown fields")
@@ -183,9 +178,10 @@ def parse_envelope(
         raise ReplayError("controlled envelope schema is unsupported")
     recorded_digest = document["evidence_digest"]
     normalized_expected = expected_evidence_digest.removeprefix("sha256:")
-    if not isinstance(recorded_digest, str) or recorded_digest.removeprefix(
-        "sha256:"
-    ) != normalized_expected:
+    if (
+        not isinstance(recorded_digest, str)
+        or recorded_digest.removeprefix("sha256:") != normalized_expected
+    ):
         raise ReplayError("controlled envelope does not bind the ledger evidence digest")
     components = document["components"]
     if not isinstance(components, list) or len(components) != 1:
@@ -225,9 +221,7 @@ def parse_envelope(
         nonce=_b64_field(component, "nonce_base64", max_bytes=64),
         miner_hotkey=hotkey,
         cert_chain=cert_chain,
-        ssh_host_key=_b64_field(
-            component, "ssh_host_key_base64", optional=True, max_bytes=4096
-        ),
+        ssh_host_key=_b64_field(component, "ssh_host_key_base64", optional=True, max_bytes=4096),
         report_data_version=version,
         channel_binding=binding,
     )
@@ -294,8 +288,7 @@ def replay_evidence(
     # receipt for quote A) must never replay as full provenance.
     if _digest(evidence.quote) != expected_quote_digest:
         raise ReplayError(
-            "raw quote bytes do not match the receipt's signed hardware "
-            "evidence digest"
+            "raw quote bytes do not match the receipt's signed hardware evidence digest"
         )
     # Freshness anchor: the nonce is NEVER trusted from the envelope alone.
     # It must reproduce the challenge randomness committed for this epoch in
@@ -303,8 +296,7 @@ def replay_evidence(
     # stale envelope from another epoch cannot replay here.
     if _digest(evidence.nonce) != expected_challenge_digest:
         raise ReplayError(
-            "envelope nonce does not match the epoch's committed challenge "
-            "randomness"
+            "envelope nonce does not match the epoch's committed challenge randomness"
         )
     authenticate_verifier_bytes(
         verifier_binary,
@@ -327,9 +319,7 @@ def replay_evidence(
             handle.flush()
             os.fsync(handle.fileno())
         metadata = os.lstat(binary_path)
-        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_size != len(
-            verifier_binary
-        ):
+        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_size != len(verifier_binary):
             raise ReplayError("materialized verifier binary is inconsistent")
         # The CANONICAL strict verification path: bounded subprocess, output
         # cap enforced during execution, sanitized environment, and every

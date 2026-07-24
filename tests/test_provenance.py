@@ -33,8 +33,6 @@ from tests.test_receipt import (
     ISSUED_TEXT,
     RECEIPT_SEED_2,
     TRUSTED,
-    _attested,
-    _claims,
     _completed_receipt_epoch,
     _export_score_class,
     _issued_receipt,
@@ -63,17 +61,17 @@ def _receipts_from_ledger(ledger: Ledger, epoch_id: int) -> dict[str, bytes]:
 
 
 def _verify(report: bytes, receipts: dict[str, bytes], **overrides):
-    arguments = dict(
-        report_bytes=report,
-        receipts_by_id=receipts,
-        registry_bytes=REGISTRY_BYTES,
-        trusted_registry_keys=TRUSTED,
-        report_signing_keys=REPORT_KEYS,
-        expected_network="local",
-        expected_netuid=1,
-        expected_verifier_digest=VERIFIER_DIGEST,
-        now=NOW,
-    )
+    arguments = {
+        "report_bytes": report,
+        "receipts_by_id": receipts,
+        "registry_bytes": REGISTRY_BYTES,
+        "trusted_registry_keys": TRUSTED,
+        "report_signing_keys": REPORT_KEYS,
+        "expected_network": "local",
+        "expected_netuid": 1,
+        "expected_verifier_digest": VERIFIER_DIGEST,
+        "now": NOW,
+    }
     arguments.update(overrides)
     return verify_and_recompute(**arguments)
 
@@ -266,9 +264,7 @@ def test_missing_receipt_fails_closed(exported):
 
 def test_corrupt_receipt_bytes_fail_closed(exported):
     report, receipts = exported
-    corrupted = {
-        receipt_id: body[:-2] + b" }" for receipt_id, body in receipts.items()
-    }
+    corrupted = {receipt_id: body[:-2] + b" }" for receipt_id, body in receipts.items()}
     with pytest.raises(ProvenanceError, match="does not match its digest"):
         _verify(report, corrupted)
 
@@ -340,9 +336,7 @@ def test_chain_enforcement_rejects_a_broken_predecessor(exported):
             expected_previous_report_id="sha256:" + "e" * 64,
         )
     # And the true chain head (previous None) verifies when enforced.
-    result = _verify(
-        report, receipts, enforce_chain=True, expected_previous_report_id=None
-    )
+    result = _verify(report, receipts, enforce_chain=True, expected_previous_report_id=None)
     assert result.previous_report_id is None
 
 
@@ -422,16 +416,12 @@ def test_candidate_omission_cannot_inflate_a_survivor(exported):
             {"hotkey": "omitted-miner", "outcome": "verified", "reason": "receipt_verified"},
         ],
     }
-    with pytest.raises(
-        ProvenanceError, match="does not equal the report's anchored snapshot"
-    ):
+    with pytest.raises(ProvenanceError, match="does not equal the report's anchored snapshot"):
         _verify(report, receipts, candidate_set=candidate_set)
 
     def drop_zero_entry(document):
         document["entries"] = [
-            entry
-            for entry in document["entries"]
-            if entry["miner_hotkey"] != "zero-hotkey"
+            entry for entry in document["entries"] if entry["miner_hotkey"] != "zero-hotkey"
         ]
 
     with pytest.raises(ProvenanceError, match="omits anchored snapshot candidates"):

@@ -44,7 +44,6 @@ from cathedral.common import (
 )
 from cathedral.verify.snp import verify_snp
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -132,8 +131,7 @@ def _verify_tdx(
     claims = _run_tdx_verifier(
         evidence.quote,
         production_mode=(
-            True if _pinned_replay_command is not None
-            else policy.production_ready_for_tdx
+            True if _pinned_replay_command is not None else policy.production_ready_for_tdx
         ),
         expected_report_data=expected_report_data,
         pinned_command=_pinned_replay_command,
@@ -486,9 +484,7 @@ def tdx_implementation_digest_from_bytes(
     try:
         _require_static_linux_elf(_io.BytesIO(executable_bytes), len(executable_bytes))
     except OSError as exc:
-        raise ValueError(
-            "pinned verifier bytes are not a static x86-64 Linux ELF"
-        ) from exc
+        raise ValueError("pinned verifier bytes are not a static x86-64 Linux ELF") from exc
     digest = hashlib.sha256()
     digest.update(b"cathedral-tdx-verifier-implementation-v1\0")
     digest.update(
@@ -589,7 +585,7 @@ def _run_tdx_verifier(
         if production_mode:
             verifier_args.append(production_expected_hex)
         try:
-            stdout_str, stderr_str, returncode = _read_bounded_subprocess(
+            stdout_str, _stderr_str, returncode = _read_bounded_subprocess(
                 verifier_args,
                 max_output,
                 timeout,
@@ -612,8 +608,7 @@ def _claim_bytes(claims: dict[str, Any], key: str) -> bytes:
         return b""
 
     text = value.strip()
-    if text.startswith("0x"):
-        text = text[2:]
+    text = text.removeprefix("0x")
     try:
         return bytes.fromhex(text)
     except ValueError:

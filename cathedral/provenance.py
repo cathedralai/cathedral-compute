@@ -30,6 +30,7 @@ This module is transport-agnostic: callers supply already-fetched bytes. The
 evidence store/CLI and the two-mode validator handle fetching and
 content-addressing.
 """
+
 from __future__ import annotations
 
 import base64
@@ -84,9 +85,7 @@ _REPORT_KEYS = frozenset(
         "signature",
     }
 )
-_ENTRY_KEYS = frozenset(
-    {"miner_hotkey", "metrics", "asserted_score", "reason_codes", "evidence"}
-)
+_ENTRY_KEYS = frozenset({"miner_hotkey", "metrics", "asserted_score", "reason_codes", "evidence"})
 
 
 class ProvenanceError(Exception):
@@ -181,6 +180,7 @@ def load_registry(
 # the derivation MUST introduce a new id so an independent validator can pin
 # exactly what it recomputes. The signed evidence manifest carries the id.
 
+
 def _mechanism_validated_supply_v1(
     positive: list[tuple[str, Decimal]],
 ) -> dict[str, float]:
@@ -209,9 +209,8 @@ MECHANISMS: dict[str, Callable[[list[tuple[str, Decimal]]], dict[str, float]]] =
 # Report verification
 # ---------------------------------------------------------------------------
 
-def _verify_report_signature(
-    document: Mapping[str, Any], public_key: bytes
-) -> None:
+
+def _verify_report_signature(document: Mapping[str, Any], public_key: bytes) -> None:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -227,12 +226,10 @@ def _verify_report_signature(
         raise ProvenanceError("score report signature is not valid base64") from exc
 
     # report_id must bind the exact signed material (domain-separated).
-    id_material = {
-        k: v for k, v in document.items() if k not in {"report_id", "signature"}
-    }
-    expected_id = "sha256:" + hashlib.sha256(
-        REPORT_ID_DOMAIN + canonical_json(id_material)
-    ).hexdigest()
+    id_material = {k: v for k, v in document.items() if k not in {"report_id", "signature"}}
+    expected_id = (
+        "sha256:" + hashlib.sha256(REPORT_ID_DOMAIN + canonical_json(id_material)).hexdigest()
+    )
     if document.get("report_id") != expected_id:
         raise ProvenanceError("score report id does not bind its signed body")
 
@@ -324,12 +321,11 @@ def verify_report_structure(
         "block_hash",
         "hotkeys",
     }:
-        raise ProvenanceError(
-            "score report candidate_snapshot has missing or unknown fields"
-        )
-    if not isinstance(snapshot["digest"], str) or _SNAPSHOT_DIGEST_RE.fullmatch(
-        snapshot["digest"]
-    ) is None:
+        raise ProvenanceError("score report candidate_snapshot has missing or unknown fields")
+    if (
+        not isinstance(snapshot["digest"], str)
+        or _SNAPSHOT_DIGEST_RE.fullmatch(snapshot["digest"]) is None
+    ):
         raise ProvenanceError("score report candidate_snapshot digest is invalid")
     snapshot_block = snapshot["block"]
     if (
@@ -338,33 +334,27 @@ def verify_report_structure(
         or snapshot_block < 0
     ):
         raise ProvenanceError("score report candidate_snapshot block is invalid")
-    if not isinstance(snapshot["block_hash"], str) or _SNAPSHOT_HASH_RE.fullmatch(
-        snapshot["block_hash"]
-    ) is None:
-        raise ProvenanceError(
-            "score report candidate_snapshot block hash is invalid"
-        )
+    if (
+        not isinstance(snapshot["block_hash"], str)
+        or _SNAPSHOT_HASH_RE.fullmatch(snapshot["block_hash"]) is None
+    ):
+        raise ProvenanceError("score report candidate_snapshot block hash is invalid")
     snapshot_hotkeys = snapshot["hotkeys"]
     if (
         not isinstance(snapshot_hotkeys, list)
-        or any(
-            not isinstance(hotkey, str) or not hotkey for hotkey in snapshot_hotkeys
-        )
+        or any(not isinstance(hotkey, str) or not hotkey for hotkey in snapshot_hotkeys)
         or len(set(snapshot_hotkeys)) != len(snapshot_hotkeys)
         or sorted(snapshot_hotkeys) != snapshot_hotkeys
     ):
         raise ProvenanceError(
-            "score report candidate_snapshot hotkeys must be a sorted "
-            "duplicate-free list"
+            "score report candidate_snapshot hotkeys must be a sorted duplicate-free list"
         )
 
     previous = document.get("previous_report_id")
     if previous is not None and not isinstance(previous, str):
         raise ProvenanceError("score report previous_report_id is invalid")
     if enforce_chain and previous != expected_previous_report_id:
-        raise ProvenanceError(
-            "score report previous_report_id breaks the recorded export chain"
-        )
+        raise ProvenanceError("score report previous_report_id breaks the recorded export chain")
 
     key_id = document.get("signing_key_id")
     if not isinstance(key_id, str) or key_id not in report_signing_keys:
@@ -440,20 +430,15 @@ def verify_and_recompute(
         now=now,
     )
 
-    if document.get("class_id") != expected_class_id or document.get(
-        "source_id"
-    ) != expected_source_id:
-        raise ProvenanceError(
-            "score report class/source identity does not match the operator pins"
-        )
-    if current_block is not None and not (
-        int(document["valid_from_block"])
-        <= int(current_block)
-        < int(document["valid_until_block"])
+    if (
+        document.get("class_id") != expected_class_id
+        or document.get("source_id") != expected_source_id
     ):
-        raise ProvenanceError(
-            "current finalized block is outside the report's validity window"
-        )
+        raise ProvenanceError("score report class/source identity does not match the operator pins")
+    if current_block is not None and not (
+        int(document["valid_from_block"]) <= int(current_block) < int(document["valid_until_block"])
+    ):
+        raise ProvenanceError("current finalized block is outside the report's validity window")
     entries = document.get("entries")
     if not isinstance(entries, list):
         raise ProvenanceError("score report has no entries list")
@@ -466,19 +451,14 @@ def verify_and_recompute(
     # always range over one identical candidate universe.
     bound_snapshot = document["candidate_snapshot"]
     bound_hotkeys = set(bound_snapshot["hotkeys"])
-    report_hotkeys = {
-        entry.get("miner_hotkey") for entry in entries if isinstance(entry, dict)
-    }
+    report_hotkeys = {entry.get("miner_hotkey") for entry in entries if isinstance(entry, dict)}
     omitted = bound_hotkeys - report_hotkeys
     if omitted:
-        raise ProvenanceError(
-            f"report omits anchored snapshot candidates: {sorted(omitted)}"
-        )
+        raise ProvenanceError(f"report omits anchored snapshot candidates: {sorted(omitted)}")
     stray = report_hotkeys - bound_hotkeys
     if stray:
         raise ProvenanceError(
-            f"report carries entries outside its anchored snapshot: "
-            f"{sorted(stray)}"
+            f"report carries entries outside its anchored snapshot: {sorted(stray)}"
         )
 
     candidate_outcomes: dict[str, str] = {}
@@ -492,15 +472,13 @@ def verify_and_recompute(
                 "manifest candidate_set does not equal the report's anchored "
                 f"snapshot hotkey set (drift: {drift})"
             )
-        manifest_hash = (
-            str(candidate_set.get("block_hash", "")).lower().removeprefix("0x")
-        )
-        if int(candidate_set.get("block", -1)) != int(
-            bound_snapshot["block"]
-        ) or manifest_hash != bound_snapshot["block_hash"]:
+        manifest_hash = str(candidate_set.get("block_hash", "")).lower().removeprefix("0x")
+        if (
+            int(candidate_set.get("block", -1)) != int(bound_snapshot["block"])
+            or manifest_hash != bound_snapshot["block_hash"]
+        ):
             raise ProvenanceError(
-                "manifest candidate_set block/hash does not match the "
-                "report's anchored snapshot"
+                "manifest candidate_set block/hash does not match the report's anchored snapshot"
             )
 
     miners: list[MinerProvenance] = []
@@ -532,13 +510,9 @@ def verify_and_recompute(
         if candidate_outcomes:
             outcome = candidate_outcomes.get(hotkey)
             if units > 0 and outcome != "verified":
-                raise ProvenanceError(
-                    f"positive entry {hotkey!r} is not a verified candidate"
-                )
+                raise ProvenanceError(f"positive entry {hotkey!r} is not a verified candidate")
             if units == 0 and outcome == "verified":
-                raise ProvenanceError(
-                    f"verified candidate {hotkey!r} carries no verified work"
-                )
+                raise ProvenanceError(f"verified candidate {hotkey!r} carries no verified work")
         if units > 0:
             # A positive miner must carry exactly one verifiable receipt.
             if len(evidence) != 1 or not isinstance(evidence[0], dict):
@@ -556,22 +530,16 @@ def verify_and_recompute(
                 raise ProvenanceError(f"positive miner {hotkey!r} has malformed evidence")
             body = receipts_by_id.get(receipt_id)
             if body is None:
-                raise ProvenanceError(
-                    f"receipt {receipt_id} for {hotkey!r} was not provided"
-                )
+                raise ProvenanceError(f"receipt {receipt_id} for {hotkey!r} was not provided")
             if _digest_bytes(body) != receipt_digest:
-                raise ProvenanceError(
-                    f"receipt {receipt_id} content does not match its digest"
-                )
+                raise ProvenanceError(f"receipt {receipt_id} content does not match its digest")
             # Full receipt verification against the signed registry: signature,
             # id binding, registry release+digest, validity window, measurement
             # in an approved profile.
             try:
                 verify_receipt(body, registry)
             except ReceiptError as exc:
-                raise ProvenanceError(
-                    f"receipt {receipt_id} failed verification: {exc}"
-                ) from exc
+                raise ProvenanceError(f"receipt {receipt_id} failed verification: {exc}") from exc
             parsed = parse_receipt_json(body)
             if parsed.get("receipt_id") != receipt_id:
                 raise ProvenanceError(f"receipt {receipt_id} id mismatch")
@@ -587,9 +555,7 @@ def verify_and_recompute(
             try:
                 receipt_units = Decimal(str(work.get("work_units")))
             except (InvalidOperation, ValueError) as exc:
-                raise ProvenanceError(
-                    f"receipt {receipt_id} work units are invalid"
-                ) from exc
+                raise ProvenanceError(f"receipt {receipt_id} work units are invalid") from exc
             if receipt_units != units:
                 raise ProvenanceError(
                     f"receipt {receipt_id} work units {receipt_units} != report units {units}"
@@ -610,9 +576,7 @@ def verify_and_recompute(
                     verify_work_artifacts(
                         artifacts[0],
                         artifacts[1],
-                        expected_manifest_digest=str(
-                            receipt_work.get("manifest_digest")
-                        ),
+                        expected_manifest_digest=str(receipt_work.get("manifest_digest")),
                         expected_result_digest=str(receipt_work.get("result_digest")),
                         expected_challenge_id=str(receipt_work.get("challenge_id")),
                         expected_hotkey=hotkey,
@@ -625,10 +589,9 @@ def verify_and_recompute(
                 work_verified = True
             receipt_measurement = parsed.get("measurement")
             receipt_issued_at = parsed.get("issued_at")
-            receipt_hardware = (
-                ((parsed.get("assurance") or {}).get("claims") or {}).get("hardware")
-                or {}
-            )
+            receipt_hardware = ((parsed.get("assurance") or {}).get("claims") or {}).get(
+                "hardware"
+            ) or {}
             receipt_quote_digest = receipt_hardware.get("evidence_digest")
             positive.append((hotkey, units))
         else:
@@ -649,20 +612,10 @@ def verify_and_recompute(
                 receipt_digest=receipt_digest,
                 reason_codes=reasons,
                 receipt_verified=receipt_verified,
-                measurement=(
-                    receipt_measurement
-                    if isinstance(receipt_measurement, str)
-                    else None
-                ),
-                issued_at=(
-                    receipt_issued_at
-                    if isinstance(receipt_issued_at, str)
-                    else None
-                ),
+                measurement=(receipt_measurement if isinstance(receipt_measurement, str) else None),
+                issued_at=(receipt_issued_at if isinstance(receipt_issued_at, str) else None),
                 hardware_evidence_digest=(
-                    receipt_quote_digest
-                    if isinstance(receipt_quote_digest, str)
-                    else None
+                    receipt_quote_digest if isinstance(receipt_quote_digest, str) else None
                 ),
                 work_verified=work_verified,
             )
@@ -725,9 +678,7 @@ def compare_with_vector(
         mine = recomputed.get(hotkey, 0.0)
         theirs = vector_ext.get(hotkey, 0.0)
         if not math.isclose(mine, theirs, rel_tol=0.0, abs_tol=abs_tol):
-            discrepancies.append(
-                f"{hotkey}: recomputed={mine:.9f} signed_vector={theirs:.9f}"
-            )
+            discrepancies.append(f"{hotkey}: recomputed={mine:.9f} signed_vector={theirs:.9f}")
     return (not discrepancies), discrepancies
 
 
@@ -769,9 +720,7 @@ def replay_positive_miners(
         replayed_count += 1
         binding = attestation_bindings.get(miner.hotkey)
         if not isinstance(binding, Mapping):
-            raise ProvenanceError(
-                f"manifest carries no attestation binding for {miner.hotkey!r}"
-            )
+            raise ProvenanceError(f"manifest carries no attestation binding for {miner.hotkey!r}")
         envelope_digest = binding.get("envelope_digest")
         evidence_digest = binding.get("evidence_digest")
         if not isinstance(envelope_digest, str) or not envelope_digest:
@@ -786,8 +735,7 @@ def replay_positive_miners(
         challenge_digest = binding.get("challenge_digest")
         if not isinstance(challenge_digest, str) or not challenge_digest:
             raise ProvenanceError(
-                f"no committed challenge randomness for {miner.hotkey!r}; "
-                "freshness is NOT PROVEN"
+                f"no committed challenge randomness for {miner.hotkey!r}; freshness is NOT PROVEN"
             )
         if challenge_anchor is None:
             raise ProvenanceError(
@@ -811,9 +759,7 @@ def replay_positive_miners(
             )
         envelope = envelopes_by_hotkey.get(miner.hotkey)
         if envelope is None:
-            raise ProvenanceError(
-                f"controlled envelope for {miner.hotkey!r} was not provided"
-            )
+            raise ProvenanceError(f"controlled envelope for {miner.hotkey!r} was not provided")
         if miner.measurement is None or miner.issued_at is None:
             raise ProvenanceError(
                 f"receipt for {miner.hotkey!r} lacks measurement/issue-time bindings"
@@ -833,13 +779,11 @@ def replay_positive_miners(
                 "valid quote plus a signer-asserted work claim never reaches FULL"
             )
         try:
-            issued_at = datetime.strptime(
-                miner.issued_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-            ).replace(tzinfo=UTC)
+            issued_at = datetime.strptime(miner.issued_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=UTC
+            )
         except ValueError as exc:
-            raise ProvenanceError(
-                f"receipt issue time for {miner.hotkey!r} is malformed"
-            ) from exc
+            raise ProvenanceError(f"receipt issue time for {miner.hotkey!r} is malformed") from exc
         if epoch_generated_at is not None:
             epoch_moment = _parse_utc(epoch_generated_at, "manifest generated_at")
             age = abs((epoch_moment - issued_at).total_seconds())
@@ -863,9 +807,7 @@ def replay_positive_miners(
 
             remaining = deadline_monotonic - time_module.monotonic()
             if remaining <= 0:
-                raise ProvenanceError(
-                    "command deadline exhausted before raw-evidence replay"
-                )
+                raise ProvenanceError("command deadline exhausted before raw-evidence replay")
             timeout_override = remaining
         try:
             replay_evidence(

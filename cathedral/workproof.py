@@ -21,6 +21,7 @@ work-item canonicalization and the work-claim evidence material
 (``assigned_hotkey``/``assignment``/``challenge_id``/``satisfiable``/
 ``work_units``, sorted compact ASCII JSON).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -58,9 +59,7 @@ def _strict_canonical_json(data: bytes, label: str) -> dict[str, Any]:
         document = json.loads(
             data.decode("ascii"),
             object_pairs_hook=_no_duplicates,
-            parse_constant=lambda _v: (_ for _ in ()).throw(
-                ValueError(f"non-finite {label} JSON")
-            ),
+            parse_constant=lambda _v: (_ for _ in ()).throw(ValueError(f"non-finite {label} JSON")),
         )
     except (ValueError, UnicodeDecodeError) as exc:
         raise WorkProofError(f"{label} is not strict ASCII JSON: {exc}") from exc
@@ -86,13 +85,9 @@ def verify_work_artifacts(
 ) -> None:
     """Independently replay one receipt's SAT work from published bytes."""
     if _digest(work_item_bytes) != expected_manifest_digest:
-        raise WorkProofError(
-            "work-item bytes do not match the receipt's signed manifest digest"
-        )
+        raise WorkProofError("work-item bytes do not match the receipt's signed manifest digest")
     if _digest(result_bytes) != expected_result_digest:
-        raise WorkProofError(
-            "result bytes do not match the receipt's signed result digest"
-        )
+        raise WorkProofError("result bytes do not match the receipt's signed result digest")
 
     item = _strict_canonical_json(work_item_bytes, "work item")
     if frozenset(item) != {"schema", "challenge_id", "seed", "instance"}:
@@ -100,9 +95,7 @@ def verify_work_artifacts(
     if item["schema"] != WORK_ITEM_SCHEMA:
         raise WorkProofError("work item schema is unsupported")
     if item["challenge_id"] != expected_challenge_id:
-        raise WorkProofError(
-            "work item challenge does not match the receipt's challenge binding"
-        )
+        raise WorkProofError("work item challenge does not match the receipt's challenge binding")
     instance = item["instance"]
     if not isinstance(instance, dict) or frozenset(instance) != {"n_vars", "clauses"}:
         raise WorkProofError("work item instance is malformed")
@@ -140,26 +133,19 @@ def verify_work_artifacts(
     }:
         raise WorkProofError("work result has missing or unknown fields")
     if result["challenge_id"] != expected_challenge_id:
-        raise WorkProofError(
-            "work result challenge does not match the receipt's challenge binding"
-        )
+        raise WorkProofError("work result challenge does not match the receipt's challenge binding")
     if result["assigned_hotkey"] != expected_hotkey:
         raise WorkProofError(
             "work result is assigned to a different hotkey than the receipt subject"
         )
     if result["satisfiable"] is not True:
-        raise WorkProofError(
-            "only satisfiable certificates with checkable witnesses can earn"
-        )
+        raise WorkProofError("only satisfiable certificates with checkable witnesses can earn")
 
     assignment = result["assignment"]
     if (
         not isinstance(assignment, list)
         or len(assignment) != n_vars
-        or any(
-            isinstance(literal, bool) or not isinstance(literal, int)
-            for literal in assignment
-        )
+        or any(isinstance(literal, bool) or not isinstance(literal, int) for literal in assignment)
     ):
         raise WorkProofError("work result assignment is malformed")
     # Exactly-once variable coverage with a single sign: a contradictory
@@ -183,9 +169,7 @@ def verify_work_artifacts(
     # The raw certificate's units are the MINER's claim - bound into the
     # result digest for auditability but never trusted. Only shape-check it;
     # the value that earns is the validator re-derivation below.
-    if isinstance(certificate_units, bool) or not isinstance(
-        certificate_units, (int, float)
-    ):
+    if isinstance(certificate_units, bool) or not isinstance(certificate_units, (int, float)):
         raise WorkProofError("work result units are malformed")
     if expected_units != derived_units:
         raise WorkProofError(

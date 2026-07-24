@@ -18,6 +18,7 @@ The launch evidence model has two tiers:
 
 Nothing in this module performs network I/O; callers move bytes.
 """
+
 from __future__ import annotations
 
 import base64
@@ -158,6 +159,7 @@ def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644) -> None:
 # Store
 # ---------------------------------------------------------------------------
 
+
 class EvidenceStore:
     """Append-only content-addressed public evidence directory.
 
@@ -185,9 +187,7 @@ class EvidenceStore:
         if path.exists():
             existing = path.read_bytes()
             if digest_bytes(existing) != digest or existing != data:
-                raise EvidenceError(
-                    f"blob collision: {digest} exists with different content"
-                )
+                raise EvidenceError(f"blob collision: {digest} exists with different content")
             return digest
         _atomic_write(path, data)
         return digest
@@ -304,9 +304,7 @@ class EvidenceStore:
                         "high-water (corrupt-index recovery must not roll back)"
                     )
                 if new_latest[0] == highwater[0] and new_latest[1] != highwater[1]:
-                    raise EvidenceError(
-                        "refusing to equivocate the durable high-water manifest"
-                    )
+                    raise EvidenceError("refusing to equivocate the durable high-water manifest")
             current = self._store.read_index()
             if current is not None and current != index_bytes:
                 current_latest = self._latest_of(current)
@@ -314,16 +312,10 @@ class EvidenceStore:
                 if current_latest is not None and new_latest is not None:
                     if new_latest[0] < current_latest[0]:
                         raise EvidenceError(
-                            "refusing to publish an index whose latest epoch "
-                            "moves backwards"
+                            "refusing to publish an index whose latest epoch moves backwards"
                         )
-                    if (
-                        new_latest[0] == current_latest[0]
-                        and new_latest[1] != current_latest[1]
-                    ):
-                        raise EvidenceError(
-                            "refusing to equivocate the index latest manifest"
-                        )
+                    if new_latest[0] == current_latest[0] and new_latest[1] != current_latest[1]:
+                        raise EvidenceError("refusing to equivocate the index latest manifest")
             _atomic_write(self._store.root / "index.json", index_bytes)
             _atomic_write(
                 self._highwater_path(),
@@ -345,6 +337,7 @@ class EvidenceStore:
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
+
 
 def build_manifest(
     *,
@@ -442,8 +435,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         raise EvidenceError("evidence manifest reward_mechanism is invalid")
     source_revision = document["source_revision"]
     if source_revision is not None and (
-        not isinstance(source_revision, str)
-        or not re.fullmatch(r"[0-9a-f]{7,64}", source_revision)
+        not isinstance(source_revision, str) or not re.fullmatch(r"[0-9a-f]{7,64}", source_revision)
     ):
         raise EvidenceError("evidence manifest source_revision is invalid")
     registry = document["policy_registry"]
@@ -501,8 +493,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     for row in receipts:
         if (
             not isinstance(row, Mapping)
-            or set(row)
-            != {"receipt_id", "hotkey", "blob", "work_item_blob", "result_blob"}
+            or set(row) != {"receipt_id", "hotkey", "blob", "work_item_blob", "result_blob"}
             or not isinstance(row["receipt_id"], str)
             or not row["receipt_id"].startswith("receipt-sha256:")
             or not isinstance(row["hotkey"], str)
@@ -552,9 +543,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     if isinstance(block, bool) or not isinstance(block, int) or block < 0:
         raise EvidenceError("evidence manifest candidate block is invalid")
     block_hash = candidate_set["block_hash"]
-    if not isinstance(block_hash, str) or not re.fullmatch(
-        r"(0x)?[0-9a-f]{64}", block_hash
-    ):
+    if not isinstance(block_hash, str) or not re.fullmatch(r"(0x)?[0-9a-f]{64}", block_hash):
         raise EvidenceError("evidence manifest candidate block hash is invalid")
     candidates = candidate_set["candidates"]
     if not isinstance(candidates, list) or len(candidates) > 4096:
@@ -575,9 +564,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
             raise EvidenceError("evidence manifest duplicates a candidate")
         seen_candidates.add(row["hotkey"])
     wire = document["wire_report_sha256"]
-    if wire is not None and (
-        not isinstance(wire, str) or not re.fullmatch(r"[0-9a-f]{64}", wire)
-    ):
+    if wire is not None and (not isinstance(wire, str) or not re.fullmatch(r"[0-9a-f]{64}", wire)):
         raise EvidenceError("evidence manifest wire_report_sha256 is invalid")
 
 
@@ -595,6 +582,7 @@ def parse_manifest(manifest_bytes: bytes) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Signed index
 # ---------------------------------------------------------------------------
+
 
 def build_signed_index(
     *,
@@ -685,15 +673,11 @@ def verify_index(
     except (InvalidSignature, ValueError) as exc:
         raise EvidenceError("evidence index signature is invalid") from exc
 
-    generated_at = _parse_manifest_time(
-        document["generated_at"], "evidence index generated_at"
-    )
+    generated_at = _parse_manifest_time(document["generated_at"], "evidence index generated_at")
     moment = now if now is not None else datetime.now(UTC)
     if generated_at > moment:
         raise EvidenceError("evidence index generated_at is in the future")
-    if max_age_seconds is not None and (
-        (moment - generated_at).total_seconds() > max_age_seconds
-    ):
+    if max_age_seconds is not None and ((moment - generated_at).total_seconds() > max_age_seconds):
         raise EvidenceError("evidence index is stale")
     latest = document["latest"]
     if (
@@ -726,9 +710,7 @@ def verify_index(
         if row["manifest"] in seen_manifests:
             raise EvidenceError("evidence index duplicates a manifest digest")
         if epoch >= previous_epoch:
-            raise EvidenceError(
-                "evidence index recent epochs must strictly decrease from latest"
-            )
+            raise EvidenceError("evidence index recent epochs must strictly decrease from latest")
         seen_epochs.add(epoch)
         seen_manifests.add(str(row["manifest"]))
         previous_epoch = epoch
@@ -738,6 +720,7 @@ def verify_index(
 # ---------------------------------------------------------------------------
 # Controlled-disclosure retention
 # ---------------------------------------------------------------------------
+
 
 class RetentionStore:
     """Root-only retention for raw quotes/collateral (controlled disclosure).
@@ -776,9 +759,7 @@ class RetentionStore:
                 or metadata.st_mode & 0o077
                 or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
             ):
-                raise EvidenceError(
-                    f"retained blob {digest} is unsafe on disk (mode/owner/type)"
-                )
+                raise EvidenceError(f"retained blob {digest} is unsafe on disk (mode/owner/type)")
             if digest_bytes(path.read_bytes()) != digest:
                 raise EvidenceError(f"retained blob {digest} is corrupt on disk")
         else:

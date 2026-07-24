@@ -299,7 +299,9 @@ def cmd_work_submit(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
         )
         queued = ledger.customer_job_counts()["queued"]
-    print(f"submitted {job.job_id} (n_vars={item.instance.n_vars}, seed={item.seed}); queued={queued}")
+    print(
+        f"submitted {job.job_id} (n_vars={item.instance.n_vars}, seed={item.seed}); queued={queued}"
+    )
     return 0
 
 
@@ -1036,9 +1038,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
-            tls_context.load_cert_chain(
-                certfile=str(certificate_path), keyfile=str(key_path)
-            )
+            tls_context.load_cert_chain(certfile=str(certificate_path), keyfile=str(key_path))
         except (OSError, ssl.SSLError) as exc:
             raise ValueError("worker TLS certificate or private key could not be loaded") from exc
     if not getattr(args, "development_no_auth", False) and channel_binding is None:
@@ -1285,9 +1285,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         report_bytes = bytes(export["report_body"])
         report = json.loads(report_bytes)
 
-        registry_bytes = _read_bounded_registry_file(
-            args.policy_registry, "policy registry"
-        )
+        registry_bytes = _read_bounded_registry_file(args.policy_registry, "policy registry")
         registry_document = parse_registry_json(registry_bytes)
         registry_release = registry_document.get("release")
         registry_digest = "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
@@ -1296,9 +1294,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 "signed report policy_digest does not match the supplied registry file"
             )
         if report.get("verifier_digest") != args.verifier_digest:
-            raise ValueError(
-                "signed report verifier_digest does not match --verifier-digest"
-            )
+            raise ValueError("signed report verifier_digest does not match --verifier-digest")
 
         snapshot = ledger.score_class_snapshot(epoch_id)
         receipts_by_id: dict[str, bytes] = {}
@@ -1371,14 +1367,10 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 "verdict": str(row["verdict"]),
                 "evidence_digest": _normalized_digest(row["evidence_digest"]),
                 "envelope_digest": (
-                    str(row["envelope_digest"])
-                    if row["envelope_digest"] is not None
-                    else None
+                    str(row["envelope_digest"]) if row["envelope_digest"] is not None else None
                 ),
                 "challenge_digest": (
-                    str(row["challenge_digest"])
-                    if row["challenge_digest"] is not None
-                    else None
+                    str(row["challenge_digest"]) if row["challenge_digest"] is not None else None
                 ),
                 "disclosure": "controlled",
             }
@@ -1425,8 +1417,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             )
         if sorted(report_binding.get("hotkeys") or []) != snapshot_binding["hotkeys"]:
             raise ValueError(
-                "candidate snapshot hotkeys do not match the signed report's "
-                "bound hotkey set"
+                "candidate snapshot hotkeys do not match the signed report's bound hotkey set"
             )
         epoch_anchor = ledger.epoch_challenge_anchor(epoch_id)
         if epoch_anchor is not None and (
@@ -1434,8 +1425,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             str(epoch_anchor["block_hash"]),
         ) != (snapshot_binding["block"], snapshot_binding["block_hash"]):
             raise ValueError(
-                "candidate snapshot block/hash does not match the epoch's "
-                "durable challenge anchor"
+                "candidate snapshot block/hash does not match the epoch's durable challenge anchor"
             )
         if epoch_anchor is None and not args.development:
             raise ValueError(
@@ -1450,8 +1440,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         unregistered = set(row_outcomes) - registered
         if unregistered:
             raise ValueError(
-                f"scored hotkeys are not registered at the anchored block: "
-                f"{sorted(unregistered)}"
+                f"scored hotkeys are not registered at the anchored block: {sorted(unregistered)}"
             )
         # EVERY registered hotkey at the anchored snapshot is accounted for:
         # verified with evidence, or rejected/no-verified-work. Only hotkeys
@@ -1658,9 +1647,7 @@ def _verify_wire_vector(
     if not isinstance(signature_b64, str) or not signature_b64.strip():
         raise ValueError("weight vector is missing its signature")
     body = {key: value for key, value in payload.items() if key != "signature"}
-    canonical = json.dumps(
-        body, sort_keys=True, separators=(",", ":"), default=str
-    ).encode("utf-8")
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     try:
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex.strip())).verify(
             base64.b64decode(signature_b64, validate=True), canonical
@@ -1766,9 +1753,7 @@ def _getaddrinfo_bounded(host: str, port: int, timeout: float) -> list:
     def _resolve() -> None:
         try:
             try:
-                channel.put(
-                    ("ok", _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP))
-                )
+                channel.put(("ok", _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP)))
             except OSError as exc:
                 channel.put(("err", exc))
         finally:
@@ -1777,9 +1762,7 @@ def _getaddrinfo_bounded(host: str, port: int, timeout: float) -> list:
             slots.release()
 
     try:
-        worker = _threading.Thread(
-            target=_resolve, name="cathedral-dns", daemon=True
-        )
+        worker = _threading.Thread(target=_resolve, name="cathedral-dns", daemon=True)
         worker.start()
     except BaseException:
         slots.release()  # the worker never ran; do not leak the slot
@@ -1787,16 +1770,17 @@ def _getaddrinfo_bounded(host: str, port: int, timeout: float) -> list:
     try:
         kind, value = channel.get(timeout=max(0.0, timeout))
     except _queue.Empty:
-        raise ValueError(
-            f"DNS resolution for {host} exceeded the command deadline"
-        ) from None
+        raise ValueError(f"DNS resolution for {host} exceeded the command deadline") from None
     if kind == "err":
         raise ValueError(f"evidence host does not resolve: {host}") from value
     return value
 
 
 def _resolved_public_address(
-    host: str, port: int, *, allow_private: bool,
+    host: str,
+    port: int,
+    *,
+    allow_private: bool,
     budget: _FetchBudget | None = None,
 ) -> tuple[str, int]:
     """Resolve once, validate the address policy, and return the EXACT peer
@@ -1817,9 +1801,7 @@ def _resolved_public_address(
             or address.is_multicast
             or address.is_unspecified
         ):
-            raise ValueError(
-                f"evidence host resolves to a non-public address: {host}"
-            )
+            raise ValueError(f"evidence host resolves to a non-public address: {host}")
     return infos[0][4][0], port
 
 
@@ -1916,9 +1898,7 @@ def _strict_json_object(data: bytes, label: str) -> dict:
     document = json.loads(
         data.decode("utf-8"),
         object_pairs_hook=_no_duplicates,
-        parse_constant=lambda _v: (_ for _ in ()).throw(
-            ValueError(f"non-finite {label} JSON")
-        ),
+        parse_constant=lambda _v: (_ for _ in ()).throw(ValueError(f"non-finite {label} JSON")),
     )
     if not isinstance(document, dict):
         raise ValueError(f"{label} is not a JSON object")  # noqa: TRY004 - intentional fail-closed/UTC-text semantics
@@ -1981,14 +1961,10 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
         epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
         epoch_row = ledger.get_epoch(epoch_id)
         if epoch_row is None or epoch_row["status"] != "published":
-            raise ValueError(
-                f"epoch {epoch_id} is not published/frozen; refusing disclosure"
-            )
+            raise ValueError(f"epoch {epoch_id} is not published/frozen; refusing disclosure")
         snapshot = ledger.score_class_snapshot(epoch_id)
         rows = [
-            row
-            for row in ledger.attestation_rows(epoch_id)
-            if row["envelope_digest"] is not None
+            row for row in ledger.attestation_rows(epoch_id) if row["envelope_digest"] is not None
         ]
         if not rows:
             raise ValueError(f"epoch {epoch_id} has no retained envelopes to disclose")
@@ -2047,14 +2023,10 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
                 or root_stat.st_mode & 0o077
                 or (hasattr(os, "geteuid") and root_stat.st_uid != os.geteuid())
             ):
-                raise ValueError(
-                    "existing controlled output directory is unsafe; refusing"
-                )
+                raise ValueError("existing controlled output directory is unsafe; refusing")
             existing = out_root / "controlled-manifest.json"
             if not existing.is_file() or existing.read_text() != manifest_text:
-                raise ValueError(
-                    "controlled output path exists with different content; refusing"
-                )
+                raise ValueError("controlled output path exists with different content; refusing")
             for digest, data, _entry in envelopes:
                 candidate = out_root / f"{digest.split(':', 1)[1]}.json"
                 file_stat = os.lstat(candidate) if os.path.lexists(candidate) else None
@@ -2083,9 +2055,7 @@ def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
             )
             return 0
 
-        staging = tempfile_module.mkdtemp(
-            prefix=f".controlled.{epoch_id}.", dir=parent
-        )
+        staging = tempfile_module.mkdtemp(prefix=f".controlled.{epoch_id}.", dir=parent)
         os.chmod(staging, 0o700)
         for digest, data, _entry in envelopes:
             target = Path(staging) / f"{digest.split(':', 1)[1]}.json"
@@ -2164,31 +2134,20 @@ def _reserve_fences(
         if isinstance(stored_epoch, int):
             if index_epoch < stored_epoch:
                 raise ValueError(
-                    f"index rollback: epoch {index_epoch} < reserved "
-                    f"high-water {stored_epoch}"
+                    f"index rollback: epoch {index_epoch} < reserved high-water {stored_epoch}"
                 )
-            if (
-                index_epoch == stored_epoch
-                and current.get("index_manifest") != index_manifest
-            ):
+            if index_epoch == stored_epoch and current.get("index_manifest") != index_manifest:
                 raise ValueError(
-                    "index equivocation: same epoch reserved with a different "
-                    "manifest"
+                    "index equivocation: same epoch reserved with a different manifest"
                 )
         stored_release = current.get("policy_release")
         if isinstance(stored_release, int):
             if policy_release < stored_release:
                 raise ValueError(
-                    f"policy rollback: release {policy_release} < reserved "
-                    f"{stored_release}"
+                    f"policy rollback: release {policy_release} < reserved {stored_release}"
                 )
-            if (
-                policy_release == stored_release
-                and current.get("policy_digest") != policy_digest
-            ):
-                raise ValueError(
-                    "policy equivocation: same release, different digest"
-                )
+            if policy_release == stored_release and current.get("policy_digest") != policy_digest:
+                raise ValueError("policy equivocation: same release, different digest")
         stored_report = current.get("report_id")
         stored_source = current.get("report_source_epoch")
         if (
@@ -2201,13 +2160,10 @@ def _reserve_fences(
         if isinstance(stored_source, int):
             if source_epoch < stored_source:
                 raise ValueError(
-                    f"report rollback: source epoch {source_epoch} < reserved "
-                    f"{stored_source}"
+                    f"report rollback: source epoch {source_epoch} < reserved {stored_source}"
                 )
             if source_epoch == stored_source and stored_report != report_id:
-                raise ValueError(
-                    "report equivocation: same source epoch, different report"
-                )
+                raise ValueError("report equivocation: same source epoch, different report")
 
         current.update(
             {
@@ -2332,13 +2288,10 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             ]
             if missing:
                 raise ValueError(
-                    "production verification requires independent pins: "
-                    + ", ".join(missing)
+                    "production verification requires independent pins: " + ", ".join(missing)
                 )
         started = time_mod.monotonic()
-        index_keys = _load_evidence_keyfile(
-            args.index_keys, args.index_keys_digest, "index keys"
-        )
+        index_keys = _load_evidence_keyfile(args.index_keys, args.index_keys_digest, "index keys")
         index_document = verify_index(
             load_index_bytes(),
             index_keys,
@@ -2366,9 +2319,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                     manifest_digest = row["manifest"]
                     break
             if manifest_digest is None:
-                raise EvidenceError(
-                    f"source epoch {wanted} is not present in the evidence index"
-                )
+                raise EvidenceError(f"source epoch {wanted} is not present in the evidence index")
         else:
             manifest_digest = index_document["latest"]["manifest"]
 
@@ -2377,17 +2328,13 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         if manifest["network"] != args.network or manifest["netuid"] != args.netuid:
             raise EvidenceError("evidence manifest network/netuid mismatch")
         if args.source_epoch is None:
-            if int(manifest["source_epoch"]) != int(
-                index_document["latest"]["source_epoch"]
-            ):
+            if int(manifest["source_epoch"]) != int(index_document["latest"]["source_epoch"]):
                 raise EvidenceError(
-                    "index latest.source_epoch does not match the manifest it "
-                    "points to"
+                    "index latest.source_epoch does not match the manifest it points to"
                 )
         elif int(manifest["source_epoch"]) != int(args.source_epoch):
             raise EvidenceError(
-                "selected historical index row does not match its manifest's "
-                "source epoch"
+                "selected historical index row does not match its manifest's source epoch"
             )
 
         # Durable anti-rollback fences: a signed-but-older index or a
@@ -2407,12 +2354,11 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                         f"index rollback: latest epoch {new_epoch} < recorded "
                         f"high-water {last_epoch}"
                     )
-                if new_epoch == last_epoch and index_document["latest"][
-                    "manifest"
-                ] != last_manifest:
-                    raise EvidenceError(
-                        "index equivocation: same epoch, different manifest"
-                    )
+                if (
+                    new_epoch == last_epoch
+                    and index_document["latest"]["manifest"] != last_manifest
+                ):
+                    raise EvidenceError("index equivocation: same epoch, different manifest")
         if manifest["reward_mechanism"]["id"] != args.mechanism:
             raise EvidenceError(
                 "manifest reward mechanism "
@@ -2450,9 +2396,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             args.report_keys, args.report_keys_digest, "report keys"
         )
         report_bytes = load_blob(manifest["score_report"]["blob"])
-        receipts_by_id = {
-            row["receipt_id"]: load_blob(row["blob"]) for row in manifest["receipts"]
-        }
+        receipts_by_id = {row["receipt_id"]: load_blob(row["blob"]) for row in manifest["receipts"]}
         work_artifacts_by_receipt = {
             row["receipt_id"]: (
                 load_blob(row["work_item_blob"]),
@@ -2482,58 +2426,41 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             registry_max_age_seconds=args.registry_max_age_secs,
             work_artifacts_by_receipt=work_artifacts_by_receipt,
             candidate_set=manifest["candidate_set"],
-            current_block=(
-                int(args.current_block) if args.current_block is not None else None
-            ),
+            current_block=(int(args.current_block) if args.current_block is not None else None),
         )
         if result.policy_release != manifest["policy_registry"]["release"]:
             raise EvidenceError("verified registry release differs from the manifest")
         if result.report_id != manifest["score_report"]["report_id"]:
             raise EvidenceError("verified report id differs from the manifest")
         if int(result.source_epoch) != int(manifest["source_epoch"]):
-            raise EvidenceError(
-                "verified report source epoch differs from the manifest"
-            )
+            raise EvidenceError("verified report source epoch differs from the manifest")
         pinned_revision = getattr(args, "source_revision", None)
         if pinned_revision and manifest["source_revision"] != pinned_revision:
-            raise EvidenceError(
-                "manifest source revision does not match the operator's pin"
-            )
+            raise EvidenceError("manifest source revision does not match the operator's pin")
 
         # ---- FULL assurance: raw-evidence replay through the pinned verifier.
         controlled_dir = getattr(args, "controlled_dir", None)
         if controlled_dir:
             from cathedral import provenance as provenance_module
 
-            bindings = {
-                row["hotkey"]: row for row in manifest["attestations"]
-            }
+            bindings = {row["hotkey"]: row for row in manifest["attestations"]}
             envelopes: dict[str, bytes] = {}
             for miner in result.miners:
                 if not miner.receipt_verified:
                     continue
                 binding = bindings.get(miner.hotkey)
-                envelope_digest = (
-                    binding.get("envelope_digest") if binding else None
-                )
+                envelope_digest = binding.get("envelope_digest") if binding else None
                 if not envelope_digest:
-                    raise EvidenceError(
-                        f"no controlled envelope binding for {miner.hotkey!r}"
-                    )
+                    raise EvidenceError(f"no controlled envelope binding for {miner.hotkey!r}")
                 envelope_path = (
-                    Path(controlled_dir)
-                    / f"{str(envelope_digest).split(':', 1)[1]}.json"
+                    Path(controlled_dir) / f"{str(envelope_digest).split(':', 1)[1]}.json"
                 )
                 if envelope_path.is_symlink() or not envelope_path.is_file():
-                    raise EvidenceError(
-                        f"controlled envelope file missing for {miner.hotkey!r}"
-                    )
+                    raise EvidenceError(f"controlled envelope file missing for {miner.hotkey!r}")
                 envelopes[miner.hotkey] = envelope_path.read_bytes()
             verifier_info = manifest["verifier"]
             if not verifier_info["binary_blob"] or not verifier_info["command"]:
-                raise EvidenceError(
-                    "manifest lacks verifier binary/command bindings for full mode"
-                )
+                raise EvidenceError("manifest lacks verifier binary/command bindings for full mode")
             if getattr(args, "verifier_binary", None):
                 binary_path = Path(args.verifier_binary)
                 if binary_path.stat().st_size > MAX_VERIFIER_FETCH_BYTES:
@@ -2556,9 +2483,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 verifier_binary=verifier_bytes,
                 verifier_blob_digest=verifier_info["binary_blob"],
                 verifier_command=tuple(verifier_info["command"]),
-                verifier_artifacts=tuple(
-                    verifier_info["artifacts"] or verifier_info["command"]
-                ),
+                verifier_artifacts=tuple(verifier_info["artifacts"] or verifier_info["command"]),
                 epoch_generated_at=manifest["generated_at"],
                 deadline_monotonic=command_budget.deadline,
             )
@@ -3046,14 +2971,17 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--ledger-db", required=True)
         command.add_argument("--measurements-file")
         command.add_argument(
-            "--challenge-anchor-block", type=int, default=None,
+            "--challenge-anchor-block",
+            type=int,
+            default=None,
             help="finalized SN39 block number anchoring this epoch's derived "
-                 "challenge nonces (REQUIRED for production CPU scoring)",
+            "challenge nonces (REQUIRED for production CPU scoring)",
         )
         command.add_argument(
-            "--challenge-anchor-hash", default=None,
+            "--challenge-anchor-hash",
+            default=None,
             help="hash of the finalized anchor block; nonces derive from it "
-                 "under the cathedral-tdx-challenge-v1 domain",
+            "under the cathedral-tdx-challenge-v1 domain",
         )
         command.add_argument(
             "--evidence-retention-dir",
@@ -3174,9 +3102,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-snapshot",
         required=True,
         help="cathedral_candidate_snapshot_v1 JSON captured from finalized "
-             "chain state; its digest, block, hash, and full sorted hotkey "
-             "set are bound into the signed report and must match the "
-             "epoch's durable challenge anchor",
+        "chain state; its digest, block, hash, and full sorted hotkey "
+        "set are bound into the signed report and must match the "
+        "epoch's durable challenge anchor",
     )
     p_export_class.add_argument("--policy-digest")
     p_export_class.add_argument("--previous-report-id")
@@ -3210,8 +3138,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_evidence.add_argument(
         "--verifier-production-path",
         help="the absolute production install path of the pinned verifier "
-             "(published so external validators can recompute the "
-             "implementation digest from the binary blob)",
+        "(published so external validators can recompute the "
+        "implementation digest from the binary blob)",
     )
     p_export_evidence.add_argument("--mechanism", default="validated_supply_v1")
     p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
@@ -3220,8 +3148,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-snapshot",
         required=True,
         help="cathedral_candidate_snapshot_v1 JSON: the anchored SN39 "
-             "metagraph (network/netuid/block/block_hash/hotkeys) the epoch "
-             "loop observed; every registered hotkey is accounted for",
+        "metagraph (network/netuid/block/block_hash/hotkeys) the epoch "
+        "loop observed; every registered hotkey is accounted for",
     )
     p_export_evidence.add_argument("--index-signing-key-id", required=True)
     p_export_evidence.add_argument("--index-signing-key-file", required=True)
@@ -3317,29 +3245,38 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--evidence-dir", help="local evidence store directory")
     p_prov_verify.add_argument("--network", default="finney")
     p_prov_verify.add_argument("--netuid", type=int, default=39)
-    p_prov_verify.add_argument("--registry-keys", required=True,
-                               help="trusted policy-registry key file (key_id -> base64)")
-    p_prov_verify.add_argument("--registry-keys-digest",
-                               help="pinned sha256:<hex> of the registry key file")
-    p_prov_verify.add_argument("--report-keys", required=True,
-                               help="trusted score-report key file (key_id -> base64)")
+    p_prov_verify.add_argument(
+        "--registry-keys", required=True, help="trusted policy-registry key file (key_id -> base64)"
+    )
+    p_prov_verify.add_argument(
+        "--registry-keys-digest", help="pinned sha256:<hex> of the registry key file"
+    )
+    p_prov_verify.add_argument(
+        "--report-keys", required=True, help="trusted score-report key file (key_id -> base64)"
+    )
     p_prov_verify.add_argument("--report-keys-digest")
-    p_prov_verify.add_argument("--index-keys", required=True,
-                               help="trusted evidence-index key file (key_id -> base64)")
+    p_prov_verify.add_argument(
+        "--index-keys", required=True, help="trusted evidence-index key file (key_id -> base64)"
+    )
     p_prov_verify.add_argument("--index-keys-digest")
-    p_prov_verify.add_argument("--verifier-digest", required=True,
-                               help="pinned TDX verifier implementation digest")
+    p_prov_verify.add_argument(
+        "--verifier-digest", required=True, help="pinned TDX verifier implementation digest"
+    )
     p_prov_verify.add_argument("--mechanism", default="validated_supply_v1")
-    p_prov_verify.add_argument("--source-epoch", type=int,
-                               help="verify a specific epoch (default: index latest)")
+    p_prov_verify.add_argument(
+        "--source-epoch", type=int, help="verify a specific epoch (default: index latest)"
+    )
     p_prov_verify.add_argument("--index-max-age-secs", type=float, default=3600.0)
     p_prov_verify.add_argument(
-        "--registry-max-age-secs", type=int, default=86400,
+        "--registry-max-age-secs",
+        type=int,
+        default=86400,
         help="reject a registry whose publication (generated_at) is older "
-             "than this many seconds (default 24 hours, fail closed)",
+        "than this many seconds (default 24 hours, fail closed)",
     )
-    p_prov_verify.add_argument("--publisher-url",
-                               help="also fetch Cathedral's signed vector and compare")
+    p_prov_verify.add_argument(
+        "--publisher-url", help="also fetch Cathedral's signed vector and compare"
+    )
     p_prov_verify.add_argument(
         "--weight-policy-public-key-hex",
         default=os.environ.get("CATHEDRAL_WEIGHT_POLICY_PUBLIC_KEY", ""),
@@ -3355,17 +3292,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov_verify.add_argument(
         "--controlled-dir",
         help="controlled-disclosure envelope directory; enables FULL assurance "
-             "(raw-evidence replay through the pinned verifier)",
+        "(raw-evidence replay through the pinned verifier)",
     )
     p_prov_verify.add_argument(
         "--verifier-binary",
         help="local verifier binary (must match the manifest's binary blob "
-             "digest); default: fetched from the evidence store",
+        "digest); default: fetched from the evidence store",
     )
     p_prov_verify.add_argument(
         "--source-revision",
         help="independent pin of the expected source revision; the manifest "
-             "must match (never self-authorized)",
+        "must match (never self-authorized)",
     )
     p_prov_verify.add_argument(
         "--production",
@@ -3376,21 +3313,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-receipts-only",
         action="store_true",
         help="exit 0 for a receipts-only chain; the result is still recorded "
-             "and logged as NOT_PROVEN, never as full provenance",
+        "and logged as NOT_PROVEN, never as full provenance",
     )
     p_prov_verify.add_argument(
         "--current-block",
         type=int,
         help="trusted current finalized SN39 block (REQUIRED in production); "
-             "the report's valid_from_block..valid_until_block window is "
-             "enforced against it",
+        "the report's valid_from_block..valid_until_block window is "
+        "enforced against it",
     )
     p_prov_verify.add_argument(
         "--fetch-deadline-secs",
         type=float,
         default=DEFAULT_COMMAND_DEADLINE_SECONDS,
-        help="one command-wide wall-clock budget covering DNS, connect, TLS, "
-             "and every blob read",
+        help="one command-wide wall-clock budget covering DNS, connect, TLS, and every blob read",
     )
     p_prov_verify.add_argument(
         "--allow-private-evidence-host",

@@ -40,13 +40,13 @@ def _digest(data: bytes) -> str:
 
 
 def _verify(item_bytes: bytes, result_bytes: bytes, **overrides) -> None:
-    arguments = dict(
-        expected_manifest_digest=_digest(item_bytes),
-        expected_result_digest=_digest(result_bytes),
-        expected_challenge_id=CHALLENGE,
-        expected_hotkey=HOTKEY,
-        expected_units=Decimal(20),
-    )
+    arguments = {
+        "expected_manifest_digest": _digest(item_bytes),
+        "expected_result_digest": _digest(result_bytes),
+        "expected_challenge_id": CHALLENGE,
+        "expected_hotkey": HOTKEY,
+        "expected_units": Decimal(20),
+    }
     arguments.update(overrides)
     verify_work_artifacts(item_bytes, result_bytes, **arguments)
 
@@ -140,9 +140,9 @@ def test_tampered_units_inside_result_change_the_digest():
     item_bytes, result_bytes = _artifacts()
     document = json.loads(result_bytes)
     document["work_units"] = 1e300
-    forged = json.dumps(
-        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
+    forged = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "ascii"
+    )
     with pytest.raises(WorkProofError, match="result digest"):
         _verify(
             item_bytes,
@@ -160,10 +160,13 @@ def test_challenge_derivation_is_deterministic_and_slot_unique():
         expected_challenge_digest,
     )
 
-    kwargs = dict(
-        block_hash="0x" + "ab" * 32, network="finney", netuid=39,
-        source_epoch=11, miner_hotkey="tdx-miner",
-    )
+    kwargs = {
+        "block_hash": "0x" + "ab" * 32,
+        "network": "finney",
+        "netuid": 39,
+        "source_epoch": 11,
+        "miner_hotkey": "tdx-miner",
+    }
     first = derive_challenge_nonce(**kwargs)
     assert first == derive_challenge_nonce(**kwargs)  # deterministic
     assert len(first) == 32

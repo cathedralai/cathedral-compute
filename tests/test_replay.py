@@ -95,28 +95,28 @@ def _replay(tmp_path: Path, claims: dict, *, wrong_nonce: bool = False, **overri
     blob_digest = "sha256:" + hashlib.sha256(VERIFIER_SCRIPT).hexdigest()
     implementation = "sha256:" + "0" * 64  # authentication is stubbed here
     component = json.loads(envelope)["components"][0]
-    quote_digest = "sha256:" + hashlib.sha256(
-        base64.b64decode(component["quote_base64"])
-    ).hexdigest()
-    challenge_digest = "sha256:" + hashlib.sha256(
-        base64.b64decode(component["nonce_base64"])
-    ).hexdigest()
-    arguments = dict(
-        expected_envelope_digest=envelope_digest,
-        expected_evidence_digest=evidence_digest,
-        expected_hotkey="tdx-miner",
-        expected_measurement=MEASUREMENT,
-        expected_quote_digest=quote_digest,
-        expected_challenge_digest=challenge_digest,
-        verifier_binary=VERIFIER_SCRIPT,
-        verifier_blob_digest=blob_digest,
-        verifier_command=DECLARED,
-        verifier_artifacts=DECLARED,
-        verifier_implementation_digest=implementation,
-        policy=POLICY,
+    quote_digest = (
+        "sha256:" + hashlib.sha256(base64.b64decode(component["quote_base64"])).hexdigest()
     )
+    challenge_digest = (
+        "sha256:" + hashlib.sha256(base64.b64decode(component["nonce_base64"])).hexdigest()
+    )
+    arguments = {
+        "expected_envelope_digest": envelope_digest,
+        "expected_evidence_digest": evidence_digest,
+        "expected_hotkey": "tdx-miner",
+        "expected_measurement": MEASUREMENT,
+        "expected_quote_digest": quote_digest,
+        "expected_challenge_digest": challenge_digest,
+        "verifier_binary": VERIFIER_SCRIPT,
+        "verifier_blob_digest": blob_digest,
+        "verifier_command": DECLARED,
+        "verifier_artifacts": DECLARED,
+        "verifier_implementation_digest": implementation,
+        "policy": POLICY,
+    }
     arguments.update(overrides)
-    import unittest.mock as mock
+    from unittest import mock
 
     with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
         return replay_evidence(envelope, **arguments)
@@ -191,12 +191,9 @@ def test_verifier_binary_pins_are_both_enforced():
     import hashlib
 
     from cathedral.replay import authenticate_verifier_bytes
-    from cathedral.verify import tdx_implementation_digest_from_bytes
 
     elf = _static_elf()
-    implementation = tdx_implementation_digest_from_bytes(
-        DECLARED, DECLARED, {DECLARED[0]: elf}
-    )
+    implementation = tdx_implementation_digest_from_bytes(DECLARED, DECLARED, {DECLARED[0]: elf})
     with pytest.raises(ReplayError, match="pinned content digest"):
         authenticate_verifier_bytes(
             elf + b"\x00trojan",
@@ -221,12 +218,8 @@ def test_verifier_binary_pins_are_both_enforced():
         lambda doc: doc.__setitem__("extra", 1),  # unknown envelope key
         lambda doc: doc["components"][0].__setitem__("composite_jwt", "a.b.c"),
         lambda doc: doc["components"][0].pop("nonce_base64"),
-        lambda doc: doc["components"][0].__setitem__(
-            "cert_chain_base64", [123]
-        ),
-        lambda doc: doc["components"][0].__setitem__(
-            "cert_chain_base64", ["QQ=="] * 9
-        ),
+        lambda doc: doc["components"][0].__setitem__("cert_chain_base64", [123]),
+        lambda doc: doc["components"][0].__setitem__("cert_chain_base64", ["QQ=="] * 9),
     ],
 )
 def test_envelope_parser_rejects_malformed_documents(mutate):
@@ -255,14 +248,11 @@ def test_envelope_parser_rejects_noncanonical_and_duplicate_keys():
             expected_envelope_digest="sha256:" + hashlib.sha256(pretty).hexdigest(),
             expected_evidence_digest=evidence_digest,
         )
-    duplicated = envelope.replace(
-        b'"schema":', b'"schema":"x","schema":', 1
-    )
+    duplicated = envelope.replace(b'"schema":', b'"schema":"x","schema":', 1)
     with pytest.raises(ReplayError, match="strict JSON|duplicate"):
         parse_envelope(
             duplicated,
-            expected_envelope_digest="sha256:"
-            + hashlib.sha256(duplicated).hexdigest(),
+            expected_envelope_digest="sha256:" + hashlib.sha256(duplicated).hexdigest(),
             expected_evidence_digest=evidence_digest,
         )
 
@@ -270,6 +260,7 @@ def test_envelope_parser_rejects_noncanonical_and_duplicate_keys():
 # ---------------------------------------------------------------------------
 # Verifier-bytes authentication: canonical config + static-ELF enforcement
 # ---------------------------------------------------------------------------
+
 
 def _static_elf(*, machine=62, elf_type=2, ptypes=(1,)) -> bytes:
     """Craft a minimal structurally valid static x86-64 ELF64 image."""
@@ -280,7 +271,7 @@ def _static_elf(*, machine=62, elf_type=2, ptypes=(1,)) -> bytes:
     header[:4] = b"\x7fELF"
     header[4:7] = b"\x02\x01\x01"
     struct.pack_into("<HH", header, 16, elf_type, machine)
-    struct.pack_into("<Q", header, 32, 64)          # program header offset
+    struct.pack_into("<Q", header, 32, 64)  # program header offset
     struct.pack_into("<HH", header, 54, 56, count)  # entry size, count
     body = bytearray()
     for ptype in ptypes:
@@ -291,14 +282,12 @@ def _static_elf(*, machine=62, elf_type=2, ptypes=(1,)) -> bytes:
 
 
 def test_verifier_authentication_accepts_a_static_elf():
-    from cathedral.replay import authenticate_verifier_bytes
-    from cathedral.verify import tdx_implementation_digest_from_bytes
     import hashlib
 
+    from cathedral.replay import authenticate_verifier_bytes
+
     elf = _static_elf()
-    implementation = tdx_implementation_digest_from_bytes(
-        DECLARED, DECLARED, {DECLARED[0]: elf}
-    )
+    implementation = tdx_implementation_digest_from_bytes(DECLARED, DECLARED, {DECLARED[0]: elf})
     authenticate_verifier_bytes(
         elf,
         expected_blob_digest="sha256:" + hashlib.sha256(elf).hexdigest(),
@@ -311,21 +300,18 @@ def test_verifier_authentication_accepts_a_static_elf():
 @pytest.mark.parametrize(
     "binary",
     [
-        b"#!/usr/bin/env python3\nprint()",       # script
-        b"",                                        # empty
-        _static_elf(machine=183),                   # aarch64, wrong arch
-        _static_elf(elf_type=3),                    # ET_DYN
-        _static_elf(ptypes=(1, 3)),                 # PT_INTERP
-        _static_elf(ptypes=(2,)),                   # PT_DYNAMIC
+        b"#!/usr/bin/env python3\nprint()",  # script
+        b"",  # empty
+        _static_elf(machine=183),  # aarch64, wrong arch
+        _static_elf(elf_type=3),  # ET_DYN
+        _static_elf(ptypes=(1, 3)),  # PT_INTERP
+        _static_elf(ptypes=(2,)),  # PT_DYNAMIC
     ],
 )
 def test_verifier_authentication_rejects_non_static_elves(binary):
-    from cathedral.verify import tdx_implementation_digest_from_bytes
 
     with pytest.raises(ValueError, match="static x86-64|invalid|empty"):
-        tdx_implementation_digest_from_bytes(
-            DECLARED, DECLARED, {DECLARED[0]: binary}
-        )
+        tdx_implementation_digest_from_bytes(DECLARED, DECLARED, {DECLARED[0]: binary})
 
 
 @pytest.mark.parametrize(
@@ -339,7 +325,6 @@ def test_verifier_authentication_rejects_non_static_elves(binary):
     ],
 )
 def test_verifier_authentication_rejects_bad_configurations(command):
-    from cathedral.verify import tdx_implementation_digest_from_bytes
 
     with pytest.raises(ValueError):
         tdx_implementation_digest_from_bytes(
@@ -353,12 +338,12 @@ def test_full_chain_refuses_a_script_verifier_without_stubs(tmp_path: Path):
     import hashlib
 
     component = json.loads(envelope)["components"][0]
-    quote_digest = "sha256:" + hashlib.sha256(
-        base64.b64decode(component["quote_base64"])
-    ).hexdigest()
-    challenge_digest = "sha256:" + hashlib.sha256(
-        base64.b64decode(component["nonce_base64"])
-    ).hexdigest()
+    quote_digest = (
+        "sha256:" + hashlib.sha256(base64.b64decode(component["quote_base64"])).hexdigest()
+    )
+    challenge_digest = (
+        "sha256:" + hashlib.sha256(base64.b64decode(component["nonce_base64"])).hexdigest()
+    )
     with pytest.raises(ReplayError, match="static x86-64|implementation"):
         replay_evidence(
             envelope,

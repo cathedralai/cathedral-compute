@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 from cathedral.lanes.sat import (
     CUSTOMER_SAT_WORK_UNITS,
@@ -231,7 +231,7 @@ def _validated_generated_at(value: str | None) -> str:
     if not isinstance(value, str):
         raise LedgerError("generated_at must be a timezone-aware ISO-8601 string")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
         offset = parsed.utcoffset()
     except (TypeError, ValueError, OverflowError) as exc:
         raise LedgerError("generated_at must be a timezone-aware ISO-8601 string") from exc
@@ -365,9 +365,7 @@ def _validate_customer_result(
         raise LedgerError("customer job SAT result assignment is invalid")
     if any(isinstance(literal, bool) or not isinstance(literal, int) for literal in assignment):
         raise LedgerError("customer job SAT result assignment is invalid")
-    if {abs(literal) for literal in assignment} != set(
-        range(1, lease.item.instance.n_vars + 1)
-    ):
+    if {abs(literal) for literal in assignment} != set(range(1, lease.item.instance.n_vars + 1)):
         raise LedgerError("customer job SAT result assignment is invalid")
     true_literals = set(assignment)
     if any(
@@ -530,9 +528,7 @@ class Ledger:
                 ("challenge_anchor_hash", "TEXT"),
             ):
                 if name not in columns:
-                    self._connection.execute(
-                        f"ALTER TABLE epochs ADD COLUMN {name} {sql_type}"
-                    )
+                    self._connection.execute(f"ALTER TABLE epochs ADD COLUMN {name} {sql_type}")
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add epoch challenge-anchor fields") from exc
 
@@ -857,7 +853,7 @@ class Ledger:
                 self._connection.close()
                 self._closed = True
 
-    def __enter__(self) -> Ledger:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -912,8 +908,13 @@ class Ledger:
             if int(customer_active) >= MAX_ACTIVE_CUSTOMER_JOBS_PER_CUSTOMER:
                 raise LedgerError("customer active-job quota reached")
             reserved_bytes = len(body) + _MAX_CUSTOMER_JOB_RESULT_BYTES
-            if int(capacity["storage_bytes"] or 0) + reserved_bytes > MAX_CUSTOMER_JOB_STORAGE_BYTES:
-                raise LedgerError("customer job ledger storage capacity reached; prune terminal jobs")
+            if (
+                int(capacity["storage_bytes"] or 0) + reserved_bytes
+                > MAX_CUSTOMER_JOB_STORAGE_BYTES
+            ):
+                raise LedgerError(
+                    "customer job ledger storage capacity reached; prune terminal jobs"
+                )
             job_id = f"job-{uuid.uuid4().hex}"
             now = _now()
             cx.execute(
@@ -922,9 +923,7 @@ class Ledger:
                 "submitted_at,available_at) VALUES (?,?,?,?,?, 'queued',?,?)",
                 (job_id, customer_id, idempotency_key, body, digest, now, now),
             )
-            row = cx.execute(
-                "SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
+            row = cx.execute("SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)).fetchone()
             assert row is not None
             return self._customer_job_snapshot(row)
 
@@ -1161,9 +1160,7 @@ class Ledger:
             except ChallengeError as exc:
                 raise LedgerError(f"challenge anchor hash is invalid: {exc}") from exc
             if network is None or netuid is None:
-                raise LedgerError(
-                    "a challenge anchor requires its audience (network and netuid)"
-                )
+                raise LedgerError("a challenge anchor requires its audience (network and netuid)")
         if (network is None) != (netuid is None):
             raise LedgerError("network and netuid must be supplied together")
         if network is not None:
@@ -1574,9 +1571,7 @@ class Ledger:
         cx: sqlite3.Connection,
         lease: CustomerJobLease,
     ) -> None:
-        row = cx.execute(
-            "SELECT * FROM customer_jobs WHERE job_id = ?", (lease.job_id,)
-        ).fetchone()
+        row = cx.execute("SELECT * FROM customer_jobs WHERE job_id = ?", (lease.job_id,)).fetchone()
         if row is None:
             raise LedgerError(f"customer job {lease.job_id!r} not found")
         expected = (
@@ -1621,9 +1616,7 @@ class Ledger:
         else:
             final_status = "failed"
         result_digest = (
-            "sha256:" + hashlib.sha256(result_body).hexdigest()
-            if result_body is not None
-            else None
+            "sha256:" + hashlib.sha256(result_body).hexdigest() if result_body is not None else None
         )
         cursor = cx.execute(
             "UPDATE customer_jobs SET status = ?,available_at = ?,"
@@ -1672,9 +1665,7 @@ class Ledger:
         ):
             raise LedgerError("attestation envelope digest is invalid")
         if envelope_required and envelope_digest is None:
-            raise LedgerError(
-                "production scoring attestation requires a retained envelope digest"
-            )
+            raise LedgerError("production scoring attestation requires a retained envelope digest")
         if challenge_digest is not None and (
             not isinstance(challenge_digest, str)
             or re.fullmatch(r"sha256:[0-9a-f]{64}", challenge_digest) is None
@@ -1710,8 +1701,7 @@ class Ledger:
             if existing:
                 if envelope_required and existing["envelope_digest"] is None:
                     raise LedgerError(
-                        "production scoring attestation requires a retained "
-                        "envelope digest"
+                        "production scoring attestation requires a retained envelope digest"
                     )
                 if (
                     existing["evidence_digest"] != evidence_digest
@@ -2129,14 +2119,15 @@ class Ledger:
         Idempotent for identical bytes; different bytes for a recorded
         challenge are equivocation and fail closed.
         """
-        if not challenge_id or not isinstance(work_item_body, bytes) or not isinstance(
-            result_body, bytes
+        if (
+            not challenge_id
+            or not isinstance(work_item_body, bytes)
+            or not isinstance(result_body, bytes)
         ):
             raise LedgerError("work artifacts are invalid")
         with self._lock:
             row = self._connection.execute(
-                "SELECT work_item_body, result_body FROM work_artifacts "
-                "WHERE challenge_id = ?",
+                "SELECT work_item_body, result_body FROM work_artifacts WHERE challenge_id = ?",
                 (challenge_id,),
             ).fetchone()
             if row is not None:
@@ -2144,9 +2135,7 @@ class Ledger:
                     bytes(row["work_item_body"]) != work_item_body
                     or bytes(row["result_body"]) != result_body
                 ):
-                    raise LedgerError(
-                        f"work artifacts for {challenge_id!r} are immutable"
-                    )
+                    raise LedgerError(f"work artifacts for {challenge_id!r} are immutable")
                 return
             with self._connection:
                 self._connection.execute(
@@ -2155,13 +2144,10 @@ class Ledger:
                     (challenge_id, work_item_body, result_body, _now()),
                 )
 
-    def work_artifacts_for_challenge(
-        self, challenge_id: str
-    ) -> Mapping[str, Any] | None:
+    def work_artifacts_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT work_item_body, result_body FROM work_artifacts "
-                "WHERE challenge_id = ?",
+                "SELECT work_item_body, result_body FROM work_artifacts WHERE challenge_id = ?",
                 (challenge_id,),
             ).fetchone()
         return MappingProxyType(dict(row)) if row is not None else None

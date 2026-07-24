@@ -17,6 +17,7 @@ Secrets are never accepted: values are rendered with a redaction pass that
 drops credential-shaped substrings defensively, mirroring the CLI's output
 redaction.
 """
+
 from __future__ import annotations
 
 import json
@@ -50,10 +51,10 @@ _SENSITIVE_FIELD_RE = re.compile(
 )
 
 _COLORS = {
-    PASS: "\x1b[32m",       # green
-    FAIL: "\x1b[31;1m",     # bold red
+    PASS: "\x1b[32m",  # green
+    FAIL: "\x1b[31;1m",  # bold red
     NOT_PROVEN: "\x1b[33m",  # yellow
-    INFO: "\x1b[2m",        # dim
+    INFO: "\x1b[2m",  # dim
 }
 _RESET = "\x1b[0m"
 
@@ -83,9 +84,7 @@ def _scrub(value):
         # Sensitive FIELD NAMES redact the entire value regardless of shape.
         return {
             _neutralize(str(key)): (
-                "[REDACTED]"
-                if _SENSITIVE_FIELD_RE.match(str(key))
-                else _scrub(item)
+                "[REDACTED]" if _SENSITIVE_FIELD_RE.match(str(key)) else _scrub(item)
             )
             for key, item in value.items()
         }
@@ -136,9 +135,7 @@ class EventLogger:
             opened = os.fstat(descriptor)
             if not _stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o077:
                 os.close(descriptor)
-                raise ValueError(
-                    "event log must be a private (0600) regular file"
-                )
+                raise ValueError("event log must be a private (0600) regular file")
             self._jsonl_file = os.fdopen(descriptor, "a", encoding="utf-8")
         self._tty = tty if tty is not None else sys.stderr
         if color is None:

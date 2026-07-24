@@ -11,15 +11,15 @@ import hashlib
 import json
 import re
 import urllib.parse
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptError, parse_receipt_json
-
 
 REPORT_SCHEMA = "cathedral_score_class_report_v2"
 REPORT_DOMAIN = b"cathedral-score-class-report-v1\x00"
@@ -140,9 +140,10 @@ def validate_candidate_snapshot(
     if isinstance(block, bool) or not isinstance(block, int) or block < 0:
         raise ScoreClassError("candidate snapshot block is invalid")
     block_hash = document["block_hash"]
-    if not isinstance(block_hash, str) or _BLOCK_HASH_RE.fullmatch(
-        block_hash.strip().lower()
-    ) is None:
+    if (
+        not isinstance(block_hash, str)
+        or _BLOCK_HASH_RE.fullmatch(block_hash.strip().lower()) is None
+    ):
         raise ScoreClassError("candidate snapshot block hash is invalid")
     hotkeys = document["hotkeys"]
     if not isinstance(hotkeys, list) or len(hotkeys) > MAX_REPORT_ENTRIES:

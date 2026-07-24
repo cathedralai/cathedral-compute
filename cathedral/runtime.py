@@ -14,11 +14,12 @@ import math
 import os
 import threading
 import urllib.parse
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol
+from typing import Protocol
 
 from cathedral.assurance import (
     ATTESTATION_ADMISSION_POLICY,
@@ -33,16 +34,16 @@ from cathedral.assurance import (
     with_verified_channel,
 )
 from cathedral.common import (
+    MAX_EVIDENCE_RESPONSE_BODY,
+    MAX_GPU_EVIDENCE_CONCURRENCY,
     Attested,
     ChannelBinding,
     Evidence,
     EvidenceKind,
-    MAX_EVIDENCE_RESPONSE_BODY,
-    MAX_GPU_EVIDENCE_CONCURRENCY,
     Policy,
     Tier,
-    issue_nonce,
     is_globally_routable,
+    issue_nonce,
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
@@ -57,8 +58,8 @@ from cathedral.lifecycle import (
     WorkerLifecycleState,
 )
 from cathedral.poster import Poster
-from cathedral.remote import RemoteMiner
 from cathedral.receipt import ReceiptIssuer
+from cathedral.remote import RemoteMiner
 from cathedral.score_audience import validate_score_audience
 from cathedral.verify import preflight_tdx_verifier, verify
 
@@ -141,15 +142,15 @@ class RuntimeConfig:
         ):
             raise ValueError("max_workers must be between 1 and 64")
         if not isinstance(self.production_mode, bool):
-            raise ValueError("production_mode must be a boolean")
+            raise ValueError("production_mode must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if not isinstance(self.allow_insecure_http_for_tests, bool):
-            raise ValueError("allow_insecure_http_for_tests must be a boolean")
+            raise ValueError("allow_insecure_http_for_tests must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.production_mode and self.allow_insecure_http_for_tests:
             raise ValueError("insecure HTTP is unavailable in production mode")
         if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
             raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
         if not isinstance(self.admission_enabled, bool):
-            raise ValueError("admission_enabled must be a boolean")
+            raise ValueError("admission_enabled must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.score_network is not None or self.score_netuid is not None:
             validate_score_audience(self.score_network, self.score_netuid)
         minimum_lease = math.ceil(float(timeout) * self.miner_attempts) + 5
@@ -550,15 +551,13 @@ class ConfidentialRuntime:
             return None
         if block is None or block_hash is None:
             raise ValueError(
-                "challenge anchor block and hash must be configured together "
-                "as a validated pair"
+                "challenge anchor block and hash must be configured together as a validated pair"
             )
         if isinstance(block, bool) or not isinstance(block, int) or block < 0:
             raise ValueError("challenge anchor block is invalid")
         if self.config.score_network is None or self.config.score_netuid is None:
             raise ValueError(
-                "a challenge anchor requires the score audience "
-                "(score_network/score_netuid)"
+                "a challenge anchor requires the score audience (score_network/score_netuid)"
             )
         from cathedral.challenge import normalize_block_hash
 
@@ -577,7 +576,7 @@ class ConfidentialRuntime:
         publish: bool = False,
     ) -> EpochRun:
         if not isinstance(publish, bool):
-            raise ValueError("publish must be a boolean")
+            raise ValueError("publish must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         # The active epoch anchors every derived challenge nonce this cycle.
         # ONE anchor snapshot is taken here; the same values are persisted on
         # the epoch row at begin_epoch and asserted on read-back, so nonce
@@ -677,9 +676,7 @@ class ConfidentialRuntime:
                 policy_registry_digest=self.policy.registry_digest,
                 network=(anchor or {}).get("network") or self.config.score_network,
                 netuid=(
-                    (anchor or {}).get("netuid")
-                    if anchor is not None
-                    else self.config.score_netuid
+                    (anchor or {}).get("netuid") if anchor is not None else self.config.score_netuid
                 ),
                 challenge_anchor_block=(anchor or {}).get("block"),
                 challenge_anchor_hash=(anchor or {}).get("block_hash"),
@@ -793,7 +790,7 @@ class ConfidentialRuntime:
     def __del__(self) -> None:  # pragma: no cover - interpreter cleanup fallback
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort close on interpreter teardown
             pass
 
     def abort_running(self) -> int:
@@ -870,7 +867,7 @@ class ConfidentialRuntime:
             for hotkey in sorted(futures):
                 result = futures[hotkey].result()
                 if result.attested is None:
-                    target, endpoint = by_hotkey[hotkey]
+                    _target, endpoint = by_hotkey[hotkey]
                     if (
                         result.lifecycle_generation is not None
                         and result.lifecycle_revision is not None
@@ -1125,8 +1122,7 @@ class ConfidentialRuntime:
                 envelope_digest=result.envelope_digest,
                 challenge_digest=result.challenge_digest,
                 envelope_required=(
-                    self.config.production_mode
-                    and self.config.expected_tier is Tier.CC_CPU_TDX
+                    self.config.production_mode and self.config.expected_tier is Tier.CC_CPU_TDX
                 ),
             )
             outcomes[result.target.hotkey] = MinerOutcome(
@@ -1211,7 +1207,9 @@ class ConfidentialRuntime:
         # audit work without consuming a customer attempt.
         customer_capable: set[str] = set()
         if self.config.expected_tier is Tier.CC_CPU_TDX and eligible:
-            with ThreadPoolExecutor(max_workers=min(len(eligible), self.config.max_workers)) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(len(eligible), self.config.max_workers)
+            ) as executor:
                 capability_futures = {
                     result.target.hotkey: executor.submit(
                         result.client.supports_customer_sat  # type: ignore[union-attr]
@@ -1223,7 +1221,7 @@ class ConfidentialRuntime:
                     try:
                         if future.result() is True:
                             customer_capable.add(hotkey)
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110 - probe failure is not a customer attempt
                         # Capability failure is not a customer attempt. The
                         # worker still receives safe canonical audit work.
                         pass
@@ -1443,7 +1441,7 @@ class ConfidentialRuntime:
                 target.hotkey,
                 **remote_options,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized attestation error
             return _AttestationResult(target, endpoint, error=_safe_error(exc))
 
         last_error = "attestation rejected"
@@ -1594,7 +1592,7 @@ class ConfidentialRuntime:
                     component_audit=component_audit,
                     gpu_component=gpu_component,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized attestation error
                 last_error = _safe_error(exc)
                 last_error_category = _safe_error_category(exc)
             finally:
@@ -1621,7 +1619,7 @@ class ConfidentialRuntime:
         for _ in range(self.config.miner_attempts):
             try:
                 return client.do_sat_work(item), None
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized work error
                 last_error = _safe_error(exc)
         return None, last_error
 
@@ -1759,7 +1757,7 @@ def _sat_certificate_json(certificate: SatCertificate) -> Mapping[str, object]:
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
     if not isinstance(endpoint, str):
-        raise ValueError("endpoint must be a string")
+        raise ValueError("endpoint must be a string")  # noqa: TRY004 - ValueError is the stable fail-closed contract
     parsed = urllib.parse.urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError("endpoint must be an absolute HTTP(S) URL")
@@ -1839,9 +1837,7 @@ def _preflight_evidence_retention(directory: str | None) -> None:
 RETAINED_EVIDENCE_SCHEMA = "cathedral_retained_evidence_v1"
 
 
-def _retained_evidence_envelope(
-    evidences: tuple[Evidence, ...], evidence_digest: str
-) -> bytes:
+def _retained_evidence_envelope(evidences: tuple[Evidence, ...], evidence_digest: str) -> bytes:
     """Serialize verified CPU-TDX admission evidence for controlled retention.
 
     The envelope carries exactly the fields hashed by ``_evidence_digest`` so
@@ -1861,13 +1857,9 @@ def _retained_evidence_envelope(
     components = []
     for evidence in sorted(evidences, key=lambda item: item.kind.value):
         if evidence.kind is not EvidenceKind.TDX:
-            raise RuntimeError(
-                "evidence retention is limited to CPU-TDX components at launch"
-            )
+            raise RuntimeError("evidence retention is limited to CPU-TDX components at launch")
         if evidence.composite_jwt is not None:
-            raise RuntimeError(
-                "refusing to retain token-shaped evidence material (composite JWT)"
-            )
+            raise RuntimeError("refusing to retain token-shaped evidence material (composite JWT)")
         binding = (
             evidence.channel_binding.canonical_bytes()
             if evidence.channel_binding is not None

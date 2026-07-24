@@ -64,10 +64,7 @@ def _legacy_cpu_schema(path: Path, *, with_envelope: bool, envelope_value: str |
 
 def _columns(path: Path) -> set[str]:
     with sqlite3.connect(path) as connection:
-        return {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(epoch_attestations)")
-        }
+        return {row[1] for row in connection.execute("PRAGMA table_info(epoch_attestations)")}
 
 
 def test_legacy_cpu_schema_migrates_and_envelope_survives_reopen(tmp_path: Path):
@@ -155,23 +152,19 @@ def test_production_scoring_attestation_requires_envelope(tmp_path: Path):
 def test_idempotent_attestation_compares_envelope_exactly(tmp_path: Path):
     ledger = Ledger(tmp_path / "ledger.sqlite")
     epoch_id = ledger.begin_epoch(11)
-    base = dict(
-        verdict="VERIFIED",
-        tee_type="TDX",
-        workload="CPU",
-        evidence_digest="sha256:" + "d" * 64,
-        policy_mode="strict",
-    )
+    base = {
+        "verdict": "VERIFIED",
+        "tee_type": "TDX",
+        "workload": "CPU",
+        "evidence_digest": "sha256:" + "d" * 64,
+        "policy_mode": "strict",
+    }
     ledger.add_attestation(epoch_id, "hk", envelope_digest=ENVELOPE, **base)
     # Exact idempotent replay (same envelope) is accepted.
-    ledger.add_attestation(
-        epoch_id, "hk", envelope_digest=ENVELOPE, envelope_required=True, **base
-    )
+    ledger.add_attestation(epoch_id, "hk", envelope_digest=ENVELOPE, envelope_required=True, **base)
     # A different envelope for the same row is rejected.
     with pytest.raises(LedgerError, match="immutable"):
-        ledger.add_attestation(
-            epoch_id, "hk", envelope_digest="sha256:" + "f" * 64, **base
-        )
+        ledger.add_attestation(epoch_id, "hk", envelope_digest="sha256:" + "f" * 64, **base)
     # Dropping the envelope on replay is rejected too.
     with pytest.raises(LedgerError, match="immutable"):
         ledger.add_attestation(epoch_id, "hk", envelope_digest=None, **base)
@@ -189,22 +182,18 @@ def test_idempotent_retry_with_conflicting_challenge_digest_rejected(tmp_path: P
     challenge randomness is equivocation, never an idempotent success."""
     ledger = Ledger(tmp_path / "ledger.sqlite")
     epoch_id = ledger.begin_epoch(11)
-    base = dict(
-        verdict="VERIFIED",
-        tee_type="TDX",
-        workload="CPU",
-        evidence_digest="sha256:" + "d" * 64,
-        policy_mode="strict",
-        envelope_digest=ENVELOPE,
-    )
-    ledger.add_attestation(
-        epoch_id, "hk", challenge_digest="sha256:" + "1" * 64, **base
-    )
+    base = {
+        "verdict": "VERIFIED",
+        "tee_type": "TDX",
+        "workload": "CPU",
+        "evidence_digest": "sha256:" + "d" * 64,
+        "policy_mode": "strict",
+        "envelope_digest": ENVELOPE,
+    }
+    ledger.add_attestation(epoch_id, "hk", challenge_digest="sha256:" + "1" * 64, **base)
     ledger.add_attestation(  # exact retry OK
         epoch_id, "hk", challenge_digest="sha256:" + "1" * 64, **base
     )
     with pytest.raises(LedgerError, match="immutable"):
-        ledger.add_attestation(
-            epoch_id, "hk", challenge_digest="sha256:" + "2" * 64, **base
-        )
+        ledger.add_attestation(epoch_id, "hk", challenge_digest="sha256:" + "2" * 64, **base)
     ledger.close()

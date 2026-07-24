@@ -16,6 +16,7 @@ cryptographically — no forgetful cache involved. Miners can compute the
 nonce only once the anchor block is finalized, which is exactly the epoch
 freshness window.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -51,11 +52,7 @@ def derive_challenge_nonce(
         raise ChallengeError("network is invalid")
     if isinstance(netuid, bool) or not isinstance(netuid, int) or netuid < 0:
         raise ChallengeError("netuid is invalid")
-    if (
-        isinstance(source_epoch, bool)
-        or not isinstance(source_epoch, int)
-        or source_epoch < 0
-    ):
+    if isinstance(source_epoch, bool) or not isinstance(source_epoch, int) or source_epoch < 0:
         raise ChallengeError("source epoch is invalid")
     if not isinstance(miner_hotkey, str) or not miner_hotkey:
         raise ChallengeError("miner hotkey is invalid")
