@@ -2229,6 +2229,12 @@ def test_tls_handshake_deadline_is_recomputed_after_tcp(monkeypatch):
         return _FakeRaw(timeout)
 
     class _WrapRecorder:
+        # Python 3.11's HTTPSConnection validates these context attributes in
+        # __init__; newer runtimes defer the checks. Model a real default
+        # client context so this transport-boundary fake is portable.
+        verify_mode = ssl.CERT_REQUIRED
+        check_hostname = True
+
         def wrap_socket(self, sock, server_hostname=None):
             captured["tls_timeout"] = sock.gettimeout()
             raise RuntimeError("stop-at-wrap")
@@ -2290,6 +2296,9 @@ def test_trickled_body_cannot_outlive_the_absolute_deadline(monkeypatch):
     thread.start()
 
     class _NoTls:
+        verify_mode = ssl.CERT_REQUIRED
+        check_hostname = True
+
         def wrap_socket(self, sock, server_hostname=None):
             return sock  # transport logic under test is TLS-agnostic
 
