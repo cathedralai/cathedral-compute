@@ -338,15 +338,22 @@ class ConfidentialRuntime:
             preflight_tdx_verifier(self.policy)
             if self.config.expected_tier is Tier.CC_CPU_TDX:
                 _preflight_evidence_retention(self.config.evidence_retention_dir)
-                if not self.config.challenge_anchor_hash:
+                if (
+                    self.config.challenge_anchor_hash is None
+                    or self.config.challenge_anchor_block is None
+                ):
                     raise ValueError(
-                        "production CPU scoring requires a finalized-block "
-                        "challenge anchor (--challenge-anchor-hash/-block); "
+                        "production CPU scoring requires the finalized-block "
+                        "challenge anchor as a VALIDATED PAIR "
+                        "(--challenge-anchor-block AND --challenge-anchor-hash); "
                         "issuer-random nonces are not a public freshness proof"
                     )
-                from cathedral.challenge import normalize_block_hash
-
-                normalize_block_hash(self.config.challenge_anchor_hash)
+                if self.config.score_network is None or self.config.score_netuid is None:
+                    raise ValueError(
+                        "an anchored production runtime requires its score "
+                        "audience (--score-network/--score-netuid)"
+                    )
+                self._config_challenge_anchor()
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -533,6 +540,35 @@ class ConfidentialRuntime:
             self._active_policy_authority = None
             self._run_lock.release()
 
+    def _config_challenge_anchor(self) -> dict | None:
+        """The validated {network, netuid, block, block_hash} challenge-anchor
+        pair from configuration, hash-normalized, or None when unanchored
+        (development only; production CPU preflight refuses to start)."""
+        block = self.config.challenge_anchor_block
+        block_hash = self.config.challenge_anchor_hash
+        if block is None and block_hash is None:
+            return None
+        if block is None or block_hash is None:
+            raise ValueError(
+                "challenge anchor block and hash must be configured together "
+                "as a validated pair"
+            )
+        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+            raise ValueError("challenge anchor block is invalid")
+        if self.config.score_network is None or self.config.score_netuid is None:
+            raise ValueError(
+                "a challenge anchor requires the score audience "
+                "(score_network/score_netuid)"
+            )
+        from cathedral.challenge import normalize_block_hash
+
+        return {
+            "network": self.config.score_network,
+            "netuid": int(self.config.score_netuid),
+            "block": int(block),
+            "block_hash": normalize_block_hash(block_hash),
+        }
+
     def _run_epoch_once(
         self,
         source_epoch: int,
@@ -543,7 +579,11 @@ class ConfidentialRuntime:
         if not isinstance(publish, bool):
             raise ValueError("publish must be a boolean")
         # The active epoch anchors every derived challenge nonce this cycle.
+        # ONE anchor snapshot is taken here; the same values are persisted on
+        # the epoch row at begin_epoch and asserted on read-back, so nonce
+        # derivation and the durable epoch record can never diverge.
         self._active_source_epoch = int(source_epoch)
+        self._active_challenge_anchor = self._config_challenge_anchor()
         self._require_live_gpu_profile()
         canary_target, canary_endpoint = self._validate_target(canary)
 
@@ -630,11 +670,37 @@ class ConfidentialRuntime:
                     raise RuntimeError("an enrolled miner shares the dedicated canary GPU identity")
 
             self._require_live_gpu_profile()
+            anchor = getattr(self, "_active_challenge_anchor", None)
             epoch_id = self.ledger.begin_epoch(
                 source_epoch,
                 policy_registry_release=self.policy.registry_release,
                 policy_registry_digest=self.policy.registry_digest,
+                network=(anchor or {}).get("network") or self.config.score_network,
+                netuid=(
+                    (anchor or {}).get("netuid")
+                    if anchor is not None
+                    else self.config.score_netuid
+                ),
+                challenge_anchor_block=(anchor or {}).get("block"),
+                challenge_anchor_hash=(anchor or {}).get("block_hash"),
             )
+            if anchor is not None:
+                stored = self.ledger.epoch_challenge_anchor(epoch_id)
+                if stored is None or (
+                    stored["network"],
+                    stored["netuid"],
+                    stored["block"],
+                    stored["block_hash"],
+                ) != (
+                    anchor["network"],
+                    anchor["netuid"],
+                    anchor["block"],
+                    anchor["block_hash"],
+                ):
+                    raise RuntimeError(
+                        "durable epoch challenge anchor does not match the "
+                        "anchor the epoch's nonces were derived from"
+                    )
             try:
                 admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
                 self._run_sat(epoch_id, source_epoch, admitted, outcomes)
@@ -1387,17 +1453,24 @@ class ConfidentialRuntime:
                 return _AttestationResult(target, endpoint, error="reattestation cancelled")
             gpu_budget_reserved = False
             try:
-                if self.config.challenge_anchor_hash:
+                anchor = getattr(self, "_active_challenge_anchor", None) or (
+                    self._config_challenge_anchor()
+                )
+                if anchor is not None:
                     # Anchored, publicly derivable challenge: any validator can
                     # recompute this exact nonce from the finalized block hash,
-                    # audience, epoch, and hotkey. (Lifecycle re-attestations
-                    # between epochs reuse the last epoch's anchor slot.)
+                    # audience, epoch, and hotkey. The anchor is the SAME
+                    # snapshot begin_epoch durably persists on the epoch row
+                    # (read-back asserted), so exports verify against exactly
+                    # what these nonces were derived from. (Lifecycle
+                    # re-attestations between epochs reuse the last epoch's
+                    # anchor slot.)
                     from cathedral.challenge import derive_challenge_nonce
 
                     nonce = derive_challenge_nonce(
-                        block_hash=self.config.challenge_anchor_hash,
-                        network=self.config.score_network or "local",
-                        netuid=self.config.score_netuid or 0,
+                        block_hash=anchor["block_hash"],
+                        network=anchor["network"],
+                        netuid=anchor["netuid"],
                         source_epoch=int(getattr(self, "_active_source_epoch", 0)),
                         miner_hotkey=target.hotkey,
                     )

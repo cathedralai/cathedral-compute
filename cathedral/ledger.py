@@ -495,6 +495,7 @@ class Ledger:
         self._migrate_attestation_envelope_if_needed()
         self._migrate_attestation_challenge_if_needed()
         self._migrate_worker_lifecycle_fields_if_needed()
+        self._migrate_epoch_anchor_fields_if_needed()
 
     def _migrate_registry_policy_fields_if_needed(self) -> None:
         columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")}
@@ -509,6 +510,31 @@ class Ledger:
                 )
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add registry policy audit fields") from exc
+
+    def _migrate_epoch_anchor_fields_if_needed(self) -> None:
+        """Add the durable challenge-anchor columns to the epochs table.
+
+        The finalized-block challenge anchor (and its audience) must survive
+        on the EPOCH, not in transient runtime configuration: score-class
+        export and evidence export both re-read it from here, so a later,
+        unrelated snapshot can never be substituted for the one the epoch's
+        nonces were actually derived from. NULL means the epoch predates
+        anchoring (development databases only; production preflight refuses
+        to score without an anchor)."""
+        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")}
+        try:
+            for name, sql_type in (
+                ("anchor_network", "TEXT"),
+                ("anchor_netuid", "INTEGER"),
+                ("challenge_anchor_block", "INTEGER"),
+                ("challenge_anchor_hash", "TEXT"),
+            ):
+                if name not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE epochs ADD COLUMN {name} {sql_type}"
+                    )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add epoch challenge-anchor fields") from exc
 
     def _migrate_attestation_challenge_if_needed(self) -> None:
         """Add the per-epoch challenge-randomness commitment column."""
@@ -1100,12 +1126,51 @@ class Ledger:
         *,
         policy_registry_release: int | None = None,
         policy_registry_digest: str | None = None,
+        network: str | None = None,
+        netuid: int | None = None,
+        challenge_anchor_block: int | None = None,
+        challenge_anchor_hash: str | None = None,
     ) -> int:
-        """Begin the next attempt, reusing an aborted attempt's source epoch."""
+        """Begin the next attempt, reusing an aborted attempt's source epoch.
+
+        The challenge anchor — the finalized chain block (and hash) every
+        derived TDX nonce for this epoch commits to — is persisted HERE, at
+        epoch begin, as a validated pair together with its audience. Every
+        later export re-reads it from the epoch row, so no unrelated
+        snapshot can be swapped in after the fact."""
         if isinstance(source_epoch, bool) or not isinstance(source_epoch, int) or source_epoch < 0:
             raise LedgerError("source_epoch must be a nonnegative integer")
         if (policy_registry_release is None) != (policy_registry_digest is None):
             raise LedgerError("policy registry release and digest must be supplied together")
+        if (challenge_anchor_block is None) != (challenge_anchor_hash is None):
+            raise LedgerError(
+                "challenge anchor block and hash must be supplied together as a validated pair"
+            )
+        anchor_hash_normalized: str | None = None
+        if challenge_anchor_block is not None:
+            if (
+                isinstance(challenge_anchor_block, bool)
+                or not isinstance(challenge_anchor_block, int)
+                or not 0 <= challenge_anchor_block <= _MAX_SQLITE_INTEGER
+            ):
+                raise LedgerError("challenge anchor block is invalid")
+            from cathedral.challenge import ChallengeError, normalize_block_hash
+
+            try:
+                anchor_hash_normalized = normalize_block_hash(challenge_anchor_hash)
+            except ChallengeError as exc:
+                raise LedgerError(f"challenge anchor hash is invalid: {exc}") from exc
+            if network is None or netuid is None:
+                raise LedgerError(
+                    "a challenge anchor requires its audience (network and netuid)"
+                )
+        if (network is None) != (netuid is None):
+            raise LedgerError("network and netuid must be supplied together")
+        if network is not None:
+            try:
+                network, netuid = validate_score_audience(network, netuid)
+            except ValueError as exc:
+                raise LedgerError(str(exc)) from exc
         if policy_registry_release is not None and (
             isinstance(policy_registry_release, bool)
             or not isinstance(policy_registry_release, int)
@@ -1142,16 +1207,38 @@ class Ledger:
 
             cursor = cx.execute(
                 "INSERT INTO epochs(source_epoch, status, started_at, "
-                "policy_registry_release, policy_registry_digest) "
-                "VALUES (?, 'running', ?, ?, ?)",
+                "policy_registry_release, policy_registry_digest, "
+                "anchor_network, anchor_netuid, challenge_anchor_block, "
+                "challenge_anchor_hash) "
+                "VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     source_epoch,
                     _now(),
                     policy_registry_release,
                     policy_registry_digest,
+                    network,
+                    netuid,
+                    challenge_anchor_block,
+                    anchor_hash_normalized,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def epoch_challenge_anchor(self, epoch_id: int) -> Mapping[str, Any] | None:
+        """The durable challenge anchor persisted at ``begin_epoch``, or None
+        for a pre-anchoring epoch."""
+        with self._lock:
+            row = self._epoch(self._connection, epoch_id)
+            if row["challenge_anchor_block"] is None:
+                return None
+            return MappingProxyType(
+                {
+                    "network": str(row["anchor_network"]),
+                    "netuid": int(row["anchor_netuid"]),
+                    "block": int(row["challenge_anchor_block"]),
+                    "block_hash": str(row["challenge_anchor_hash"]),
+                }
+            )
 
     def abort_epoch(self, epoch_id: int) -> None:
         with self._transaction() as cx:
@@ -1770,6 +1857,18 @@ class Ledger:
                 return self._load_scores(cx, epoch_id)
             if epoch["status"] != "running":
                 raise LedgerError(f"epoch {epoch_id} is {epoch['status']}; cannot complete")
+            if epoch["anchor_network"] is not None:
+                anchored = (str(epoch["anchor_network"]), int(epoch["anchor_netuid"]))
+                if audience is None:
+                    raise LedgerError(
+                        "an anchored epoch must be completed with its anchored "
+                        f"score audience {anchored[0]}/{anchored[1]}"
+                    )
+                if audience != anchored:
+                    raise LedgerError(
+                        f"score audience {audience[0]}/{audience[1]} does not match "
+                        f"the epoch's anchored audience {anchored[0]}/{anchored[1]}"
+                    )
             unresolved = cx.execute(
                 "SELECT COUNT(*) FROM challenges WHERE epoch_id = ? AND status = 'issued'",
                 (epoch_id,),
@@ -2131,6 +2230,16 @@ class Ledger:
                 "netuid": report.get("netuid"),
                 "policy_registry_release": epoch["policy_registry_release"],
                 "policy_registry_digest": epoch["policy_registry_digest"],
+                "challenge_anchor_block": (
+                    int(epoch["challenge_anchor_block"])
+                    if epoch["challenge_anchor_block"] is not None
+                    else None
+                ),
+                "challenge_anchor_hash": (
+                    str(epoch["challenge_anchor_hash"])
+                    if epoch["challenge_anchor_hash"] is not None
+                    else None
+                ),
                 "report_digest": "sha256:" + str(epoch["report_digest"]),
                 "rows": tuple(MappingProxyType(dict(row)) for row in rows),
             }

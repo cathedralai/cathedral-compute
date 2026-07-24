@@ -325,24 +325,23 @@ def test_direct_production_epoch_requires_audience_before_network_or_epoch(
     factory = FakeFactory(specs)
     policy = production_policy()
     monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
-    runtime = ConfidentialRuntime(
-        registry,
-        ledger,
-        policy,
-        token_provider=lambda _hotkey: "token",
-        policy_refresher=lambda: policy,
-        remote_factory=factory,
-        config=RuntimeConfig(
-            production_mode=True,
-            evidence_retention_dir=str(tmp_path / "retained-evidence"),
-            challenge_anchor_block=100,
-            challenge_anchor_hash="0x" + "ab" * 32,
-        ),
-    )
-
-    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
-    with pytest.raises(RuntimeError, match="explicit score network and netuid"):
-        runtime.run_epoch(1, canary)
+    # The missing audience now fails PREFLIGHT, before any network or epoch
+    # activity can start at all.
+    with pytest.raises(ValueError, match="requires its score audience"):
+        ConfidentialRuntime(
+            registry,
+            ledger,
+            policy,
+            token_provider=lambda _hotkey: "token",
+            policy_refresher=lambda: policy,
+            remote_factory=factory,
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
+        )
     assert factory.log == {}
     assert ledger.blocking_epoch() is None
 
@@ -412,6 +411,8 @@ def test_production_runtime_refreshes_policy_and_rejects_mid_epoch_change(
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
             challenge_anchor_block=100,
             challenge_anchor_hash="0x" + "ab" * 32,
+            score_network="local",
+            score_netuid=1,
         ),
     )
     runtime._active_policy_authority = initial.registry_authority_identity
@@ -774,6 +775,8 @@ def test_production_rejects_legacy_report_data_before_work(tmp_path: Path, monke
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
             challenge_anchor_block=100,
             challenge_anchor_hash="0x" + "ab" * 32,
+            score_network="local",
+            score_netuid=1,
         ),
     )
 
