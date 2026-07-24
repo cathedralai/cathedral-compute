@@ -149,3 +149,29 @@ def test_tampered_units_inside_result_change_the_digest():
             forged,
             expected_result_digest=_digest(result_bytes),  # receipt-signed
         )
+
+
+def test_challenge_derivation_is_deterministic_and_slot_unique():
+    """Defect-5: nonces derive from public chain state; every
+    (epoch, hotkey) slot is distinct and reproducible."""
+    from cathedral.challenge import (
+        ChallengeError,
+        derive_challenge_nonce,
+        expected_challenge_digest,
+    )
+
+    kwargs = dict(
+        block_hash="0x" + "ab" * 32, network="finney", netuid=39,
+        source_epoch=11, miner_hotkey="tdx-miner",
+    )
+    first = derive_challenge_nonce(**kwargs)
+    assert first == derive_challenge_nonce(**kwargs)  # deterministic
+    assert len(first) == 32
+    assert first != derive_challenge_nonce(**{**kwargs, "source_epoch": 12})
+    assert first != derive_challenge_nonce(**{**kwargs, "miner_hotkey": "other"})
+    assert first != derive_challenge_nonce(**{**kwargs, "netuid": 40})
+    # 0x prefix is normalized away.
+    assert derive_challenge_nonce(**{**kwargs, "block_hash": "ab" * 32}) == first
+    assert expected_challenge_digest(**kwargs).startswith("sha256:")
+    with pytest.raises(ChallengeError):
+        derive_challenge_nonce(**{**kwargs, "block_hash": "zz" * 32})

@@ -795,6 +795,12 @@ def _build_runtime(
             or os.environ.get("CATHEDRAL_EVIDENCE_RETENTION_DIR")
             or None
         ),
+        challenge_anchor_block=getattr(args, "challenge_anchor_block", None),
+        challenge_anchor_hash=(
+            getattr(args, "challenge_anchor_hash", None)
+            or os.environ.get("CATHEDRAL_CHALLENGE_ANCHOR_HASH")
+            or None
+        ),
     )
     if require_report_audience and config.production_mode and config.score_network is None:
         raise ValueError("production score reports require --score-network and --score-netuid")
@@ -1383,15 +1389,46 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             str(snapshot["generated_at"]).replace("Z", "+00:00")  # noqa: FURB162 - ledger text may carry either suffix
         ).astimezone(datetime.UTC)
         manifest_generated_at = frozen_generated.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        snapshot_document = _strict_json_object(
+            Path(args.candidate_snapshot).read_bytes(), "candidate snapshot"
+        )
+        if (
+            snapshot_document.get("schema") != "cathedral_candidate_snapshot_v1"
+            or snapshot_document.get("network") != args.score_network
+            or snapshot_document.get("netuid") != args.score_netuid
+            or not isinstance(snapshot_document.get("hotkeys"), list)
+            or not isinstance(snapshot_document.get("block"), int)
+            or not isinstance(snapshot_document.get("block_hash"), str)
+        ):
+            raise ValueError(
+                "candidate snapshot must carry schema/network/netuid/block/"
+                "block_hash/hotkeys for the anchored SN39 metagraph"
+            )
+        registered = {str(h) for h in snapshot_document["hotkeys"]}
+        row_outcomes = {
+            str(row["hotkey"]): ("verified" if row["receipt_id"] else "rejected")
+            for row in snapshot["rows"]
+        }
+        unregistered = set(row_outcomes) - registered
+        if unregistered:
+            raise ValueError(
+                f"scored hotkeys are not registered at the anchored block: "
+                f"{sorted(unregistered)}"
+            )
+        # EVERY registered hotkey at the anchored snapshot is accounted for:
+        # verified with evidence, or rejected/no-verified-work. Only hotkeys
+        # appear - never machine identity or endpoints.
         candidate_rows = [
             {
-                "hotkey": str(row["hotkey"]),
-                "outcome": "verified" if row["receipt_id"] else "rejected",
+                "hotkey": hotkey,
+                "outcome": row_outcomes.get(hotkey, "rejected"),
                 "reason": (
-                    "receipt_verified" if row["receipt_id"] else "no_verified_work"
+                    "receipt_verified"
+                    if row_outcomes.get(hotkey) == "verified"
+                    else "no_verified_work"
                 ),
             }
-            for row in snapshot["rows"]
+            for hotkey in sorted(registered)
         ]
         manifest_bytes = build_manifest(
             network=args.score_network,
@@ -1419,12 +1456,11 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             receipts=manifest_receipts,
             attestations=attestations,
             candidate_set={
-                "source": "enrollment_registry",
-                "finalized_block": (
-                    int(args.finalized_block)
-                    if args.finalized_block is not None
-                    else None
-                ),
+                "source": "sn39_metagraph",
+                "network": args.score_network,
+                "netuid": args.score_netuid,
+                "block": int(snapshot_document["block"]),
+                "block_hash": str(snapshot_document["block_hash"]),
                 "candidates": candidate_rows,
             },
             wire_report_sha256=wire_digest,
@@ -1646,6 +1682,40 @@ class _FetchBudget:
         self.remaining_seconds()
 
 
+def _getaddrinfo_bounded(host: str, port: int, timeout: float) -> list:
+    """Resolve with a GENUINE prompt bound: getaddrinfo runs on a daemon
+    thread and the caller waits at most ``timeout`` seconds — a slow
+    resolver fails at the budget, not after the resolver returns, and the
+    abandoned daemon thread never blocks interpreter shutdown."""
+    import queue as _queue
+    import socket as _socket
+    import threading as _threading
+
+    channel: _queue.Queue = _queue.Queue(maxsize=1)
+
+    def _resolve() -> None:
+        try:
+            channel.put(
+                ("ok", _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP))
+            )
+        except OSError as exc:
+            channel.put(("err", exc))
+
+    worker = _threading.Thread(
+        target=_resolve, name="cathedral-dns", daemon=True
+    )
+    worker.start()
+    try:
+        kind, value = channel.get(timeout=max(0.0, timeout))
+    except _queue.Empty:
+        raise ValueError(
+            f"DNS resolution for {host} exceeded the command deadline"
+        ) from None
+    if kind == "err":
+        raise ValueError(f"evidence host does not resolve: {host}") from value
+    return value
+
+
 def _resolved_public_address(
     host: str, port: int, *, allow_private: bool,
     budget: _FetchBudget | None = None,
@@ -1653,16 +1723,9 @@ def _resolved_public_address(
     """Resolve once, validate the address policy, and return the EXACT peer
     the transport must use — no second unvalidated resolution."""
     import ipaddress as _ip
-    import socket as _socket
 
-    if budget is not None:
-        budget.remaining_seconds()  # blocking DNS counts against the deadline
-    try:
-        infos = _socket.getaddrinfo(host, port, proto=_socket.IPPROTO_TCP)
-    except OSError as exc:
-        raise ValueError(f"evidence host does not resolve: {host}") from exc
-    if budget is not None:
-        budget.remaining_seconds()  # a slow resolver fails promptly here
+    timeout = budget.remaining_seconds() if budget is not None else 30.0
+    infos = _getaddrinfo_bounded(host, port, timeout)
     if not infos:
         raise ValueError(f"evidence host does not resolve: {host}")
     for info in infos:
@@ -2904,6 +2967,16 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--ledger-db", required=True)
         command.add_argument("--measurements-file")
         command.add_argument(
+            "--challenge-anchor-block", type=int, default=None,
+            help="finalized SN39 block number anchoring this epoch's derived "
+                 "challenge nonces (REQUIRED for production CPU scoring)",
+        )
+        command.add_argument(
+            "--challenge-anchor-hash", default=None,
+            help="hash of the finalized anchor block; nonces derive from it "
+                 "under the cathedral-tdx-challenge-v1 domain",
+        )
+        command.add_argument(
             "--evidence-retention-dir",
             default=None,
             help="retain verified raw admission evidence (controlled disclosure) "
@@ -3057,10 +3130,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
     p_export_evidence.add_argument("--source-revision")
     p_export_evidence.add_argument(
-        "--finalized-block",
-        type=int,
-        help="trusted finalized SN39 block observed by the epoch loop; "
-             "committed into the candidate-set binding",
+        "--candidate-snapshot",
+        required=True,
+        help="cathedral_candidate_snapshot_v1 JSON: the anchored SN39 "
+             "metagraph (network/netuid/block/block_hash/hotkeys) the epoch "
+             "loop observed; every registered hotkey is accounted for",
     )
     p_export_evidence.add_argument("--index-signing-key-id", required=True)
     p_export_evidence.add_argument("--index-signing-key-file", required=True)

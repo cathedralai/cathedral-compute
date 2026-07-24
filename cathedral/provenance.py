@@ -685,6 +685,7 @@ def replay_positive_miners(
     epoch_generated_at: str | None = None,
     max_evidence_age_seconds: float = 3600.0,
     deadline_monotonic: float | None = None,
+    challenge_anchor: Mapping[str, Any] | None = None,
 ) -> ProvenanceResult:
     """Upgrade a receipts-only result to FULL assurance via raw replay.
 
@@ -722,6 +723,32 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"manifest attestation for {miner.hotkey!r} lacks an evidence digest"
             )
+        challenge_digest = binding.get("challenge_digest")
+        if not isinstance(challenge_digest, str) or not challenge_digest:
+            raise ProvenanceError(
+                f"no committed challenge randomness for {miner.hotkey!r}; "
+                "freshness is NOT PROVEN"
+            )
+        if challenge_anchor is None:
+            raise ProvenanceError(
+                "no finalized-block challenge anchor; a derived, publicly "
+                "verifiable challenge is required for FULL provenance"
+            )
+        from cathedral.challenge import expected_challenge_digest
+
+        derived_digest = expected_challenge_digest(
+            block_hash=str(challenge_anchor["block_hash"]),
+            network=str(challenge_anchor["network"]),
+            netuid=int(challenge_anchor["netuid"]),
+            source_epoch=result.source_epoch,
+            miner_hotkey=miner.hotkey,
+        )
+        if derived_digest != challenge_digest:
+            raise ProvenanceError(
+                f"challenge commitment for {miner.hotkey!r} does not derive "
+                "from the anchored finalized block; stale or issuer-chosen "
+                "nonces never reach FULL"
+            )
         envelope = envelopes_by_hotkey.get(miner.hotkey)
         if envelope is None:
             raise ProvenanceError(
@@ -744,12 +771,6 @@ def replay_positive_miners(
             raise ProvenanceError(
                 f"work for {miner.hotkey!r} was not independently replayed; a "
                 "valid quote plus a signer-asserted work claim never reaches FULL"
-            )
-        challenge_digest = binding.get("challenge_digest")
-        if not isinstance(challenge_digest, str) or not challenge_digest:
-            raise ProvenanceError(
-                f"no committed challenge randomness for {miner.hotkey!r}; "
-                "freshness is NOT PROVEN"
             )
         try:
             issued_at = datetime.strptime(

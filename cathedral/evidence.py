@@ -541,15 +541,21 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
     candidate_set = document["candidate_set"]
     if (
         not isinstance(candidate_set, Mapping)
-        or set(candidate_set) != {"source", "finalized_block", "candidates"}
-        or candidate_set["source"] != "enrollment_registry"
+        or set(candidate_set)
+        != {"source", "network", "netuid", "block", "block_hash", "candidates"}
+        or candidate_set["source"] != "sn39_metagraph"
+        or candidate_set["network"] != document["network"]
+        or candidate_set["netuid"] != document["netuid"]
     ):
         raise EvidenceError("evidence manifest candidate_set is invalid")
-    block = candidate_set["finalized_block"]
-    if block is not None and (
-        isinstance(block, bool) or not isinstance(block, int) or block < 0
+    block = candidate_set["block"]
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        raise EvidenceError("evidence manifest candidate block is invalid")
+    block_hash = candidate_set["block_hash"]
+    if not isinstance(block_hash, str) or not re.fullmatch(
+        r"(0x)?[0-9a-f]{64}", block_hash
     ):
-        raise EvidenceError("evidence manifest candidate finalized_block is invalid")
+        raise EvidenceError("evidence manifest candidate block hash is invalid")
     candidates = candidate_set["candidates"]
     if not isinstance(candidates, list) or len(candidates) > 4096:
         raise EvidenceError("evidence manifest candidates list is invalid")

@@ -307,8 +307,11 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
             }
         ],
         candidate_set={
-            "source": "enrollment_registry",
-            "finalized_block": None,
+            "source": "sn39_metagraph",
+            "network": NETWORK,
+            "netuid": NETUID,
+            "block": 100,
+            "block_hash": "0x" + "ab" * 32,
             "candidates": [
                 {
                     "hotkey": "public-hotkey",
@@ -443,6 +446,21 @@ def exported_evidence(tmp_path: Path, capsys):
     index_key_path = tmp_path / "index-signing.key"
     _write_key_file(index_key_path, INDEX_SEED)
     evidence_dir = tmp_path / "evidence"
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "schema": "cathedral_candidate_snapshot_v1",
+                "network": NETWORK,
+                "netuid": NETUID,
+                "block": 100,
+                "block_hash": "0x" + "ab" * 32,
+                "hotkeys": ["public-hotkey"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
     code = cli_main(
         [
@@ -468,6 +486,8 @@ def exported_evidence(tmp_path: Path, capsys):
             "evidence-index-test-1",
             "--index-signing-key-file",
             str(index_key_path),
+            "--candidate-snapshot",
+            str(snapshot_path),
         ]
     )
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
@@ -815,15 +835,17 @@ def test_dns_resolution_is_capped_by_the_command_deadline(monkeypatch):
     from cathedral.cli import _FetchBudget, _resolved_public_address
 
     def slow_resolver(*_a, **_k):
-        time.sleep(0.05)
+        time.sleep(0.25)  # a genuinely slow resolver
         return [(socket.AF_INET, 0, 6, "", ("34.71.88.140", 443))]
 
     monkeypatch.setattr(socket, "getaddrinfo", slow_resolver)
     budget = _FetchBudget(deadline_seconds=0.001)
     started = time.monotonic()
-    with pytest.raises(ValueError, match="total deadline"):
+    with pytest.raises(ValueError, match="exceeded the command deadline"):
         _resolved_public_address("example.com", 443, allow_private=False, budget=budget)
-    assert time.monotonic() - started < 0.5  # promptly, not after retries
+    elapsed = time.monotonic() - started
+    # The failure lands at ~the 1ms budget, NOT after the 250ms resolver.
+    assert elapsed < 0.1, elapsed
 
 
 def test_production_refuses_the_private_host_bypass(tmp_path, capsys):

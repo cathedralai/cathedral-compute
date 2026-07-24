@@ -396,8 +396,11 @@ def test_candidate_omission_cannot_inflate_a_survivor(exported):
     the report fails the exhaustive accounting."""
     report, receipts = exported
     candidate_set = {
-        "source": "enrollment_registry",
-        "finalized_block": None,
+        "source": "sn39_metagraph",
+        "network": "local",
+        "netuid": 1,
+        "block": 100,
+        "block_hash": "0x" + "ab" * 32,
         "candidates": [
             {"hotkey": "public-hotkey", "outcome": "verified", "reason": "receipt_verified"},
             {"hotkey": "zero-hotkey", "outcome": "rejected", "reason": "no_verified_work"},

@@ -292,6 +292,8 @@ def _production_runtime(
             score_netuid=39,
             # Production CPU scoring requires durable raw-evidence retention.
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
     )
     return runtime, ledger, factory
@@ -333,6 +335,8 @@ def test_direct_production_epoch_requires_audience_before_network_or_epoch(
         config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
     )
 
@@ -355,6 +359,8 @@ def test_production_runtime_rejects_unsigned_or_compatibility_policy(tmp_path: P
             config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
         )
 
@@ -377,6 +383,8 @@ def test_production_runtime_rejects_forged_registry_metadata(tmp_path: Path) -> 
             config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
         )
 
@@ -402,6 +410,8 @@ def test_production_runtime_refreshes_policy_and_rejects_mid_epoch_change(
         config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
     )
     runtime._active_policy_authority = initial.registry_authority_identity
@@ -423,6 +433,8 @@ def test_production_runtime_rejects_custom_verifier_escape_hatch(tmp_path: Path)
             config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
         )
 
@@ -436,6 +448,8 @@ def test_production_runtime_requires_live_policy_refresher(tmp_path: Path) -> No
             config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
         )
 
@@ -758,6 +772,8 @@ def test_production_rejects_legacy_report_data_before_work(tmp_path: Path, monke
         config=RuntimeConfig(
             production_mode=True,
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
     )
 

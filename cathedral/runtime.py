@@ -106,6 +106,12 @@ class RuntimeConfig:
     customer_job_max_attempts: int = 3
     score_network: str | None = None
     score_netuid: int | None = None
+    # Publicly derivable challenge anchor: the finalized SN39 block (and its
+    # hash) each epoch's TDX challenge nonces are derived from. REQUIRED for
+    # production CPU scoring - a random issuer nonce is not a public
+    # freshness proof.
+    challenge_anchor_block: int | None = None
+    challenge_anchor_hash: str | None = None
     # Controlled-disclosure retention of raw admission evidence (quotes and
     # their binding material). REQUIRED for production CPU scoring: the
     # runtime refuses to start without a safe retention directory, and any
@@ -332,6 +338,15 @@ class ConfidentialRuntime:
             preflight_tdx_verifier(self.policy)
             if self.config.expected_tier is Tier.CC_CPU_TDX:
                 _preflight_evidence_retention(self.config.evidence_retention_dir)
+                if not self.config.challenge_anchor_hash:
+                    raise ValueError(
+                        "production CPU scoring requires a finalized-block "
+                        "challenge anchor (--challenge-anchor-hash/-block); "
+                        "issuer-random nonces are not a public freshness proof"
+                    )
+                from cathedral.challenge import normalize_block_hash
+
+                normalize_block_hash(self.config.challenge_anchor_hash)
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -527,6 +542,8 @@ class ConfidentialRuntime:
     ) -> EpochRun:
         if not isinstance(publish, bool):
             raise ValueError("publish must be a boolean")
+        # The active epoch anchors every derived challenge nonce this cycle.
+        self._active_source_epoch = int(source_epoch)
         self._require_live_gpu_profile()
         canary_target, canary_endpoint = self._validate_target(canary)
 
@@ -1370,7 +1387,22 @@ class ConfidentialRuntime:
                 return _AttestationResult(target, endpoint, error="reattestation cancelled")
             gpu_budget_reserved = False
             try:
-                nonce = self.nonce_factory()
+                if self.config.challenge_anchor_hash:
+                    # Anchored, publicly derivable challenge: any validator can
+                    # recompute this exact nonce from the finalized block hash,
+                    # audience, epoch, and hotkey. (Lifecycle re-attestations
+                    # between epochs reuse the last epoch's anchor slot.)
+                    from cathedral.challenge import derive_challenge_nonce
+
+                    nonce = derive_challenge_nonce(
+                        block_hash=self.config.challenge_anchor_hash,
+                        network=self.config.score_network or "local",
+                        netuid=self.config.score_netuid or 0,
+                        source_epoch=int(getattr(self, "_active_source_epoch", 0)),
+                        miner_hotkey=target.hotkey,
+                    )
+                else:
+                    nonce = self.nonce_factory()
                 if not isinstance(nonce, bytes) or len(nonce) != 32:
                     raise RuntimeError("nonce_factory must return exactly 32 bytes")
                 if self.config.expected_tier is Tier.CC_GPU:
