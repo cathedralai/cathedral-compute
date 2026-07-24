@@ -69,13 +69,18 @@ recorded, justified exception — not a silent suppression.
 
 ## Public freshness and candidate accountability (round-three hardening)
 
-- **Derived challenges.** The 32-byte TDX challenge nonce is DERIVED, not
-  issuer-random: `sha256("cathedral-tdx-challenge-v1\0" ||
-  canonical{block_hash, network, netuid, source_epoch, miner_hotkey})`
-  (`cathedral/challenge.py`). Anyone can recompute it from the finalized
-  SN39 block hash; cross-epoch evidence reuse fails cryptographically with
-  no replay cache involved. Production CPU scoring REFUSES to start without
-  a challenge anchor.
+- **Derived challenges (v2).** The 32-byte TDX challenge nonce is DERIVED,
+  not issuer-random: `sha256("cathedral-tdx-challenge-v2\0" ||
+  canonical{block, block_hash, network, netuid, source_epoch,
+  miner_hotkey})` (`cathedral/challenge.py`) — the normalized finalized
+  block HEIGHT is bound alongside the hash, network, and netuid at every
+  site (producer/runtime, digest, verifier, replay). Anyone can recompute
+  it from finalized SN39 chain state; cross-epoch evidence reuse fails
+  cryptographically with no replay cache involved. Production CPU scoring
+  REFUSES to start without a challenge anchor, and report validity windows
+  cannot start before the anchored block
+  (valid_from_block >= candidate_snapshot.block, enforced by producer and
+  verifier).
 - **Independent candidate set.** The finalized-block challenge anchor is
   persisted ON THE EPOCH at `begin_epoch` (validated block+hash pair with
   its audience); nonce derivation and the durable record are read-back
