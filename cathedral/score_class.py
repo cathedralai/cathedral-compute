@@ -18,7 +18,11 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from cathedral.launch_limits import MAX_LAUNCH_CANDIDATES
+from cathedral.launch_limits import (
+    MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_HOTKEY_BYTES,
+    MAX_LAUNCH_SCORE_REPORT_BYTES,
+)
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptError, parse_receipt_json
 
@@ -27,7 +31,7 @@ REPORT_DOMAIN = b"cathedral-score-class-report-v1\x00"
 REPORT_ID_DOMAIN = b"cathedral-score-class-id-v1\x00"
 CANDIDATE_SNAPSHOT_SCHEMA = "cathedral_candidate_snapshot_v1"
 _BLOCK_HASH_RE = re.compile(r"^(0x)?[0-9a-f]{64}$")
-MAX_REPORT_BYTES = 1_048_576
+MAX_REPORT_BYTES = MAX_LAUNCH_SCORE_REPORT_BYTES
 MAX_REPORT_ENTRIES = MAX_LAUNCH_CANDIDATES
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -150,7 +154,10 @@ def validate_candidate_snapshot(
     if not isinstance(hotkeys, list) or len(hotkeys) > MAX_REPORT_ENTRIES:
         raise ScoreClassError("candidate snapshot hotkeys are invalid")
     for hotkey in hotkeys:
-        if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
+        if (
+            not isinstance(hotkey, str)
+            or not 1 <= len(hotkey.encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+        ):
             raise ScoreClassError("candidate snapshot carries an invalid hotkey")
     if len(set(hotkeys)) != len(hotkeys):
         raise ScoreClassError("candidate snapshot carries duplicate hotkeys")
@@ -315,7 +322,10 @@ def export_score_class_report(
     rows_by_hotkey: dict[str, Any] = {}
     for row in rows:
         hotkey = row["hotkey"]
-        if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
+        if (
+            not isinstance(hotkey, str)
+            or not 1 <= len(hotkey.encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+        ):
             raise ScoreClassError("invalid miner hotkey in frozen epoch")
         rows_by_hotkey[hotkey] = row
     for hotkey in sorted(set(rows_by_hotkey) - set(snapshot_binding["hotkeys"])):

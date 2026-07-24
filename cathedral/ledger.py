@@ -24,6 +24,7 @@ from cathedral.lanes.sat import (
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.launch_limits import (
     MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_HOTKEY_BYTES,
     MAX_LAUNCH_VERIFIED_CANDIDATES,
 )
 from cathedral.lifecycle import (
@@ -81,9 +82,20 @@ def _validate_launch_report_cardinality(body: bytes) -> None:
             f"({len(scores)} > {MAX_LAUNCH_CANDIDATES})"
         )
     verified_count = 0
+    seen_hotkeys: set[str] = set()
     for row in scores:
         if not isinstance(row, dict):
             raise LedgerError("persisted confidential score report has an invalid score row")
+        hotkey = row.get("miner_hotkey")
+        if (
+            not isinstance(hotkey, str)
+            or not 1 <= len(hotkey.encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
+            or hotkey in seen_hotkeys
+        ):
+            raise LedgerError(
+                "persisted confidential score report has an invalid or duplicate hotkey"
+            )
+        seen_hotkeys.add(hotkey)
         value = row.get("score")
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise LedgerError("persisted confidential score report has an invalid score")

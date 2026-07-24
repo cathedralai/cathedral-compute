@@ -33,6 +33,8 @@ from typing import Any
 
 from cathedral.launch_limits import (
     MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_HOTKEY_BYTES,
+    MAX_LAUNCH_SCORE_REPORT_BYTES,
     MAX_LAUNCH_VERIFIED_CANDIDATES,
 )
 from cathedral.policy_registry import (
@@ -73,7 +75,7 @@ MAX_INDEX_RECENT = 96
 MAX_INDEX_ARTIFACT_BYTES = 256 * 1024
 MAX_MANIFEST_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_REGISTRY_ARTIFACT_BYTES = MAX_REGISTRY_BYTES  # 1 MiB, policy_registry pin
-MAX_REPORT_ARTIFACT_BYTES = 2 * 1024 * 1024
+MAX_REPORT_ARTIFACT_BYTES = MAX_LAUNCH_SCORE_REPORT_BYTES
 MAX_RECEIPT_ARTIFACT_BYTES = 64 * 1024
 # SAT grammar worst case (cathedral/lanes/sat.py): 65,536 literals over
 # <= 8192 clauses encodes to ~410 KiB of canonical JSON; 512 KiB bounds it.
@@ -568,7 +570,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
             or not isinstance(row["receipt_id"], str)
             or not row["receipt_id"].startswith("receipt-sha256:")
             or not isinstance(row["hotkey"], str)
-            or not row["hotkey"]
+            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
         ):
             raise EvidenceError("evidence manifest receipt row is invalid")
         _require_digest(row["blob"], "receipt blob")
@@ -590,7 +592,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
                 "disclosure",
             }
             or not isinstance(row["hotkey"], str)
-            or not row["hotkey"]
+            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
             or not isinstance(row["verdict"], str)
             or row["disclosure"] not in _DISCLOSURES
         ):
@@ -625,7 +627,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
             not isinstance(row, Mapping)
             or set(row) != {"hotkey", "outcome", "reason"}
             or not isinstance(row["hotkey"], str)
-            or not row["hotkey"]
+            or not 1 <= len(row["hotkey"].encode("utf-8")) <= MAX_LAUNCH_HOTKEY_BYTES
             or row["outcome"] not in _CANDIDATE_OUTCOMES
             or not isinstance(row["reason"], str)
             or len(row["reason"]) > 200

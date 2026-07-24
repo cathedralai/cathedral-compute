@@ -1337,6 +1337,23 @@ def test_complete_epoch_refuses_more_verified_miners_than_evidence_can_export() 
     assert ledger.get_epoch(epoch_id)["status"] == "running"
 
 
+def test_complete_epoch_refuses_hotkey_the_subnet_ingest_cannot_accept() -> None:
+    from cathedral.launch_limits import MAX_LAUNCH_HOTKEY_BYTES
+
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    oversized = "x" * (MAX_LAUNCH_HOTKEY_BYTES + 1)
+
+    with pytest.raises(LedgerError, match="invalid or duplicate hotkey"):
+        ledger.complete_epoch(
+            epoch_id,
+            {oversized},
+            score_network="finney",
+            score_netuid=39,
+        )
+    assert ledger.get_epoch(epoch_id)["status"] == "running"
+
+
 def test_legacy_completed_over_cap_is_refused_before_publication_network() -> None:
     from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 

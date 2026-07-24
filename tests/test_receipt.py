@@ -1385,6 +1385,110 @@ def test_score_class_export_enforces_the_epoch_anchor_and_snapshot_shape(
     ledger.close()
 
 
+def test_maximum_launch_epoch_is_publishable_and_score_class_exportable(
+    tmp_path: Path,
+):
+    """The producer's exact 4,096/28 launch boundary must remain consumable.
+
+    This is the counterexample that the publication-only cardinality check
+    previously missed: a valid wire report could be frozen and posted while
+    the corresponding public score-class report exceeded its smaller cap.
+    Use maximum-length subnet-ingest hotkeys and real signed receipts for all
+    28 positive candidates, then require the complete downstream export.
+    """
+    from cathedral.launch_limits import (
+        MAX_LAUNCH_CANDIDATES,
+        MAX_LAUNCH_HOTKEY_BYTES,
+        MAX_LAUNCH_SCORE_REPORT_BYTES,
+        MAX_LAUNCH_VERIFIED_CANDIDATES,
+    )
+
+    registry = _snapshot()
+    ledger = Ledger(tmp_path / "maximum-launch-ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=registry.release,
+        policy_registry_digest=registry.digest,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
+    )
+    hotkeys = [
+        f"5{index:04x}" + "x" * (MAX_LAUNCH_HOTKEY_BYTES - 5)
+        for index in range(MAX_LAUNCH_CANDIDATES)
+    ]
+    for index, hotkey in enumerate(hotkeys[:MAX_LAUNCH_VERIFIED_CANDIDATES]):
+        challenge_id = f"{index:064x}"
+        _snapshot_value, policy, claims, receipt = _issued_receipt(
+            epoch_id=epoch_id,
+            subject_hotkey=hotkey,
+            challenge_id=challenge_id,
+            work_units=1.0,
+        )
+        ledger.issue_challenge(challenge_id, hotkey, epoch_id)
+        ledger.resolve_challenge_with_receipt(
+            challenge_id,
+            "verified",
+            1.0,
+            validator_derived=True,
+            receipt_id=receipt.receipt_id,
+            receipt_body=receipt.receipt_bytes,
+            receipt_digest=receipt.receipt_digest,
+            issued_at=ISSUED_TEXT,
+        )
+        ledger.add_attestation(
+            epoch_id,
+            hotkey,
+            verdict="VERIFIED",
+            tee_type="TDX",
+            workload="CPU",
+            evidence_digest=claims.hardware.evidence_digest,
+            policy_mode="strict",
+        )
+        ledger.add_lifecycle_snapshot(
+            epoch_id,
+            _worker_lifecycle(policy, claims, hotkey),
+            snapshot_at=ISSUED_TEXT,
+        )
+
+    ledger.complete_epoch(
+        epoch_id,
+        set(hotkeys),
+        generated_at=ISSUED_TEXT,
+        score_network="local",
+        score_netuid=1,
+    )
+    report = export_score_class_report(
+        ledger,
+        epoch_id,
+        network="local",
+        netuid=1,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=RECEIPT_SEED_2,
+        generated_at=ISSUED,
+        valid_until=ISSUED + timedelta(minutes=5),
+        valid_from_block=ANCHOR_BLOCK,
+        valid_until_block=ANCHOR_BLOCK + 100,
+        verifier_digest="sha256:" + "d" * 64,
+        candidate_snapshot={
+            "schema": "cathedral_candidate_snapshot_v1",
+            "network": "local",
+            "netuid": 1,
+            "block": ANCHOR_BLOCK,
+            "block_hash": ANCHOR_HASH,
+            "hotkeys": hotkeys,
+        },
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+
+    assert 1024 * 1024 < len(report) <= MAX_LAUNCH_SCORE_REPORT_BYTES
+    assert len(json.loads(report)["entries"]) == MAX_LAUNCH_CANDIDATES
+    ledger.close()
+
+
 def test_score_class_export_requires_the_anchor_in_production(tmp_path: Path):
     ledger = Ledger(tmp_path / "unanchored-ledger.sqlite")
     epoch_id = ledger.begin_epoch(11)
