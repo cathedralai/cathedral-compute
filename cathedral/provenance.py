@@ -127,7 +127,11 @@ class ProvenanceResult:
     source_epoch: int
     generated_at: str
     valid_until: str
+    mechanism_revision: int = 1
     assurance_level: str = ASSURANCE_RECEIPTS_ONLY
+    # Why a receipts_only result could not reach FULL (surfaced in the
+    # NOT_PROVEN event/audit); empty for FULL results.
+    not_proven_reasons: tuple[str, ...] = ()
     # The report's SIGNED candidate-snapshot binding ({digest, block,
     # block_hash, hotkeys}); the independent-oracle gate in
     # replay_positive_miners compares externally captured chain state
@@ -207,6 +211,14 @@ def _mechanism_validated_supply_v1(
 
 MECHANISMS: dict[str, Callable[[list[tuple[str, Decimal]]], dict[str, float]]] = {
     "validated_supply_v1": _mechanism_validated_supply_v1,
+}
+
+# Production dispatch is on the exact (id, revision) PAIR: the manifest's
+# reward_mechanism carries both, and an independent validator recomputes only
+# a pair frozen here. Any derivation change bumps the revision (or the id),
+# so an unsupported pair fails BEFORE any recomputation or fence reservation.
+MECHANISM_REVISIONS: dict[str, int] = {
+    "validated_supply_v1": 1,
 }
 
 
@@ -401,6 +413,7 @@ def verify_and_recompute(
     expected_netuid: int,
     expected_verifier_digest: str,
     mechanism_id: str = "validated_supply_v1",
+    mechanism_revision: int = 1,
     expected_previous_report_id: str | None = None,
     enforce_chain: bool = False,
     now: datetime | None = None,
@@ -418,10 +431,21 @@ def verify_and_recompute(
     digest-mismatched receipt for a positive miner fails closed.
     """
     mechanism = MECHANISMS.get(mechanism_id)
-    if mechanism is None:
+    pinned_revision = MECHANISM_REVISIONS.get(mechanism_id)
+    if mechanism is None or pinned_revision is None:
         raise ProvenanceError(
             f"unknown reward mechanism {mechanism_id!r}; this validator only "
             f"recomputes {sorted(MECHANISMS)}"
+        )
+    if (
+        isinstance(mechanism_revision, bool)
+        or not isinstance(mechanism_revision, int)
+        or mechanism_revision != pinned_revision
+    ):
+        raise ProvenanceError(
+            f"unsupported mechanism pair ({mechanism_id!r}, revision="
+            f"{mechanism_revision!r}); this validator recomputes exactly "
+            f"({mechanism_id!r}, revision={pinned_revision})"
         )
     registry = load_registry(
         registry_bytes,
@@ -642,6 +666,7 @@ def verify_and_recompute(
         policy_digest=registry.digest,
         verifier_digest=expected_verifier_digest,
         mechanism_id=mechanism_id,
+        mechanism_revision=pinned_revision,
         source_epoch=int(document["source_epoch"]),
         generated_at=str(document["generated_at"]),
         valid_until=str(document["valid_until"]),
@@ -655,13 +680,36 @@ _VECTOR_ROW_FIELDS = frozenset(
     {"miner_hotkey", "weight", "base_component", "external_component", "uid"}
 )
 _VECTOR_ROW_REQUIRED = ("weight", "base_component", "external_component")
-_BURN_SNAPSHOT_FIELDS = frozenset({"burn_uid", "forced_burn_percentage"})
+# The REAL signed subnet burn snapshot (scaffold/publisher/weights.py
+# build_signed_vector + scaffold/validator_thin.py _validated_supply_meta):
+# ``burn_uid`` is explicitly null (validators resolve the burn HOTKEY against
+# the live metagraph and reject pinned historical UIDs), ``burn_hotkey`` is
+# the nonempty configured destination, and ``forced_burn_percentage`` is the
+# fixed 10.0 — for EVERY epoch shape. A zero-supply epoch keeps the signed
+# 10% and burns 100% at UID-mapping time because no positive rows exist.
+_BURN_SNAPSHOT_FIELDS = frozenset({"burn_uid", "burn_hotkey", "forced_burn_percentage"})
+_VALIDATED_SUPPLY_POLICY_FIELDS = frozenset(
+    {
+        "contract_version",
+        "intel_tdx_allocation",
+        "verified_gpu_allocation",
+        "verified_gpu_admitted",
+        "burn_hotkey",
+    }
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # The validated_supply_v1 burn contract (docs/BUDGET.md): a FIXED 10% burn to
-# the configured burn destination whenever verified supply exists, and 100%
-# burn when it does not. The floor is part of the versioned mechanism id;
-# changing it requires a new mechanism version pinned everywhere.
+# the configured burn destination. The floor is part of the versioned
+# mechanism id; changing it requires a new mechanism version pinned
+# everywhere. The subnet validator enforces the same 10.0 exactly.
 VALIDATED_SUPPLY_V1_BURN_FRACTION = 0.10
+VALIDATED_SUPPLY_V1_BURN_PERCENTAGE = 10.0
+VALIDATED_SUPPLY_V1_TDX_ALLOCATION = 0.90
+VALIDATED_SUPPLY_V1_GPU_ALLOCATION = 0.10
+VALIDATED_SUPPLY_CONTRACT_VERSION = "v1"
+CONFIDENTIAL_SOURCE = "cathedral_confidential_tdx"
+CONFIDENTIAL_SCORE_SOURCE = "confidential_primary:cathedral_confidential_tdx"
 
 
 def _row_component(row: Mapping[str, Any], hotkey: str, name: str) -> float | str:
@@ -679,40 +727,66 @@ def _row_component(row: Mapping[str, Any], hotkey: str, name: str) -> float | st
     return number
 
 
+def _policy_number(value: object) -> float | None:
+    """A finite float from signed policy metadata, or None when malformed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _normalized_sha256_hex(value: object) -> str | None:
+    """Lowercase 64-hex (optionally ``sha256:``-prefixed), or None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower().removeprefix("sha256:")
+    return text if _SHA256_HEX_RE.fullmatch(text) else None
+
+
 def compare_with_vector(
     result: ProvenanceResult,
     signed_vector: Mapping[str, Any],
     *,
+    wire_report_sha256: str | None = None,
     abs_tol: float = 1e-9,
 ) -> tuple[bool, list[str]]:
     """Validate the signed vector's complete ``validated_supply_v1`` contract
-    and compare its NORMALIZED confidential external shares against the
-    recomputed unit shares. Returns ``(agree, discrepancies)``.
+    against the REAL subnet wire shape and compare its confidential shares
+    with the recomputation. Returns ``(agree, discrepancies)``.
 
-    Contract enforced before any share comparison (all fail-closed):
+    The contract is read from the actual producer/consumer pair
+    (``scaffold/publisher/weights.py`` / ``scaffold/validator_thin.py``):
 
-      * every row carries EXPLICIT ``weight``, ``base_component``, and
-        ``external_component`` (no fallback), each finite and nonnegative,
-        composing exactly (``weight == base + external``);
-      * ``burn_snapshot`` is present with the fixed validated_supply_v1 burn:
-        10% (``forced_burn_percentage == 10.0``, integer ``burn_uid``
-        destination) with verified supply, 100% burn with none;
-      * no non-confidential base mass rides along (``sum(base) == 0``) and
-        the vector conserves emission (``sum(weight) + burn == 1``).
+      * rows are PRE-burn: base_component is exactly 0, weight equals
+        external_component, and positive supply sums to 1.0 — the subnet
+        validator applies the 10% burn afterwards at UID-mapping time;
+      * ``burn_snapshot`` is exactly ``{burn_uid: null, burn_hotkey,
+        forced_burn_percentage: 10.0}`` for EVERY epoch shape — validators
+        resolve the burn HOTKEY against the live metagraph, and a pinned
+        historical integer burn uid is rejected, never required;
+      * ``policy_metadata.validated_supply`` is the signed launch-locked
+        90/10 block (contract v1, 0.90 Intel TDX, 0.10 Verified GPU, GPU
+        not admitted, burn_hotkey matching the snapshot) and
+        ``policy_metadata.confidential_primary`` must assert the epoch's
+        confidential mass consistently;
+      * the burn hotkey must never be reused as a paying miner hotkey.
 
-    The signed vector distributes the post-burn external mass (e.g. 0.9 for
-    the 90% TDX class + 10% burn launch shape) while the recomputation yields
-    pre-burn unit shares summing to 1.0, so external components are
-    normalized by their own total before comparison — raw 0.9 mass is never
-    compared to a recomputed 1.0 share. The comparison is symmetric: a
-    hotkey earning in the signed vector without verified provenance is
-    exactly as much of a discrepancy as a verified hotkey the vector omits.
+    Epoch/report binding (fail-closed): agreement additionally requires the
+    SIGNED ``policy_metadata.external_scores`` block to bind this exact
+    verified epoch — ``latest_epoch`` equal to the evidence source_epoch and
+    ``latest_complete`` true, backed by the publisher's one-report-per-epoch
+    ingest immutability. ``wire_report_sha256`` (the evidence manifest's
+    digest of the ingested wire report) is REQUIRED; when the signed block
+    also carries ``latest_body_sha256`` (the raw ingest body digest — see
+    docs/PROVENANCE.md for the subnet pin-advance) it must equal it. Same
+    proportions NEVER prove the same epoch on their own.
     """
-    if result.mechanism_id != "validated_supply_v1":
+    if result.mechanism_id != "validated_supply_v1" or result.mechanism_revision != 1:
         return False, [
             (
-                f"unsupported mechanism {result.mechanism_id!r}: this comparison "
-                "validates the validated_supply_v1 vector contract only"
+                f"unsupported mechanism pair ({result.mechanism_id!r}, revision="
+                f"{result.mechanism_revision!r}): this comparison validates the "
+                "(validated_supply_v1, revision=1) vector contract only"
             )
         ]
     vector_rows = signed_vector.get("weights")
@@ -757,6 +831,14 @@ def compare_with_vector(
                     f"{base + external!r}"
                 )
             ]
+        if base != 0.0:
+            return False, [
+                (
+                    f"signed vector row for {hotkey!r} has base_component "
+                    f"{base!r}; under validated_supply_v1 the base share is "
+                    "exactly zero (confidential_primary rows only)"
+                )
+            ]
         if "uid" in row:
             uid = row["uid"]
             if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
@@ -770,37 +852,209 @@ def compare_with_vector(
         if external > 0.0:
             vector_ext[hotkey] = external
 
-    # The signed validated_supply_v1 burn contract: explicit, well-formed,
-    # and exactly the fixed floor the versioned mechanism id freezes.
+    # The signed validated_supply_v1 burn snapshot: the REAL wire grammar.
     burn_snapshot = signed_vector.get("burn_snapshot")
     if not isinstance(burn_snapshot, Mapping) or frozenset(burn_snapshot) != _BURN_SNAPSHOT_FIELDS:
         return False, [
             (
                 "signed vector burn_snapshot is missing or malformed (exactly "
-                "burn_uid and forced_burn_percentage are required)"
+                "burn_uid, burn_hotkey, and forced_burn_percentage are required)"
             )
         ]
-    burn_uid = burn_snapshot["burn_uid"]
-    if isinstance(burn_uid, bool) or not isinstance(burn_uid, int) or burn_uid < 0:
+    if burn_snapshot["burn_uid"] is not None:
         return False, [
             (
-                "signed vector burn_uid must be the explicit non-negative burn "
-                "destination uid; validated_supply_v1 always burns"
+                "signed vector burn_uid must be null: validated_supply_v1 "
+                "resolves the burn destination by hotkey against the live "
+                "metagraph, and validators reject a pinned historical burn uid"
             )
+        ]
+    burn_hotkey = burn_snapshot["burn_hotkey"]
+    if not isinstance(burn_hotkey, str) or not burn_hotkey:
+        return False, [
+            ("signed vector burn_hotkey must be the nonempty configured burn destination hotkey")
         ]
     percentage = burn_snapshot["forced_burn_percentage"]
     if isinstance(percentage, bool) or not isinstance(percentage, (int, float)):
         return False, ["signed vector forced_burn_percentage is not numeric"]
-    burn_fraction = float(percentage) / 100.0
-    if not math.isfinite(burn_fraction) or not 0.0 <= burn_fraction <= 1.0:
-        return False, ["signed vector forced_burn_percentage is outside 0..100"]
+    if not math.isclose(
+        float(percentage), VALIDATED_SUPPLY_V1_BURN_PERCENTAGE, rel_tol=0.0, abs_tol=abs_tol
+    ):
+        return False, [
+            (
+                f"signed vector forced_burn_percentage {percentage!r} violates "
+                f"the fixed validated_supply_v1 floor "
+                f"{VALIDATED_SUPPLY_V1_BURN_PERCENTAGE:.1f} (signed for every "
+                "epoch shape; a zero-supply epoch burns 100% because no "
+                "positive rows exist)"
+            )
+        ]
 
-    # Mechanism-wide invariants hold for EVERY epoch shape: only the
-    # verified confidential class plus the burn may carry mass, the burn is
-    # exactly what validated_supply_v1 fixes for the epoch's supply (10%
-    # with verified supply, 100% without), and the vector plus its declared
-    # burn must conserve the whole emission — a base-mass row can never
-    # ride along, not even under a 100% burn.
+    # The signed launch-locked policy blocks, exactly as the subnet
+    # validator's validated_supply_v1 pin enforces them.
+    metadata = signed_vector.get("policy_metadata")
+    if not isinstance(metadata, Mapping):
+        return False, [
+            (
+                "signed vector carries no policy_metadata; the "
+                "validated_supply_v1 contract requires the signed "
+                "validated_supply, confidential_primary, and external_scores "
+                "policy blocks"
+            )
+        ]
+    supply_policy = metadata.get("validated_supply")
+    if not isinstance(supply_policy, Mapping):
+        return False, ["signed vector policy_metadata.validated_supply block is missing"]
+    if frozenset(supply_policy) != _VALIDATED_SUPPLY_POLICY_FIELDS:
+        return False, ["signed vector validated_supply policy fields mismatch"]
+    if supply_policy["contract_version"] != VALIDATED_SUPPLY_CONTRACT_VERSION:
+        return False, [
+            (
+                "signed vector validated_supply contract_version "
+                f"{supply_policy['contract_version']!r} is unsupported (v1 only)"
+            )
+        ]
+    tdx_allocation = _policy_number(supply_policy["intel_tdx_allocation"])
+    gpu_allocation = _policy_number(supply_policy["verified_gpu_allocation"])
+    if (
+        tdx_allocation is None
+        or gpu_allocation is None
+        or not math.isclose(
+            tdx_allocation, VALIDATED_SUPPLY_V1_TDX_ALLOCATION, rel_tol=0.0, abs_tol=abs_tol
+        )
+        or not math.isclose(
+            gpu_allocation, VALIDATED_SUPPLY_V1_GPU_ALLOCATION, rel_tol=0.0, abs_tol=abs_tol
+        )
+        or not math.isclose(tdx_allocation + gpu_allocation, 1.0, rel_tol=0.0, abs_tol=abs_tol)
+    ):
+        return False, [
+            (
+                "signed vector validated_supply allocations must be exactly "
+                "0.90 Intel TDX + 0.10 Verified GPU"
+            )
+        ]
+    if supply_policy["verified_gpu_admitted"] is not False:
+        return False, ["signed vector validated_supply v1 cannot admit the Verified GPU class"]
+    if supply_policy["burn_hotkey"] != burn_hotkey:
+        return False, [
+            (
+                "signed vector validated_supply burn_hotkey does not match "
+                "the burn_snapshot destination"
+            )
+        ]
+
+    recomputed = result.recomputed_hotkey_weights
+    confidential = metadata.get("confidential_primary")
+    if not isinstance(confidential, Mapping):
+        return False, [
+            (
+                "signed vector policy_metadata.confidential_primary block is "
+                "missing; the validated_supply_v1 pin requires "
+                "confidential_primary evidence"
+            )
+        ]
+    if confidential.get("contract_version") != "v1":
+        return False, ["signed vector confidential_primary contract_version is unsupported"]
+    if confidential.get("source") != CONFIDENTIAL_SOURCE:
+        return False, [f"signed vector confidential_primary source is not {CONFIDENTIAL_SOURCE}"]
+    if _policy_number(confidential.get("base_mass")) != 0.0:
+        return False, ["signed vector confidential_primary base_mass must be 0"]
+    confidential_mass = _policy_number(confidential.get("confidential_mass"))
+    expected_mass = 1.0 if recomputed else 0.0
+    if confidential_mass != expected_mass:
+        return False, [
+            (
+                f"signed vector confidential_primary confidential_mass "
+                f"{confidential.get('confidential_mass')!r} does not match the "
+                f"recomputed epoch supply (expected {expected_mass:.1f})"
+            )
+        ]
+    if recomputed and not (
+        confidential.get("mode") == "confidential_primary"
+        and confidential.get("complete") is True
+        and confidential.get("fresh") is True
+        and confidential.get("confirmed") is True
+    ):
+        return False, [
+            (
+                "signed vector confidential_primary mass=1 requires "
+                "mode=confidential_primary with complete/fresh/confirmed all true"
+            )
+        ]
+
+    # Epoch/report binding: the SIGNED external_scores status must bind this
+    # exact evidence epoch, and the manifest must carry the ingest digest.
+    external_status = metadata.get("external_scores")
+    if not isinstance(external_status, Mapping):
+        return False, ["signed vector policy_metadata.external_scores block is missing"]
+    if external_status.get("enabled") is not True:
+        return False, ["signed vector external_scores.enabled is not true"]
+    if external_status.get("source") != CONFIDENTIAL_SOURCE:
+        return False, [f"signed vector external_scores source is not {CONFIDENTIAL_SOURCE}"]
+    if external_status.get("mode") != "confidential_primary":
+        return False, ["signed vector external_scores mode is not confidential_primary"]
+    if external_status.get("latest_complete") is not True:
+        return False, [
+            (
+                "signed vector external_scores.latest_complete is not true; "
+                "only a complete ingested snapshot can back the vector"
+            )
+        ]
+    latest_epoch = external_status.get("latest_epoch")
+    if isinstance(latest_epoch, bool) or not isinstance(latest_epoch, int):
+        return False, ["signed vector external_scores.latest_epoch is not an integer"]
+    if int(latest_epoch) != int(result.source_epoch):
+        return False, [
+            (
+                f"signed vector is bound to ingested source epoch "
+                f"{latest_epoch}, not the verified evidence epoch "
+                f"{result.source_epoch}; same proportions never prove the "
+                "same epoch"
+            )
+        ]
+    latest_report_digest = _normalized_sha256_hex(external_status.get("latest_report_sha256"))
+    if latest_report_digest is None:
+        return False, [
+            (
+                "signed vector external_scores.latest_report_sha256 is missing "
+                "or malformed; the vector must identify its ingested report"
+            )
+        ]
+    manifest_wire_digest = _normalized_sha256_hex(wire_report_sha256)
+    if manifest_wire_digest is None:
+        return False, [
+            (
+                "evidence manifest carries no publisher ingest report digest "
+                "(wire_report_sha256); the signed vector cannot be bound to "
+                "the verified epoch's ingest"
+            )
+        ]
+    body_digest_raw = external_status.get("latest_body_sha256")
+    if body_digest_raw is not None:
+        body_digest = _normalized_sha256_hex(body_digest_raw)
+        if body_digest is None or body_digest != manifest_wire_digest:
+            return False, [
+                (
+                    "signed vector external_scores.latest_body_sha256 does not "
+                    "match the evidence manifest's wire_report_sha256; the "
+                    "vector was built from a DIFFERENT ingested report body"
+                )
+            ]
+    if metadata.get("score_source") != CONFIDENTIAL_SCORE_SOURCE:
+        return False, [f"signed vector score_source is not {CONFIDENTIAL_SCORE_SOURCE}"]
+
+    # The burn destination must never double as a paying miner.
+    if burn_hotkey in seen_hotkeys:
+        return False, [
+            (
+                f"signed vector burn hotkey {burn_hotkey!r} is reused as a "
+                "miner hotkey; the burn destination must never earn"
+            )
+        ]
+
+    # Mass invariants for the REAL pre-burn rows: zero base mass always;
+    # positive supply sums to exactly 1.0 (the validator applies the burn
+    # after UID mapping); zero supply carries zero row mass.
     if not math.isclose(total_base, 0.0, rel_tol=0.0, abs_tol=abs_tol):
         return False, [
             (
@@ -809,43 +1063,35 @@ def compare_with_vector(
                 "verified confidential class plus the fixed burn"
             )
         ]
-    recomputed = result.recomputed_hotkey_weights
     if recomputed:
-        if not math.isclose(
-            burn_fraction, VALIDATED_SUPPLY_V1_BURN_FRACTION, rel_tol=0.0, abs_tol=abs_tol
-        ):
+        if not math.isclose(total_weight, 1.0, rel_tol=0.0, abs_tol=abs_tol):
             return False, [
                 (
-                    f"signed vector burn {burn_fraction:.9f} violates the fixed "
-                    f"validated_supply_v1 floor {VALIDATED_SUPPLY_V1_BURN_FRACTION:.2f} "
-                    "for an epoch with verified supply"
+                    f"signed vector does not conserve emission: pre-burn "
+                    f"weights sum to {total_weight:.9f}, not 1.0 (the 10% "
+                    "burn is applied at UID-mapping time, never in the rows)"
                 )
             ]
-    elif not math.isclose(burn_fraction, 1.0, rel_tol=0.0, abs_tol=abs_tol):
+        if total_external <= 0.0:
+            return False, [
+                (
+                    "signed vector assigns no confidential external mass while "
+                    "the recomputation has verified supply"
+                )
+            ]
+    elif not math.isclose(total_weight, 0.0, rel_tol=0.0, abs_tol=abs_tol):
         return False, [
             (
-                f"signed vector burn {burn_fraction:.9f} != 1.0: an epoch with "
-                "no verified supply must burn the complete vector"
-            )
-        ]
-    if not math.isclose(total_weight + burn_fraction, 1.0, rel_tol=0.0, abs_tol=abs_tol):
-        return False, [
-            (
-                f"signed vector does not conserve emission: weights "
-                f"{total_weight:.9f} + burn {burn_fraction:.9f} != 1.0"
-            )
-        ]
-    if recomputed and total_external <= 0.0:
-        return False, [
-            (
-                "signed vector assigns no confidential external mass while "
-                "the recomputation has verified supply"
+                f"signed vector carries positive mass {total_weight:.9f} while "
+                "the recomputation has no verified supply; every row must be "
+                "an explicit zero revocation"
             )
         ]
 
-    # Normalized confidential shares: the vector's external components carry
-    # the post-burn class mass; dividing by their own total yields the same
-    # 1.0-sum basis as the recomputed unit shares.
+    # Shares: rows are pre-burn and sum to 1.0, the recomputed unit shares
+    # sum to 1.0 — normalize by the external total for exactness and compare
+    # symmetrically: an unverified earner and an omitted verified miner are
+    # equally discrepancies.
     vector_share = (
         {hotkey: value / total_external for hotkey, value in vector_ext.items()}
         if total_external > 0.0
@@ -872,7 +1118,7 @@ def replay_positive_miners(
     verifier_blob_digest: str,
     verifier_command: tuple[str, ...],
     verifier_artifacts: tuple[str, ...],
-    candidates_all_rejected: bool = False,
+    candidate_outcomes: Mapping[str, str] | None = None,
     epoch_generated_at: str | None = None,
     max_evidence_age_seconds: float = 3600.0,
     deadline_monotonic: float | None = None,
@@ -898,6 +1144,22 @@ def replay_positive_miners(
     verifier path under the signed-registry policy evaluated at the
     receipt's issue time. Any gap is a hard ProvenanceError — the result is
     never silently left at receipts-only by this path.
+
+    ``candidate_outcomes`` (the manifest's exhaustive per-candidate outcome
+    map, hotkey -> verified|rejected|retired) is REQUIRED and gates the
+    epoch-level claim: FULL asserts the WHOLE weight decision was
+    independently proven, and a ``rejected`` outcome is a Cathedral-signed
+    assertion with no independently replayable rejection evidence in the
+    launch artifact model. Positive replays still run and are individually
+    proven, but ANY active (non-retired) rejected candidate keeps the epoch
+    at receipts_only (NOT PROVEN) — a compromised Cathedral rejecting a
+    real miner must never be laundered into a FULL vector that inflates
+    everyone else. Malformed or inconsistent outcome evidence (unknown
+    outcome values, coverage drift against the anchored snapshot, a
+    ``verified`` outcome without a verified receipt or vice versa) is a
+    hard ProvenanceError, never a downgrade. A retired-only or otherwise
+    zero-replay epoch also stays receipts_only, with the pinned verifier
+    bytes still authenticated so fake pinned bytes surface here too.
     """
     from dataclasses import replace as dataclass_replace
 
@@ -937,6 +1199,41 @@ def replay_positive_miners(
             f"historical oracle (omitted from report: {omitted}; not "
             f"registered at the anchored block: {fabricated})"
         )
+
+    # Exhaustive outcome accounting: FULL is an epoch-level claim, so the
+    # manifest's per-candidate outcomes must be present, well-formed, cover
+    # exactly the anchored snapshot, and agree with the receipt evidence.
+    if candidate_outcomes is None:
+        raise ProvenanceError(
+            "FULL provenance requires the manifest's exhaustive per-candidate "
+            "outcomes; without them a rejected candidate cannot be "
+            "distinguished from an omitted one"
+        )
+    outcomes = {str(hotkey): str(outcome) for hotkey, outcome in candidate_outcomes.items()}
+    unknown_outcomes = sorted(set(outcomes.values()) - {"verified", "rejected", "retired"})
+    if unknown_outcomes:
+        raise ProvenanceError(
+            f"candidate outcomes carry unknown values {unknown_outcomes}; "
+            "malformed outcome evidence is a hard failure"
+        )
+    if set(outcomes) != bound_hotkeys:
+        drift = sorted(set(outcomes) ^ bound_hotkeys)
+        raise ProvenanceError(
+            "candidate outcomes do not cover exactly the report's anchored "
+            f"snapshot hotkeys (drift: {drift})"
+        )
+    for miner in result.miners:
+        outcome = outcomes.get(miner.hotkey)
+        if miner.receipt_verified and outcome != "verified":
+            raise ProvenanceError(
+                f"candidate outcome for {miner.hotkey!r} is {outcome!r} but a "
+                "verified receipt backs the entry; inconsistent evidence"
+            )
+        if not miner.receipt_verified and outcome == "verified":
+            raise ProvenanceError(
+                f"candidate outcome for {miner.hotkey!r} claims verified "
+                "without a verified receipt; inconsistent evidence"
+            )
 
     upgraded: list[MinerProvenance] = []
     replayed_count = 0
@@ -1067,32 +1364,51 @@ def replay_positive_miners(
         upgraded.append(dataclass_replace(miner, raw_verified=True))
 
     result.miners = upgraded
+    rejected_candidates = sorted(
+        hotkey for hotkey, outcome in outcomes.items() if outcome == "rejected"
+    )
     if replayed_count == 0:
-        # Nothing raw was replayed. A zero-positive epoch could only claim
-        # FULL if (a) the manifest's exhaustive candidate accounting proves
-        # every active candidate was explicitly rejected, (b) the PINNED
-        # verifier bytes independently authenticate against BOTH the content
-        # digest and the implementation digest, and (c) candidate-specific
-        # RAW rejection evidence replays for every active candidate. The
-        # launch artifact model publishes no raw rejection evidence, so (c)
-        # cannot be satisfied and an all-rejected epoch REMAINS
-        # receipts_only (NOT PROVEN) - fail closed; zero replays never mint
-        # FULL. Invalid pinned verifier bytes are a hard error even here:
-        # a fake or unexercised binary must surface, never ride along.
-        if candidates_all_rejected:
-            try:
-                authenticate_verifier_bytes(
-                    verifier_binary,
-                    expected_blob_digest=verifier_blob_digest,
-                    declared_command=tuple(verifier_command),
-                    declared_artifacts=tuple(verifier_artifacts),
-                    expected_implementation_digest=result.verifier_digest,
-                )
-            except ReplayError as exc:
-                raise ProvenanceError(
-                    f"pinned verifier bytes failed authentication: {exc}"
-                ) from exc
+        # Nothing raw was replayed (all-rejected, retired-only, or empty).
+        # The PINNED verifier bytes must still independently authenticate
+        # against BOTH the content digest and the implementation digest: a
+        # fake or unexercised binary must surface, never ride along.
+        try:
+            authenticate_verifier_bytes(
+                verifier_binary,
+                expected_blob_digest=verifier_blob_digest,
+                declared_command=tuple(verifier_command),
+                declared_artifacts=tuple(verifier_artifacts),
+                expected_implementation_digest=result.verifier_digest,
+            )
+        except ReplayError as exc:
+            raise ProvenanceError(f"pinned verifier bytes failed authentication: {exc}") from exc
+    if rejected_candidates:
+        # A rejection is a Cathedral-signed assertion; the launch artifact
+        # model publishes no candidate-specific RAW rejection evidence an
+        # independent verifier could replay. Whatever positives replayed
+        # stay individually proven, but the EPOCH-level FULL claim is not:
+        # the result remains receipts_only (NOT PROVEN) — fail closed; a
+        # signed rejection alone never mints FULL.
+        shown = rejected_candidates[:8]
+        suffix = "" if len(rejected_candidates) <= 8 else f" (+{len(rejected_candidates) - 8} more)"
         result.assurance_level = ASSURANCE_RECEIPTS_ONLY
+        result.not_proven_reasons = (
+            (
+                f"rejection of active candidate(s) {shown}{suffix} is asserted "
+                "by Cathedral's signed chain but not independently replayable "
+                "in the launch artifact model"
+            ),
+        )
+        return result
+    if replayed_count == 0:
+        result.assurance_level = ASSURANCE_RECEIPTS_ONLY
+        result.not_proven_reasons = (
+            (
+                "no positive raw replays: the epoch's active candidate set is "
+                "empty or retired-only, so nothing raw could be proven"
+            ),
+        )
         return result
     result.assurance_level = ASSURANCE_FULL
+    result.not_proven_reasons = ()
     return result

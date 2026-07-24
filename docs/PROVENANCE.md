@@ -64,20 +64,60 @@ pinned here yet (`docs/LAUNCH_CANDIDATE.md`, NOT PROVEN item 5).
    EXACTLY equal to the report's signed binding. Two mutually consistent
    Cathedral artifacts are never an oracle: an omitted registered hotkey
    or a fabricated anchor fails closed before any replay.
-6. The recomputed `validated_supply_v1` vector (units-proportional shares;
-   the fixed 10% burn floor is applied at UID-mapping time and validated
-   by the subnet vector contract — see `docs/BUDGET.md`).
+6. The recomputed vector under the exact frozen mechanism pair
+   `(validated_supply_v1, revision=1)` — the manifest carries both halves
+   and verification dispatches on the pair, refusing any other id or
+   revision BEFORE recomputation and before any fence reservation
+   (units-proportional shares; the fixed 10% burn floor is applied at
+   UID-mapping time and validated by the subnet vector contract — see
+   `docs/BUDGET.md`).
 
 ## Acceptance semantics
 
 | Outcome | Meaning | Submission basis? |
 |---|---|---|
-| `PASS` + `assurance=full` | Every check above held, raw evidence replayed, oracle equality proven | Yes (authority mode) |
-| `NOT_PROVEN` (`receipts_only`) | Signed chain internally consistent; raw evidence NOT replayed (missing controlled package, missing oracle, or a zero-positive epoch — the artifact model publishes no raw rejection evidence) | Never |
-| `FAIL` | A signature, binding, bound, freshness, equivocation, or replay check failed | Never — fail closed |
+| `PASS` + `assurance=full` | Every check above held, EVERY active candidate's outcome independently proven (all positives raw-replayed, no unproven rejection), oracle equality proven | Yes (authority mode) |
+| `NOT_PROVEN` (`receipts_only`) | Signed chain internally consistent; the epoch was not FULLY replayed: missing controlled package, missing oracle, a zero-positive epoch, or ANY active candidate carrying a `rejected` outcome — a rejection is a Cathedral-signed assertion and the artifact model publishes no independently replayable rejection evidence, so a mixed positive/rejected epoch is NOT PROVEN even when every positive replays | Never |
+| `FAIL` | A signature, binding, bound, freshness, equivocation, replay, or malformed/inconsistent-evidence check failed (including outcome/receipt inconsistency and reservation conflicts) | Never — fail closed |
 
 Exit code 0 requires `PASS` at `assurance=full` (or the explicit
 `--allow-receipts-only` acknowledgement, which still records NOT_PROVEN).
+The durable anti-rollback fences are reserved atomically BEFORE the
+terminal `PROVENANCE_RESULT` event is emitted and before the audit file
+reports acceptance: a reservation conflict aborts the run with a terminal
+`FAIL` only — no accepting event or audit record can precede a failed
+reservation.
+
+## Signed-vector comparison binding (`--publisher-url`)
+
+`compare_with_vector` reports agreement ONLY when the signed subnet vector
+is bound to the verified evidence epoch, never from matching proportions
+alone. The REAL `validated_supply_v1` wire contract (read from
+`scaffold/publisher/weights.py` and `scaffold/validator_thin.py` in the
+subnet repo) is enforced in full: pre-burn rows (base 0, weight ==
+external, positive supply summing to 1.0), `burn_snapshot == {burn_uid:
+null, burn_hotkey, forced_burn_percentage: 10.0}` (validators resolve the
+burn HOTKEY against the live metagraph; a pinned historical integer burn
+uid is rejected, never required), the signed
+`policy_metadata.validated_supply` launch block (contract v1, 0.90 Intel
+TDX, 0.10 Verified GPU, GPU not admitted, matching burn hotkey), the
+`confidential_primary` mass assertions, no burn-hotkey reuse as a miner,
+and the signed `external_scores` binding: `latest_epoch` equal to the
+verified `source_epoch` with `latest_complete=true`, backed by the
+publisher's one-report-per-epoch ingest immutability, checked against the
+manifest's `wire_report_sha256` presence.
+
+**Residual gap (subnet pin-advance required).** The subnet's signed
+`latest_report_sha256` digests its NORMALIZED ingest row, while the
+evidence manifest's `wire_report_sha256` digests the raw posted body —
+different byte domains, so byte-exact report binding cannot be checked
+today and the epoch binding above is the strongest signed link. The exact
+subnet change: store `sha256(raw ingest body)` at ingest and echo it as
+`external_scores.latest_body_sha256` in the signed vector metadata. The
+comparator ALREADY enforces equality with `wire_report_sha256` whenever
+that field is present, so the subnet change lands without a confidential
+release. Until then, same-epoch report substitution inside the publisher
+is NOT PROVEN by this comparison.
 
 ## Logs
 
