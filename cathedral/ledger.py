@@ -480,7 +480,12 @@ class Ledger:
         self._migrate_epochs_table_if_needed()
         self._migrate_registry_policy_fields_if_needed()
         self._migrate_attestation_policy_mode_if_needed()
+        # The GPU widening rebuild must run BEFORE the envelope-digest column
+        # is added: it recreates epoch_attestations from a fixed column list,
+        # and running it afterwards would silently drop the new column on a
+        # historical CPU-only database.
         self._migrate_gpu_attestations_if_needed()
+        self._migrate_attestation_envelope_if_needed()
         self._migrate_worker_lifecycle_fields_if_needed()
 
     def _migrate_registry_policy_fields_if_needed(self) -> None:
@@ -496,6 +501,26 @@ class Ledger:
                 )
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add registry policy audit fields") from exc
+
+    def _migrate_attestation_envelope_if_needed(self) -> None:
+        """Add the retained-envelope digest binding to historical rows.
+
+        NULL means "no controlled envelope was retained for this row" —
+        exactly the state of every pre-migration attestation. Full-provenance
+        replay of such rows reports NOT_PROVEN.
+        """
+
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "envelope_digest" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN envelope_digest TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation envelope audit field") from exc
 
     def _migrate_attestation_policy_mode_if_needed(self) -> None:
         """Mark historical attestation rows as compatibility-mode evidence."""
@@ -527,6 +552,11 @@ class Ledger:
             return
         temporary = f"epoch_attestations_gpu_{uuid.uuid4().hex}"
         previous_foreign_keys = self._connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        # Preserve every column added by other migrations: a rebuild must
+        # never silently drop data (the envelope-digest binding in particular).
+        has_envelope = "envelope_digest" in columns
+        envelope_column_sql = "envelope_digest TEXT," if has_envelope else ""
+        envelope_select_sql = ",envelope_digest" if has_envelope else ""
         self._connection.execute("PRAGMA foreign_keys = OFF")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -541,6 +571,7 @@ class Ledger:
                 "policy_mode TEXT NOT NULL DEFAULT 'compatibility',"
                 "score_eligible INTEGER NOT NULL CHECK(score_eligible IN (0,1)),"
                 "attested_at TEXT NOT NULL,"
+                f"{envelope_column_sql}"
                 "CHECK ((tee_type='TDX' AND workload='CPU') OR "
                 "(tee_type='TDX+GPU_CC' AND workload='GPU')),"
                 "PRIMARY KEY (epoch_id,hotkey))"
@@ -549,7 +580,7 @@ class Ledger:
                 f"INSERT INTO {temporary} "
                 "SELECT epoch_id,hotkey,verdict,tee_type,workload,evidence_digest,"
                 "policy_mode,CASE WHEN tee_type='TDX' AND workload='CPU' THEN 1 ELSE 0 END,"
-                "attested_at FROM epoch_attestations"
+                f"attested_at{envelope_select_sql} FROM epoch_attestations"
             )
             self._connection.execute("DROP TABLE epoch_attestations")
             self._connection.execute(f"ALTER TABLE {temporary} RENAME TO epoch_attestations")
@@ -1511,8 +1542,24 @@ class Ledger:
         evidence_digest: str,
         policy_mode: str = "compatibility",
         score_eligible: bool | None = None,
+        envelope_digest: str | None = None,
+        envelope_required: bool = False,
     ) -> None:
-        """Add exact CPU or composite-GPU evidence to a running epoch."""
+        """Add exact CPU or composite-GPU evidence to a running epoch.
+
+        ``envelope_required`` is set by production CPU scoring: a scoring
+        attestation without a durably retained raw-evidence envelope fails
+        closed here, as a second gate behind the runtime's retention check.
+        """
+        if envelope_digest is not None and (
+            not isinstance(envelope_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", envelope_digest) is None
+        ):
+            raise LedgerError("attestation envelope digest is invalid")
+        if envelope_required and envelope_digest is None:
+            raise LedgerError(
+                "production scoring attestation requires a retained envelope digest"
+            )
         hardware_shape = (verdict, tee_type, workload)
         if hardware_shape not in {
             ("VERIFIED", "TDX", "CPU"),
@@ -1534,17 +1581,24 @@ class Ledger:
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "add attestations")
             existing = cx.execute(
-                "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible "
+                "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible,"
+                "envelope_digest "
                 "FROM epoch_attestations "
                 "WHERE epoch_id = ? AND hotkey = ?",
                 (epoch_id, hotkey),
             ).fetchone()
             if existing:
+                if envelope_required and existing["envelope_digest"] is None:
+                    raise LedgerError(
+                        "production scoring attestation requires a retained "
+                        "envelope digest"
+                    )
                 if (
                     existing["evidence_digest"] != evidence_digest
                     or existing["policy_mode"] != policy_mode
                     or existing["tee_type"] != tee_type
                     or existing["workload"] != workload
+                    or existing["envelope_digest"] != envelope_digest
                     or bool(existing["score_eligible"]) is not score_eligible
                 ):
                     raise LedgerError("attestation evidence is immutable within an epoch")
@@ -1552,8 +1606,8 @@ class Ledger:
             cx.execute(
                 "INSERT INTO epoch_attestations "
                 "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, "
-                "policy_mode, score_eligible, attested_at) "
-                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?)",
+                "policy_mode, score_eligible, attested_at, envelope_digest) "
+                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     epoch_id,
                     hotkey,
@@ -1563,6 +1617,7 @@ class Ledger:
                     policy_mode,
                     int(score_eligible),
                     _now(),
+                    envelope_digest,
                 ),
             )
 
@@ -2151,6 +2206,26 @@ class Ledger:
                 "SELECT hotkey FROM epoch_attestations WHERE epoch_id = ?", (epoch_id,)
             ).fetchall()
             return frozenset(row["hotkey"] for row in rows)
+
+    def attestation_rows(self, epoch_id: int) -> tuple[Mapping[str, Any], ...]:
+        """Read-only attestation facts for one epoch (evidence export)."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT hotkey, verdict, tee_type, workload, evidence_digest, "
+                "policy_mode, score_eligible, attested_at, envelope_digest "
+                "FROM epoch_attestations WHERE epoch_id = ? ORDER BY hotkey",
+                (epoch_id,),
+            ).fetchall()
+            return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def latest_published_epoch_id(self) -> int | None:
+        """Newest epoch whose report has been durably published, if any."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT epoch_id FROM epochs WHERE status = 'published' "
+                "ORDER BY epoch_id DESC LIMIT 1"
+            ).fetchone()
+            return int(row["epoch_id"]) if row is not None else None
 
     def _load_scores(self, cx: sqlite3.Connection, epoch_id: int) -> dict[str, float]:
         rows = cx.execute(

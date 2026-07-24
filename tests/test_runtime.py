@@ -290,6 +290,8 @@ def _production_runtime(
             production_mode=True,
             score_network="finney",
             score_netuid=39,
+            # Production CPU scoring requires durable raw-evidence retention.
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
         ),
     )
     return runtime, ledger, factory
@@ -328,7 +330,10 @@ def test_direct_production_epoch_requires_audience_before_network_or_epoch(
         token_provider=lambda _hotkey: "token",
         policy_refresher=lambda: policy,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
     )
 
     canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
@@ -347,7 +352,10 @@ def test_production_runtime_rejects_unsigned_or_compatibility_policy(tmp_path: P
             ledger,
             Policy(allowed_measurements={"measurement"}),
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
         )
 
 
@@ -366,7 +374,10 @@ def test_production_runtime_rejects_forged_registry_metadata(tmp_path: Path) -> 
             Ledger(tmp_path / "ledger.sqlite"),
             forged,
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
         )
 
 
@@ -388,7 +399,10 @@ def test_production_runtime_refreshes_policy_and_rejects_mid_epoch_change(
         initial,
         policy_refresher=lambda: replacement,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
     )
     runtime._active_policy_authority = initial.registry_authority_identity
 
@@ -406,7 +420,10 @@ def test_production_runtime_rejects_custom_verifier_escape_hatch(tmp_path: Path)
             policy,
             policy_refresher=lambda: policy,
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
         )
 
 
@@ -416,7 +433,10 @@ def test_production_runtime_requires_live_policy_refresher(tmp_path: Path) -> No
             RegistryStore(str(tmp_path / "registry.sqlite")),
             Ledger(tmp_path / "ledger.sqlite"),
             production_policy(),
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
         )
 
 
@@ -735,7 +755,10 @@ def test_production_rejects_legacy_report_data_before_work(tmp_path: Path, monke
         policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+        ),
     )
 
     with pytest.raises(RuntimeError, match="report data v2"):
@@ -1154,3 +1177,31 @@ def test_sat_lane_still_rejects_wrong_owner() -> None:
         "other",
     )
     assert lane.verify(item, cert) is None
+
+
+def test_production_cpu_preflight_requires_safe_retention_dir(tmp_path: Path) -> None:
+    from cathedral.runtime import _preflight_evidence_retention
+
+    with pytest.raises(ValueError, match="requires --evidence-retention-dir"):
+        _preflight_evidence_retention(None)
+
+    good = tmp_path / "retained"
+    _preflight_evidence_retention(str(good))  # creates 0700
+    assert (good.stat().st_mode & 0o777) == 0o700
+
+    lax = tmp_path / "lax"
+    lax.mkdir()
+    lax.chmod(0o755)
+    with pytest.raises(ValueError, match="0700"):
+        _preflight_evidence_retention(str(lax))
+
+    link = tmp_path / "link"
+    link.symlink_to(good)
+    with pytest.raises(ValueError, match="non-symlink"):
+        _preflight_evidence_retention(str(link))
+
+    not_dir = tmp_path / "file"
+    not_dir.write_text("x")
+    not_dir.chmod(0o700)
+    with pytest.raises(ValueError, match="non-symlink directory|not a directory"):
+        _preflight_evidence_retention(str(not_dir))

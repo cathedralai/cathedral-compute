@@ -11,8 +11,10 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
 import threading
 import urllib.parse
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -104,6 +106,12 @@ class RuntimeConfig:
     customer_job_max_attempts: int = 3
     score_network: str | None = None
     score_netuid: int | None = None
+    # Controlled-disclosure retention of raw admission evidence (quotes and
+    # their binding material). REQUIRED for production CPU scoring: the
+    # runtime refuses to start without a safe retention directory, and any
+    # retention failure refuses that admission (fail closed). None disables
+    # retention in development only.
+    evidence_retention_dir: str | None = None
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -220,6 +228,7 @@ class _AttestationResult:
     endpoint: str
     attested: Attested | None = None
     evidence_digest: str | None = None
+    envelope_digest: str | None = None
     client: MinerClient | None = None
     error: str | None = None
     error_category: str | None = None
@@ -320,6 +329,8 @@ class ConfidentialRuntime:
             if self.policy_refresher is None:
                 raise ValueError("production runtime requires a live policy registry refresher")
             preflight_tdx_verifier(self.policy)
+            if self.config.expected_tier is Tier.CC_CPU_TDX:
+                _preflight_evidence_retention(self.config.evidence_retention_dir)
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -849,6 +860,44 @@ class ConfidentialRuntime:
             lifecycle_revision=snapshot.revision,
         )
 
+    def _retain_admission_evidence(
+        self,
+        evidences: tuple[Evidence, ...],
+        evidence_digest: str,
+        hotkey: str,
+    ) -> str | None:
+        """Durably retain verified raw evidence for controlled disclosure.
+
+        When retention is configured it MUST succeed: production scoring
+        requires the durable raw evidence that full provenance replays, so a
+        retention failure refuses this admission (the target fails closed to
+        zero/burn like any other evidence failure). There is no silent
+        best-effort path. Returns the envelope digest binding the controlled
+        artifact into the public manifest.
+        """
+        directory = self.config.evidence_retention_dir
+        if not directory:
+            if self.config.production_mode and self.config.expected_tier is Tier.CC_CPU_TDX:
+                raise RuntimeError(
+                    "production CPU scoring requires evidence retention; "
+                    "configure --evidence-retention-dir"
+                )
+            return None
+        try:
+            from cathedral.evidence import RetentionStore
+
+            envelope = _retained_evidence_envelope(evidences, evidence_digest)
+            return RetentionStore(directory).retain(
+                envelope,
+                kind="admission_evidence",
+                hotkey=hotkey,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"evidence retention failed; refusing admission without a "
+                f"durable raw-evidence envelope: {_safe_error(exc)}"
+            ) from exc
+
     def _admit_unique_chips(
         self,
         epoch_id: int,
@@ -989,6 +1038,11 @@ class ConfidentialRuntime:
                 evidence_digest=result.evidence_digest,
                 policy_mode=result.attested.policy_mode or "compatibility",
                 score_eligible=score_eligible,
+                envelope_digest=result.envelope_digest,
+                envelope_required=(
+                    self.config.production_mode
+                    and self.config.expected_tier is Tier.CC_CPU_TDX
+                ),
             )
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey,
@@ -1405,11 +1459,17 @@ class ConfidentialRuntime:
                     verdict.assurance
                 ):
                     raise RuntimeError("production evidence requires a verified channel binding")
+                envelope_digest = None
+                if self.config.expected_tier is Tier.CC_CPU_TDX:
+                    envelope_digest = self._retain_admission_evidence(
+                        evidences, evidence_digest, target.hotkey
+                    )
                 return _AttestationResult(
                     target,
                     endpoint,
                     attested=verdict,
                     evidence_digest=evidence_digest,
+                    envelope_digest=envelope_digest,
                     client=client,
                     component_audit=component_audit,
                     gpu_component=gpu_component,
@@ -1593,6 +1653,99 @@ def _validate_bearer_token(token: str | None, *, required: bool) -> None:
         or any(ord(character) < 0x21 or ord(character) > 0x7E for character in token)
     ):
         raise ValueError("bearer token must be a nonempty bounded ASCII value")
+
+
+def _preflight_evidence_retention(directory: str | None) -> None:
+    """Fail closed at startup, before any network or epoch work, if the
+    production retention directory is absent or unsafe (symlink, non-dir,
+    group/world-writable, foreign-owned). Creates it 0700 when missing."""
+    import stat as stat_module
+
+    if not directory:
+        raise ValueError(
+            "production CPU scoring requires --evidence-retention-dir; "
+            "refusing to start without durable raw-evidence retention"
+        )
+    path = Path(directory)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    metadata = os.lstat(path)
+    if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
+        raise ValueError("evidence retention dir must be a real non-symlink directory")
+    if metadata.st_mode & 0o077:
+        raise ValueError("evidence retention dir must be mode 0700 (no group/world)")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise ValueError("evidence retention dir must be owned by the runtime user")
+    probe = path / f".preflight.{os.getpid()}"
+    try:
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+
+
+RETAINED_EVIDENCE_SCHEMA = "cathedral_retained_evidence_v1"
+
+
+def _retained_evidence_envelope(
+    evidences: tuple[Evidence, ...], evidence_digest: str
+) -> bytes:
+    """Serialize verified CPU-TDX admission evidence for controlled retention.
+
+    The envelope carries exactly the fields hashed by ``_evidence_digest`` so
+    an authorized reviewer can recompute the digest recorded in the ledger and
+    published (digest-only) in the evidence manifest, then replay the raw
+    quote through the pinned verifier.
+
+    Launch scope is CPU TDX only, and token-shaped material is never
+    persisted: a component of any other kind, or one carrying a composite
+    JWT, refuses retention outright (which in production refuses admission).
+    """
+    import base64 as _base64
+
+    def _b64(value: bytes | None) -> str | None:
+        return None if value is None else _base64.b64encode(value).decode("ascii")
+
+    components = []
+    for evidence in sorted(evidences, key=lambda item: item.kind.value):
+        if evidence.kind is not EvidenceKind.TDX:
+            raise RuntimeError(
+                "evidence retention is limited to CPU-TDX components at launch"
+            )
+        if evidence.composite_jwt is not None:
+            raise RuntimeError(
+                "refusing to retain token-shaped evidence material (composite JWT)"
+            )
+        binding = (
+            evidence.channel_binding.canonical_bytes()
+            if evidence.channel_binding is not None
+            else None
+        )
+        components.append(
+            {
+                "kind": evidence.kind.value,
+                "miner_hotkey": evidence.miner_hotkey,
+                "report_data_version": evidence.report_data_version,
+                "quote_base64": _b64(evidence.quote),
+                "nonce_base64": _b64(evidence.nonce),
+                "channel_binding_base64": _b64(binding),
+                "ssh_host_key_base64": _b64(evidence.ssh_host_key),
+                "cert_chain_base64": [_b64(item) for item in evidence.cert_chain],
+            }
+        )
+    return json.dumps(
+        {
+            "schema": RETAINED_EVIDENCE_SCHEMA,
+            "evidence_digest": evidence_digest,
+            "components": components,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _evidence_digest(evidence: Evidence) -> str:

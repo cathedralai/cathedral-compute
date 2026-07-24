@@ -75,7 +75,34 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
     return None
 
 
-def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
+def replay_verify_tdx(
+    evidence: Evidence,
+    nonce: bytes,
+    policy: Policy,
+    pinned_command: list[str],
+) -> Attested | None:
+    """Run the CANONICAL strict TDX verification against an explicit,
+    already-authenticated verifier binary (full-provenance replay).
+
+    Every parent-process invariant — intel_verified, report_data bytes,
+    claims_bound_to_quote, stable platform identity, PCK/AK ids, exact TCB
+    SVN grammar, status/advisory policy, debug and collateral gates — is the
+    exact same code path production admission uses; nothing is re-implemented
+    weaker. The caller must pass a strict registry-derived policy.
+    """
+    if not policy.tdx_strict:
+        return None
+    return _verify_tdx(
+        evidence, nonce, policy, _pinned_replay_command=list(pinned_command)
+    )
+
+
+def _verify_tdx(
+    evidence: Evidence,
+    nonce: bytes,
+    policy: Policy,
+    _pinned_replay_command: list[str] | None = None,
+) -> Attested | None:
     """TDX verifier adapter.
 
     Cathedral does not hand-roll Intel quote verification. Set
@@ -98,8 +125,12 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     expected_report_data = evidence_report_data(evidence, nonce)
     claims = _run_tdx_verifier(
         evidence.quote,
-        production_mode=policy.production_ready_for_tdx,
+        production_mode=(
+            True if _pinned_replay_command is not None
+            else policy.production_ready_for_tdx
+        ),
         expected_report_data=expected_report_data,
+        pinned_command=_pinned_replay_command,
     )
     # Both flags must be the exact JSON boolean true; missing, malformed, or
     # false (including string forms and integers) all reject.
@@ -416,11 +447,73 @@ def preflight_tdx_verifier(policy: Policy) -> None:
     _production_tdx_command(raw_command)
 
 
+def tdx_implementation_digest_from_bytes(
+    command: tuple[str, ...],
+    artifacts: tuple[str, ...],
+    artifact_bytes: dict[str, bytes],
+) -> str:
+    """Recompute the production implementation digest from supplied bytes.
+
+    Same preimage as the filesystem-pinned path (declared argv, artifact
+    paths, sanitized environment, working directory, and every artifact's
+    exact bytes) so an external full-provenance validator can verify the
+    published verifier binary against the pinned implementation digest
+    without Cathedral's root-owned installation layout.
+    """
+    # The CANONICAL production configuration validator: rejects relative,
+    # NUL/newline-bearing, oversized, sensitive-looking, or multi-artifact
+    # configurations exactly as the filesystem-pinned path does.
+    command, artifacts = _validate_production_tdx_configuration(command, list(artifacts))
+    if set(artifact_bytes) != set(artifacts):
+        raise ValueError("implementation digest requires bytes for exactly the artifacts")
+    # The executable must be the same static x86-64 ELF production demands:
+    # a script, dynamic executable, or PT_INTERP/PT_DYNAMIC program must
+    # never be blessed as the pinned verifier by a signed manifest.
+    import io as _io
+
+    executable_bytes = artifact_bytes[command[0]]
+    if not isinstance(executable_bytes, bytes) or not executable_bytes:
+        raise ValueError("implementation digest executable bytes are empty")
+    if len(executable_bytes) > _MAX_PINNED_ARTIFACT_BYTES:
+        raise ValueError("implementation digest executable is oversized")
+    try:
+        _require_static_linux_elf(_io.BytesIO(executable_bytes), len(executable_bytes))
+    except OSError as exc:
+        raise ValueError(
+            "pinned verifier bytes are not a static x86-64 Linux ELF"
+        ) from exc
+    digest = hashlib.sha256()
+    digest.update(b"cathedral-tdx-verifier-implementation-v1\0")
+    digest.update(
+        json.dumps(
+            {
+                "artifacts": list(artifacts),
+                "argv": list(command),
+                "environment": {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                "working_directory": "/",
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    for path in artifacts:
+        data = artifact_bytes[path]
+        if not isinstance(data, bytes) or len(data) > _MAX_PINNED_ARTIFACT_BYTES:
+            raise ValueError("implementation digest artifact bytes are invalid")
+        encoded_path = path.encode("utf-8")
+        digest.update(len(encoded_path).to_bytes(4, "big"))
+        digest.update(encoded_path)
+        digest.update(data)
+    return "sha256:" + digest.hexdigest()
+
+
 def _run_tdx_verifier(
     quote: bytes,
     *,
     production_mode: bool = False,
     expected_report_data: bytes | None = None,
+    pinned_command: list[str] | None = None,
 ) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
@@ -430,12 +523,26 @@ def _run_tdx_verifier(
     Returns an empty dict on any failure so callers can treat every field as
     absent and reject accordingly.
     """
-    cmd = os.environ.get("CATHEDRAL_TDX_VERIFY_CMD")
-    if not cmd:
-        raise NotImplementedError(
-            "TDX verify requires CATHEDRAL_TDX_VERIFY_CMD "
-            "(DCAP or Intel Trust Authority JSON verifier)"
-        )
+    if pinned_command is None:
+        cmd = os.environ.get("CATHEDRAL_TDX_VERIFY_CMD")
+        if not cmd:
+            raise NotImplementedError(
+                "TDX verify requires CATHEDRAL_TDX_VERIFY_CMD "
+                "(DCAP or Intel Trust Authority JSON verifier)"
+            )
+    else:
+        # Replay path: the caller has already authenticated the exact
+        # verifier bytes (content blob digest AND recomputed implementation
+        # digest) and materialized them privately. No environment is
+        # consulted, so no configuration race can swap the binary.
+        cmd = None
+        if (
+            not isinstance(pinned_command, list)
+            or len(pinned_command) != 1
+            or not isinstance(pinned_command[0], str)
+            or not os.path.isabs(pinned_command[0])
+        ):
+            return {}
 
     if not isinstance(production_mode, bool):
         return {}
@@ -451,7 +558,12 @@ def _run_tdx_verifier(
         "CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", _DEFAULT_MAX_OUTPUT, _MAX_VERIFY_OUTPUT
     )
     try:
-        command = _production_tdx_command(cmd) if production_mode else shlex.split(cmd)
+        if pinned_command is not None:
+            command = list(pinned_command)
+        elif production_mode:
+            command = _production_tdx_command(cmd)
+        else:
+            command = shlex.split(cmd)
     except (TypeError, ValueError):
         return {}
     if not command:

@@ -782,6 +782,11 @@ def _build_runtime(
         admission_enabled=require_policy,
         score_network=getattr(args, "score_network", None),
         score_netuid=getattr(args, "score_netuid", None),
+        evidence_retention_dir=(
+            getattr(args, "evidence_retention_dir", None)
+            or os.environ.get("CATHEDRAL_EVIDENCE_RETENTION_DIR")
+            or None
+        ),
     )
     if require_report_audience and config.production_mode and config.score_network is None:
         raise ValueError("production score reports require --score-network and --score-netuid")
@@ -1142,8 +1147,9 @@ def _write_score_class_report(path: str, body: bytes) -> None:
 def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
     ledger = Ledger(args.ledger_db)
     try:
+        epoch_id = _resolve_evidence_epoch(ledger, str(args.epoch_id))
         existing = ledger.get_score_class_export(
-            args.epoch_id,
+            epoch_id,
             network=args.score_network,
             netuid=args.score_netuid,
             class_id=args.class_id,
@@ -1165,7 +1171,7 @@ def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
             )
             report = export_score_class_report(
                 ledger,
-                args.epoch_id,
+                epoch_id,
                 network=args.score_network,
                 netuid=args.score_netuid,
                 class_id=args.class_id,
@@ -1203,6 +1209,1000 @@ def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
         return 0
     finally:
         ledger.close()
+
+
+def _resolve_evidence_epoch(ledger: Ledger, epoch_argument: str) -> int:
+    if epoch_argument == "latest-published":
+        epoch_id = ledger.latest_published_epoch_id()
+        if epoch_id is None:
+            raise ValueError("no published epoch exists yet")
+        return epoch_id
+    try:
+        return int(epoch_argument)
+    except ValueError as exc:
+        raise ValueError("epoch id must be an integer or 'latest-published'") from exc
+
+
+def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
+    """Export one published epoch as a public content-addressed evidence bundle.
+
+    Requires a prior ``runtime export-score-class`` for the same epoch: the
+    signed report is the spine of the bundle and this command never signs a
+    new one. It publishes: the registry blob, the signed report blob, every
+    referenced assurance receipt, the pinned verifier identity (and its binary
+    when supplied), the versioned reward-mechanism id, attestation digests
+    (controlled disclosure), and a freshly signed index pointing at the new
+    manifest.
+    """
+    from cathedral.evidence import (
+        EvidenceStore,
+        build_manifest,
+        build_signed_index,
+        digest_bytes,
+        parse_manifest,
+    )
+
+    ledger = Ledger(args.ledger_db)
+    try:
+        epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
+        export = ledger.get_score_class_export(
+            epoch_id,
+            network=args.score_network,
+            netuid=args.score_netuid,
+            class_id=args.class_id,
+            source_id=args.source_id,
+        )
+        if export is None:
+            raise ValueError(
+                f"epoch {epoch_id} has no score-class export for "
+                f"{args.class_id}/{args.source_id}; run 'runtime export-score-class' first"
+            )
+        report_bytes = bytes(export["report_body"])
+        report = json.loads(report_bytes)
+
+        registry_bytes = _read_bounded_registry_file(
+            args.policy_registry, "policy registry"
+        )
+        registry_document = parse_registry_json(registry_bytes)
+        registry_release = registry_document.get("release")
+        registry_digest = "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
+        if report.get("policy_digest") != registry_digest:
+            raise ValueError(
+                "signed report policy_digest does not match the supplied registry file"
+            )
+        if report.get("verifier_digest") != args.verifier_digest:
+            raise ValueError(
+                "signed report verifier_digest does not match --verifier-digest"
+            )
+
+        snapshot = ledger.score_class_snapshot(epoch_id)
+        receipts_by_id: dict[str, bytes] = {}
+        for row in snapshot["rows"]:
+            if row["receipt_id"] is not None and row["receipt_body"] is not None:
+                receipts_by_id[str(row["receipt_id"])] = bytes(row["receipt_body"])
+
+        store = EvidenceStore(args.evidence_dir)
+        registry_blob = store.put_blob(registry_bytes)
+        report_blob = store.put_blob(report_bytes)
+
+        manifest_receipts: list[dict[str, str]] = []
+        for entry in report.get("entries", []):
+            for reference in entry.get("evidence", []):
+                receipt_id = reference.get("id")
+                body = receipts_by_id.get(receipt_id)
+                if body is None:
+                    raise ValueError(
+                        f"report references receipt {receipt_id!r} that the ledger lacks"
+                    )
+                if digest_bytes(body) != reference.get("digest"):
+                    raise ValueError(
+                        f"ledger receipt {receipt_id!r} does not match the report digest"
+                    )
+                blob = store.put_blob(body)
+                store.put_receipt_copy(receipt_id, body)
+                manifest_receipts.append(
+                    {
+                        "receipt_id": receipt_id,
+                        "hotkey": entry["miner_hotkey"],
+                        "blob": blob,
+                    }
+                )
+
+        verifier_binary_blob = None
+        if args.verifier_binary:
+            verifier_binary_blob = store.put_blob(Path(args.verifier_binary).read_bytes())
+
+        def _normalized_digest(value: str) -> str:
+            text = str(value)
+            if re.fullmatch(r"[0-9a-f]{64}", text):
+                return "sha256:" + text
+            return text
+
+        attestations = [
+            {
+                "hotkey": str(row["hotkey"]),
+                "verdict": str(row["verdict"]),
+                "evidence_digest": _normalized_digest(row["evidence_digest"]),
+                "envelope_digest": (
+                    str(row["envelope_digest"])
+                    if row["envelope_digest"] is not None
+                    else None
+                ),
+                "disclosure": "controlled",
+            }
+            for row in ledger.attestation_rows(epoch_id)
+            if row["evidence_digest"]
+        ]
+
+        wire_digest = str(snapshot["report_digest"]).removeprefix("sha256:")
+        manifest_bytes = build_manifest(
+            network=args.score_network,
+            netuid=args.score_netuid,
+            source_epoch=int(snapshot["source_epoch"]),
+            epoch_id=epoch_id,
+            generated_at=None,
+            mechanism_id=args.mechanism,
+            mechanism_revision=args.mechanism_revision,
+            source_revision=args.source_revision,
+            registry_release=int(registry_release),
+            registry_digest=registry_digest,
+            registry_blob=registry_blob,
+            verifier_digest=args.verifier_digest,
+            verifier_binary_blob=verifier_binary_blob,
+            verifier_command=(
+                [args.verifier_production_path] if args.verifier_production_path else None
+            ),
+            verifier_artifacts=(
+                [args.verifier_production_path] if args.verifier_production_path else None
+            ),
+            report_id=str(report["report_id"]),
+            report_blob=report_blob,
+            report_signing_key_id=str(report["signing_key_id"]),
+            receipts=manifest_receipts,
+            attestations=attestations,
+            wire_report_sha256=wire_digest,
+        )
+        manifest_digest = store.put_blob(manifest_bytes)
+        store.put_epoch_copy(int(snapshot["source_epoch"]), manifest_bytes)
+
+        index_seed = _load_private_seed(
+            args.index_signing_key_file,
+            production_mode=not args.development,
+            label="evidence index signing key",
+        )
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey as _EdPriv,
+        )
+
+        index_public = (
+            _EdPriv.from_private_bytes(index_seed)
+            .public_key()
+            .public_bytes(_ser.Encoding.Raw, _ser.PublicFormat.Raw)
+        )
+
+        def _rebuild_recent_from_manifests() -> list[dict[str, object]]:
+            """History source of truth: the immutable epoch manifests."""
+            rebuilt: list[dict[str, object]] = []
+            epochs_dir = Path(args.evidence_dir) / "epochs"
+            if not epochs_dir.is_dir():
+                return rebuilt
+            for entry in sorted(epochs_dir.glob("*.json"), reverse=True):
+                try:
+                    data = entry.read_bytes()
+                    manifest_doc = parse_manifest(data)
+                except Exception:  # noqa: BLE001 - skip corrupt copies
+                    continue
+                rebuilt.append(
+                    {
+                        "source_epoch": int(manifest_doc["source_epoch"]),
+                        "manifest": digest_bytes(data),
+                    }
+                )
+            return rebuilt
+
+        # NEVER carry history from an unverified prior index: verify the old
+        # signature first; on any failure rebuild from the immutable
+        # manifests instead of re-signing attacker-controlled rows. The
+        # whole read -> carry -> sign -> publish sequence holds ONE
+        # exclusive index transaction so concurrent exporters cannot lose
+        # the latest pointer or history.
+        index_txn = store.index_transaction()
+        index_txn.__enter__()
+        recent: list[dict[str, object]] = []
+        existing_index = index_txn.read()
+        if existing_index is not None:
+            from cathedral.evidence import verify_index as _verify_index
+
+            try:
+                previous = _verify_index(
+                    existing_index,
+                    {args.index_signing_key_id: index_public},
+                    expected_network=args.score_network,
+                    expected_netuid=args.score_netuid,
+                    max_age_seconds=None,
+                )
+                recent.append(dict(previous["latest"]))
+                recent.extend(dict(row) for row in previous["recent"])
+            except Exception:  # noqa: BLE001 - unverified history is rebuilt
+                recent = _rebuild_recent_from_manifests()
+        deduped: list[dict[str, object]] = []
+        seen_epochs = {int(snapshot["source_epoch"])}
+        for row in recent:
+            try:
+                row_epoch = int(row["source_epoch"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if row_epoch in seen_epochs:
+                continue
+            seen_epochs.add(row_epoch)
+            deduped.append({"source_epoch": row_epoch, "manifest": row.get("manifest")})
+        deduped.sort(key=lambda row: int(row["source_epoch"]), reverse=True)
+        index_bytes = build_signed_index(
+            network=args.score_network,
+            netuid=args.score_netuid,
+            latest_source_epoch=int(snapshot["source_epoch"]),
+            latest_manifest_digest=manifest_digest,
+            recent=deduped,
+            signing_key_id=args.index_signing_key_id,
+            private_key_seed=index_seed,
+        )
+        try:
+            index_txn.publish(index_bytes)
+        finally:
+            index_txn.__exit__(None, None, None)
+        parse_manifest(manifest_bytes)  # final self-check before reporting
+
+        print(
+            json.dumps(
+                {
+                    "epoch_id": epoch_id,
+                    "source_epoch": int(snapshot["source_epoch"]),
+                    "manifest": manifest_digest,
+                    "report_id": report["report_id"],
+                    "receipts": len(manifest_receipts),
+                    "attestations": len(attestations),
+                    "evidence_dir": str(Path(args.evidence_dir).expanduser()),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    finally:
+        ledger.close()
+
+
+def _load_evidence_keyfile(path: str, digest: str | None, label: str) -> dict[str, bytes]:
+    return _load_registry_keys(
+        path,
+        production_mode=digest is not None,
+        pinned_digest=digest,
+    )
+
+
+def _verify_wire_vector(
+    payload: Mapping[str, object],
+    *,
+    public_key_hex: str,
+    expected_key_id: str,
+    network: str,
+    netuid: int,
+) -> None:
+    """Verify Cathedral's signed weight vector exactly as the thin validator
+    does: ed25519 over sorted compact JSON minus ``signature``."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    if payload.get("key_id") != expected_key_id:
+        raise ValueError("weight vector key_id does not match the pinned key id")
+    if payload.get("network") != network or payload.get("netuid") != netuid:
+        raise ValueError("weight vector network/netuid mismatch")
+    signature_b64 = payload.get("signature")
+    if not isinstance(signature_b64, str) or not signature_b64.strip():
+        raise ValueError("weight vector is missing its signature")
+    body = {key: value for key, value in payload.items() if key != "signature"}
+    canonical = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex.strip())).verify(
+            base64.b64decode(signature_b64, validate=True), canonical
+        )
+    except (InvalidSignature, ValueError, binascii.Error) as exc:
+        raise ValueError("weight vector signature verification failed") from exc
+    expires = payload.get("expires_at")
+    if not isinstance(expires, str):
+        raise ValueError("weight vector has no expiry")
+    expiry = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    if expiry <= datetime.datetime.now(datetime.timezone.utc):
+        raise ValueError("weight vector is expired")
+
+
+MAX_EVIDENCE_FETCH_BYTES = 4 * 1024 * 1024
+MAX_VERIFIER_FETCH_BYTES = 32 * 1024 * 1024
+
+
+def _bounded_https_fetch(
+    url: str,
+    *,
+    max_bytes: int = MAX_EVIDENCE_FETCH_BYTES,
+    allow_private: bool = False,
+    timeout: float = 30.0,
+) -> bytes:
+    """HTTPS-only bounded fetch: no redirects, no downgrade, no private hosts."""
+    import ipaddress as _ip
+    import socket as _socket
+    import urllib.parse as _parse
+    import urllib.request as _request
+
+    parsed = _parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError("evidence fetches must use https")
+    if parsed.username or parsed.password:
+        raise ValueError("evidence URLs must be credential-free")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("evidence URL has no host")
+    if not allow_private:
+        try:
+            infos = _socket.getaddrinfo(host, parsed.port or 443, proto=_socket.IPPROTO_TCP)
+        except OSError as exc:
+            raise ValueError(f"evidence host does not resolve: {host}") from exc
+        for info in infos:
+            address = _ip.ip_address(info[4][0])
+            if (
+                address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_reserved
+                or address.is_multicast
+                or address.is_unspecified
+            ):
+                raise ValueError(
+                    f"evidence host resolves to a non-public address: {host}"
+                )
+
+    class _NoRedirect(_request.HTTPRedirectHandler):
+        def redirect_request(self, *arguments, **keywords):  # noqa: D401
+            raise ValueError("evidence fetches must not follow redirects")
+
+    opener = _request.build_opener(_NoRedirect, _request.HTTPSHandler())
+    request = _request.Request(url, headers={"User-Agent": "cathedral-provenance/1.0"})
+    with opener.open(request, timeout=timeout) as response:
+        return _read_bounded_deadline(response, max_bytes, timeout)
+
+
+def _read_bounded_deadline(response, max_bytes: int, total_seconds: float) -> bytes:
+    """Read with BOTH a size bound and a total wall-clock deadline: a slow
+    drip that keeps each read under the socket timeout still cannot exceed
+    the overall budget."""
+    import time as _time
+
+    deadline = _time.monotonic() + total_seconds
+    chunks: list[bytes] = []
+    received = 0
+    while True:
+        if _time.monotonic() > deadline:
+            raise ValueError("evidence fetch exceeded the total deadline")
+        chunk = response.read(min(65536, max_bytes + 1 - received))
+        if not chunk:
+            break
+        received += len(chunk)
+        if received > max_bytes:
+            raise ValueError("evidence response exceeds the bounded size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _strict_json_object(data: bytes, label: str) -> dict:
+    def _no_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate {label} JSON key")
+            result[key] = value
+        return result
+
+    document = json.loads(
+        data.decode("utf-8"),
+        object_pairs_hook=_no_duplicates,
+        parse_constant=lambda _v: (_ for _ in ()).throw(
+            ValueError(f"non-finite {label} JSON")
+        ),
+    )
+    if not isinstance(document, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return document
+
+
+def cmd_runtime_export_controlled(args: argparse.Namespace) -> int:
+    """Package controlled-disclosure envelopes for an authorized validator.
+
+    Only a completed, PUBLISHED (frozen) epoch may be disclosed, bound to its
+    exact frozen report digest. All inputs are validated first, the package
+    is staged in a private temp directory, and only then atomically renamed
+    into place — a failure leaves nothing partial, and an exact retry of an
+    already-exported epoch succeeds idempotently. Symlinked or unsafe output
+    paths are rejected; nothing is ever chmod'ed or written through a
+    pre-existing path.
+    """
+    import tempfile as tempfile_module
+
+    from cathedral.evidence import EvidenceError, digest_bytes
+
+    ledger = Ledger(args.ledger_db)
+    staging: str | None = None
+    try:
+        epoch_id = _resolve_evidence_epoch(ledger, args.epoch_id)
+        epoch_row = ledger.get_epoch(epoch_id)
+        if epoch_row is None or epoch_row["status"] != "published":
+            raise ValueError(
+                f"epoch {epoch_id} is not published/frozen; refusing disclosure"
+            )
+        snapshot = ledger.score_class_snapshot(epoch_id)
+        rows = [
+            row
+            for row in ledger.attestation_rows(epoch_id)
+            if row["envelope_digest"] is not None
+        ]
+        if not rows:
+            raise ValueError(f"epoch {epoch_id} has no retained envelopes to disclose")
+
+        out_root = Path(args.out_dir)
+        if os.path.lexists(out_root) and out_root.is_symlink():
+            raise ValueError("controlled output path must not be a symlink")
+        parent = out_root.parent
+        if not parent.is_dir() or parent.is_symlink():
+            raise ValueError("controlled output parent must be a real directory")
+        parent_stat = os.lstat(parent)
+        if hasattr(os, "geteuid") and parent_stat.st_uid != os.geteuid():
+            raise ValueError("controlled output parent must be owned by the caller")
+        if parent_stat.st_mode & 0o022:
+            raise ValueError("controlled output parent must not be group/world writable")
+
+        # Validate and read EVERY input before creating anything.
+        retention_root = Path(args.retention_dir)
+        envelopes: list[tuple[str, bytes, dict]] = []
+        for row in rows:
+            digest = str(row["envelope_digest"])
+            blob_path = retention_root / "blobs" / "sha256" / digest.split(":", 1)[1]
+            if blob_path.is_symlink() or not blob_path.is_file():
+                raise EvidenceError(f"retained envelope {digest} is unavailable")
+            data = blob_path.read_bytes()
+            if digest_bytes(data) != digest:
+                raise EvidenceError(f"retained envelope {digest} is corrupt")
+            envelopes.append(
+                (
+                    digest,
+                    data,
+                    {
+                        "hotkey": str(row["hotkey"]),
+                        "envelope_digest": digest,
+                        "evidence_digest": str(row["evidence_digest"]),
+                    },
+                )
+            )
+        controlled_manifest = {
+            "schema": "cathedral_controlled_disclosure_v1",
+            "epoch_id": epoch_id,
+            "source_epoch": int(snapshot["source_epoch"]),
+            "report_digest": str(snapshot["report_digest"]),
+            "entries": [entry for _, _, entry in envelopes],
+        }
+        manifest_text = json.dumps(controlled_manifest, sort_keys=True, indent=2)
+
+        if out_root.exists():
+            # Idempotent EXACT retry: identical manifest bytes => success.
+            existing = out_root / "controlled-manifest.json"
+            if existing.is_file() and existing.read_text() == manifest_text:
+                print(
+                    json.dumps(
+                        {
+                            "epoch_id": epoch_id,
+                            "envelopes": len(envelopes),
+                            "out": str(out_root),
+                            "replayed": True,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            raise ValueError(
+                "controlled output path exists with different content; refusing"
+            )
+
+        staging = tempfile_module.mkdtemp(
+            prefix=f".controlled.{epoch_id}.", dir=parent
+        )
+        os.chmod(staging, 0o700)
+        for digest, data, _entry in envelopes:
+            target = Path(staging) / f"{digest.split(':', 1)[1]}.json"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(target, flags, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(Path(staging) / "controlled-manifest.json", flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(manifest_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(staging, out_root)
+        staging = None
+        directory = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        print(
+            json.dumps(
+                {
+                    "epoch_id": epoch_id,
+                    "envelopes": len(envelopes),
+                    "out": str(out_root),
+                    "replayed": False,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    finally:
+        if staging is not None:
+            import shutil
+
+            shutil.rmtree(staging, ignore_errors=True)
+        ledger.close()
+
+
+def cmd_provenance_verify(args: argparse.Namespace) -> int:
+    """Independently verify the published evidence chain and recompute weights.
+
+    Exit 0 only when every stage PASSes (and, when a publisher URL is given,
+    the recomputation matches Cathedral's signed vector). Any failure is
+    fail-closed: exit 1 with a FAIL/NOT_PROVEN event naming the broken link.
+    """
+    import time as time_mod
+    import urllib.request
+
+    from cathedral import provenance
+    from cathedral.events import EventLogger, FAIL, PASS
+    from cathedral.evidence import (
+        EvidenceError,
+        EvidenceStore,
+        digest_bytes,
+        parse_manifest,
+        verify_index,
+    )
+
+    logger = EventLogger(
+        mode="full_provenance",
+        jsonl=sys.stdout,
+        jsonl_path=args.jsonl,
+        tty=sys.stderr,
+    )
+
+    def fetch_url(path: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
+        url = args.evidence_url.rstrip("/") + path
+        try:
+            return _bounded_https_fetch(
+                url,
+                max_bytes=max_bytes,
+                allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
+            )
+        except ValueError as exc:
+            raise EvidenceError(str(exc)) from exc
+
+    store = EvidenceStore(args.evidence_dir) if args.evidence_dir else None
+
+    def load_index_bytes() -> bytes:
+        if store is not None:
+            data = store.read_index()
+            if data is None:
+                raise EvidenceError("evidence index is missing from the store")
+            return data
+        return fetch_url("/index.json")
+
+    def load_blob(digest: str, *, max_bytes: int = MAX_EVIDENCE_FETCH_BYTES) -> bytes:
+        if store is not None:
+            return store.get_blob(digest)
+        data = fetch_url("/blobs/sha256/" + digest.split(":", 1)[1], max_bytes=max_bytes)
+        if digest_bytes(data) != digest:
+            raise EvidenceError(f"fetched blob does not match digest {digest}")
+        return data
+
+    audit: dict[str, object] = {"result": "FAIL"}
+    try:
+        if getattr(args, "production", False):
+            missing = [
+                flag
+                for flag, value in (
+                    ("--registry-keys-digest", args.registry_keys_digest),
+                    ("--report-keys-digest", args.report_keys_digest),
+                    ("--index-keys-digest", args.index_keys_digest),
+                    ("--source-revision", getattr(args, "source_revision", None)),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "production verification requires independent pins: "
+                    + ", ".join(missing)
+                )
+        started = time_mod.monotonic()
+        index_keys = _load_evidence_keyfile(
+            args.index_keys, args.index_keys_digest, "index keys"
+        )
+        index_document = verify_index(
+            load_index_bytes(),
+            index_keys,
+            expected_network=args.network,
+            expected_netuid=args.netuid,
+            max_age_seconds=args.index_max_age_secs,
+        )
+        logger.event(
+            "EVIDENCE_INDEX_VERIFIED",
+            stage="fetch",
+            status=PASS,
+            duration_ms=(time_mod.monotonic() - started) * 1000,
+            detail=(
+                f"latest source_epoch={index_document['latest']['source_epoch']} "
+                f"key={index_document['signing_key_id']}"
+            ),
+            artifact=index_document["latest"]["manifest"],
+        )
+
+        if args.source_epoch is not None:
+            wanted = int(args.source_epoch)
+            manifest_digest = None
+            for row in [index_document["latest"], *index_document["recent"]]:
+                if int(row["source_epoch"]) == wanted:
+                    manifest_digest = row["manifest"]
+                    break
+            if manifest_digest is None:
+                raise EvidenceError(
+                    f"source epoch {wanted} is not present in the evidence index"
+                )
+        else:
+            manifest_digest = index_document["latest"]["manifest"]
+
+        started = time_mod.monotonic()
+        manifest = parse_manifest(load_blob(manifest_digest))
+        if manifest["network"] != args.network or manifest["netuid"] != args.netuid:
+            raise EvidenceError("evidence manifest network/netuid mismatch")
+        if args.source_epoch is None and int(manifest["source_epoch"]) != int(
+            index_document["latest"]["source_epoch"]
+        ):
+            raise EvidenceError(
+                "index latest.source_epoch does not match the manifest it points to"
+            )
+
+        # Durable anti-rollback fences: a signed-but-older index or a
+        # same-epoch different manifest must never verify.
+        fence_path = Path(args.state_file).expanduser() if args.state_file else None
+        fences: dict[str, object] = {}
+        if fence_path is not None and fence_path.exists():
+            if fence_path.is_symlink() or not fence_path.is_file():
+                raise EvidenceError("verifier state file must be a regular file")
+            fences = json.loads(fence_path.read_text())
+            last_epoch = fences.get("index_source_epoch")
+            last_manifest = fences.get("index_manifest")
+            new_epoch = int(index_document["latest"]["source_epoch"])
+            if isinstance(last_epoch, int):
+                if new_epoch < last_epoch:
+                    raise EvidenceError(
+                        f"index rollback: latest epoch {new_epoch} < recorded "
+                        f"high-water {last_epoch}"
+                    )
+                if new_epoch == last_epoch and index_document["latest"][
+                    "manifest"
+                ] != last_manifest:
+                    raise EvidenceError(
+                        "index equivocation: same epoch, different manifest"
+                    )
+        if manifest["reward_mechanism"]["id"] != args.mechanism:
+            raise EvidenceError(
+                "manifest reward mechanism "
+                f"{manifest['reward_mechanism']['id']!r} does not match the "
+                f"pinned mechanism {args.mechanism!r}"
+            )
+        if manifest["verifier"]["digest"] != args.verifier_digest:
+            raise EvidenceError(
+                "manifest verifier digest does not match the pinned verifier digest"
+            )
+        logger.event(
+            "EVIDENCE_MANIFEST_VERIFIED",
+            stage="fetch",
+            status=PASS,
+            duration_ms=(time_mod.monotonic() - started) * 1000,
+            detail=(
+                f"source_epoch={manifest['source_epoch']} "
+                f"mechanism={manifest['reward_mechanism']['id']} "
+                f"registry_release={manifest['policy_registry']['release']}"
+            ),
+            artifact=manifest_digest,
+        )
+
+        started = time_mod.monotonic()
+        registry_keys = _load_evidence_keyfile(
+            args.registry_keys, args.registry_keys_digest, "registry keys"
+        )
+        registry_bytes = load_blob(manifest["policy_registry"]["blob"])
+        if (
+            "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
+            != manifest["policy_registry"]["digest"]
+        ):
+            raise EvidenceError("registry blob does not match the manifest digest")
+        report_keys = _load_evidence_keyfile(
+            args.report_keys, args.report_keys_digest, "report keys"
+        )
+        report_bytes = load_blob(manifest["score_report"]["blob"])
+        receipts_by_id = {
+            row["receipt_id"]: load_blob(row["blob"]) for row in manifest["receipts"]
+        }
+        logger.event(
+            "EVIDENCE_ARTIFACTS_FETCHED",
+            stage="fetch",
+            status=PASS,
+            duration_ms=(time_mod.monotonic() - started) * 1000,
+            detail=f"registry+report+{len(receipts_by_id)} receipts, content-addressed",
+        )
+
+        started = time_mod.monotonic()
+        result = provenance.verify_and_recompute(
+            report_bytes=report_bytes,
+            receipts_by_id=receipts_by_id,
+            registry_bytes=registry_bytes,
+            trusted_registry_keys=registry_keys,
+            report_signing_keys=report_keys,
+            expected_network=args.network,
+            expected_netuid=args.netuid,
+            expected_verifier_digest=args.verifier_digest,
+            mechanism_id=args.mechanism,
+            registry_max_age_seconds=args.registry_max_age_secs,
+        )
+        if result.policy_release != manifest["policy_registry"]["release"]:
+            raise EvidenceError("verified registry release differs from the manifest")
+        if result.report_id != manifest["score_report"]["report_id"]:
+            raise EvidenceError("verified report id differs from the manifest")
+        pinned_revision = getattr(args, "source_revision", None)
+        if pinned_revision and manifest["source_revision"] != pinned_revision:
+            raise EvidenceError(
+                "manifest source revision does not match the operator's pin"
+            )
+
+        # ---- FULL assurance: raw-evidence replay through the pinned verifier.
+        controlled_dir = getattr(args, "controlled_dir", None)
+        if controlled_dir:
+            from cathedral import provenance as provenance_module
+            from cathedral.evidence import digest_bytes as _digest_bytes
+
+            bindings = {
+                row["hotkey"]: row for row in manifest["attestations"]
+            }
+            envelopes: dict[str, bytes] = {}
+            for miner in result.miners:
+                if not miner.receipt_verified:
+                    continue
+                binding = bindings.get(miner.hotkey)
+                envelope_digest = (
+                    binding.get("envelope_digest") if binding else None
+                )
+                if not envelope_digest:
+                    raise EvidenceError(
+                        f"no controlled envelope binding for {miner.hotkey!r}"
+                    )
+                envelope_path = (
+                    Path(controlled_dir)
+                    / f"{str(envelope_digest).split(':', 1)[1]}.json"
+                )
+                if envelope_path.is_symlink() or not envelope_path.is_file():
+                    raise EvidenceError(
+                        f"controlled envelope file missing for {miner.hotkey!r}"
+                    )
+                envelopes[miner.hotkey] = envelope_path.read_bytes()
+            verifier_info = manifest["verifier"]
+            if not verifier_info["binary_blob"] or not verifier_info["command"]:
+                raise EvidenceError(
+                    "manifest lacks verifier binary/command bindings for full mode"
+                )
+            if getattr(args, "verifier_binary", None):
+                binary_path = Path(args.verifier_binary)
+                if binary_path.stat().st_size > MAX_VERIFIER_FETCH_BYTES:
+                    raise EvidenceError("verifier binary exceeds the bounded limit")
+                verifier_bytes = binary_path.read_bytes()
+            else:
+                verifier_bytes = load_blob(
+                    verifier_info["binary_blob"],
+                    max_bytes=MAX_VERIFIER_FETCH_BYTES,
+                )
+            result = provenance_module.replay_positive_miners(
+                result,
+                registry=provenance_module.load_registry(
+                    registry_bytes,
+                    registry_keys,
+                    max_age_seconds=args.registry_max_age_secs,
+                ),
+                envelopes_by_hotkey=envelopes,
+                attestation_bindings=bindings,
+                verifier_binary=verifier_bytes,
+                verifier_blob_digest=verifier_info["binary_blob"],
+                verifier_command=tuple(verifier_info["command"]),
+                verifier_artifacts=tuple(
+                    verifier_info["artifacts"] or verifier_info["command"]
+                ),
+            )
+            for miner in result.miners:
+                if miner.raw_verified:
+                    logger.event(
+                        "RAW_EVIDENCE_REPLAYED",
+                        stage="replay",
+                        status=PASS,
+                        hotkey=miner.hotkey,
+                        detail=(
+                            "pinned verifier re-verified the raw quote and "
+                            "its nonce/worker/channel binding"
+                        ),
+                    )
+        for miner in result.miners:
+            if miner.receipt_verified:
+                logger.event(
+                    "RECEIPT_VERIFIED",
+                    stage="verify",
+                    status=PASS,
+                    hotkey=miner.hotkey,
+                    artifact=miner.receipt_id,
+                    detail=f"work_units={miner.verified_work_units}",
+                )
+        logger.event(
+            "CHAIN_VERIFIED_AND_RECOMPUTED",
+            stage="recompute",
+            status=PASS,
+            duration_ms=(time_mod.monotonic() - started) * 1000,
+            detail=(
+                f"report={result.report_id[:23]} release={result.policy_release} "
+                f"mechanism={result.mechanism_id} "
+                f"positive_miners={len(result.recomputed_hotkey_weights)}"
+            ),
+        )
+
+        audit = {
+            "result": "PASS",
+            "source_epoch": result.source_epoch,
+            "report_id": result.report_id,
+            "previous_report_id": result.previous_report_id,
+            "policy_release": result.policy_release,
+            "policy_digest": result.policy_digest,
+            "verifier_digest": result.verifier_digest,
+            "mechanism": result.mechanism_id,
+            "manifest": manifest_digest,
+            "recomputed_hotkey_weights": result.recomputed_hotkey_weights,
+        }
+
+        if args.publisher_url:
+            started = time_mod.monotonic()
+            vector_bytes = _bounded_https_fetch(
+                args.publisher_url.rstrip("/") + "/v1/validator/weights/next",
+                allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
+            )
+            vector = _strict_json_object(vector_bytes, "weight vector")
+            _verify_wire_vector(
+                vector,
+                public_key_hex=args.weight_policy_public_key_hex,
+                expected_key_id=args.weight_policy_key_id,
+                network=args.network,
+                netuid=args.netuid,
+            )
+            agree, discrepancies = provenance.compare_with_vector(result, vector)
+            audit["vector_id"] = vector.get("vector_id")
+            audit["vector_agrees"] = agree
+            audit["vector_discrepancies"] = discrepancies
+            if agree:
+                logger.event(
+                    "VECTOR_COMPARE_AGREES",
+                    stage="compare",
+                    status=PASS,
+                    duration_ms=(time_mod.monotonic() - started) * 1000,
+                    detail=(
+                        f"vector={str(vector.get('vector_id'))[:8]} matches the "
+                        "independent recomputation"
+                    ),
+                )
+            else:
+                audit["result"] = "FAIL"
+                logger.event(
+                    "VECTOR_COMPARE_MISMATCH",
+                    stage="compare",
+                    status=FAIL,
+                    duration_ms=(time_mod.monotonic() - started) * 1000,
+                    detail="; ".join(discrepancies)[:512],
+                    remediation=(
+                        "Do not submit from this vector. Compare the manifest "
+                        "epoch against the publisher feed and escalate to the "
+                        "Cathedral operators; full-provenance authority mode "
+                        "submits the recomputed vector instead."
+                    ),
+                )
+
+        audit["assurance"] = result.assurance_level
+        full = result.assurance_level == "full"
+        succeeded = audit["result"] == "PASS" and (
+            full or bool(getattr(args, "allow_receipts_only", False))
+        )
+        if not full:
+            audit["result"] = "NOT_PROVEN"
+            from cathedral.events import NOT_PROVEN as _NOT_PROVEN
+
+            logger.event(
+                "PROVENANCE_RESULT",
+                stage="result",
+                status=_NOT_PROVEN,
+                detail=(
+                    "receipts-only (PARTIAL) provenance: signed statements are "
+                    "internally consistent, but no raw evidence was replayed. "
+                    f"source_epoch={audit.get('source_epoch')}"
+                ),
+                remediation=(
+                    "Obtain the controlled envelope package and rerun with "
+                    "--controlled-dir for FULL assurance."
+                ),
+            )
+        else:
+            logger.event(
+                "PROVENANCE_RESULT",
+                stage="result",
+                status=PASS if succeeded else FAIL,
+                detail=(
+                    f"assurance=full source_epoch={audit.get('source_epoch')} "
+                    f"weights={audit.get('recomputed_hotkey_weights')}"
+                ),
+            )
+        if fence_path is not None and audit["result"] in ("PASS", "NOT_PROVEN"):
+            fences.update(
+                {
+                    "index_source_epoch": int(
+                        index_document["latest"]["source_epoch"]
+                    ),
+                    "index_manifest": index_document["latest"]["manifest"],
+                }
+            )
+            fence_tmp = fence_path.with_suffix(".tmp")
+            descriptor = os.open(
+                fence_tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(fences, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(fence_tmp, fence_path)
+        if args.audit_out:
+            Path(args.audit_out).expanduser().write_text(
+                json.dumps(audit, sort_keys=True, indent=2) + "\n"
+            )
+        return 0 if succeeded else 1
+    except (EvidenceError, provenance.ProvenanceError, ValueError, OSError) as exc:
+        logger.event(
+            "PROVENANCE_FAILED",
+            stage="result",
+            status=FAIL,
+            detail=str(exc)[:512],
+            remediation=(
+                "Fail closed: keep or fall back to the burn vector. Check the "
+                "evidence endpoint, pinned keys, and digests; rerun with "
+                "--jsonl for a machine-readable trail."
+            ),
+        )
+        if args.audit_out:
+            audit["error"] = str(exc)[:512]
+            Path(args.audit_out).expanduser().write_text(
+                json.dumps(audit, sort_keys=True, indent=2) + "\n"
+            )
+        return 1
+    finally:
+        logger.close()
 
 
 def cmd_runtime_retry_publish(args: argparse.Namespace) -> int:
@@ -1522,6 +2522,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--registry-db", required=True)
         command.add_argument("--ledger-db", required=True)
         command.add_argument("--measurements-file")
+        command.add_argument(
+            "--evidence-retention-dir",
+            default=None,
+            help="retain verified raw admission evidence (controlled disclosure) "
+            "in this root-only directory; default $CATHEDRAL_EVIDENCE_RETENTION_DIR",
+        )
         command.add_argument("--policy-registry")
         command.add_argument("--policy-registry-keys")
         command.add_argument(
@@ -1615,7 +2621,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="export a frozen receipt-backed report for an independent validator",
     )
     p_export_class.add_argument("--ledger-db", required=True)
-    p_export_class.add_argument("--epoch-id", type=int, required=True)
+    p_export_class.add_argument(
+        "--epoch-id",
+        required=True,
+        help="epoch id, or 'latest-published'",
+    )
     p_export_class.add_argument("--score-network", required=True)
     p_export_class.add_argument("--score-netuid", type=int, required=True)
     p_export_class.add_argument("--class-id", default="confidential_compute")
@@ -1637,6 +2647,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="relax production signing-key ownership and mode checks",
     )
     p_export_class.set_defaults(func=cmd_runtime_export_score_class)
+
+    p_export_evidence = runtime_sub.add_parser(
+        "export-evidence",
+        help="publish one epoch's content-addressed public evidence bundle",
+    )
+    p_export_evidence.add_argument("--ledger-db", required=True)
+    p_export_evidence.add_argument(
+        "--epoch-id",
+        default="latest-published",
+        help="epoch id, or 'latest-published' (default)",
+    )
+    p_export_evidence.add_argument("--evidence-dir", required=True)
+    p_export_evidence.add_argument("--score-network", required=True)
+    p_export_evidence.add_argument("--score-netuid", type=int, required=True)
+    p_export_evidence.add_argument("--class-id", default="confidential_compute")
+    p_export_evidence.add_argument("--source-id", default="cathedralconfidential")
+    p_export_evidence.add_argument("--policy-registry", required=True)
+    p_export_evidence.add_argument("--verifier-digest", required=True)
+    p_export_evidence.add_argument("--verifier-binary")
+    p_export_evidence.add_argument(
+        "--verifier-production-path",
+        help="the absolute production install path of the pinned verifier "
+             "(published so external validators can recompute the "
+             "implementation digest from the binary blob)",
+    )
+    p_export_evidence.add_argument("--mechanism", default="validated_supply_v1")
+    p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
+    p_export_evidence.add_argument("--source-revision")
+    p_export_evidence.add_argument("--index-signing-key-id", required=True)
+    p_export_evidence.add_argument("--index-signing-key-file", required=True)
+    p_export_evidence.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production signing-key ownership checks",
+    )
+    p_export_evidence.set_defaults(func=cmd_runtime_export_evidence)
 
     p_retry = runtime_sub.add_parser("retry-publish", help="publish frozen report bytes")
     p_retry.add_argument("--ledger-db", required=True)
@@ -1705,6 +2751,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="relax production path separation and ownership checks for a local exercise",
     )
     p_gpu_initialize.set_defaults(func=cmd_runtime_initialize_gpu_identities)
+
+    p_provenance = sub.add_parser(
+        "provenance",
+        help="independently verify published evidence and recompute weights",
+    )
+    provenance_sub = p_provenance.add_subparsers(dest="provenance_command", required=True)
+    p_prov_verify = provenance_sub.add_parser(
+        "verify",
+        help="verify the full evidence chain for one epoch and recompute the vector",
+    )
+    source = p_prov_verify.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--evidence-url",
+        help="public evidence base URL, e.g. https://api.cathedral.computer/v1/evidence",
+    )
+    source.add_argument("--evidence-dir", help="local evidence store directory")
+    p_prov_verify.add_argument("--network", default="finney")
+    p_prov_verify.add_argument("--netuid", type=int, default=39)
+    p_prov_verify.add_argument("--registry-keys", required=True,
+                               help="trusted policy-registry key file (key_id -> base64)")
+    p_prov_verify.add_argument("--registry-keys-digest",
+                               help="pinned sha256:<hex> of the registry key file")
+    p_prov_verify.add_argument("--report-keys", required=True,
+                               help="trusted score-report key file (key_id -> base64)")
+    p_prov_verify.add_argument("--report-keys-digest")
+    p_prov_verify.add_argument("--index-keys", required=True,
+                               help="trusted evidence-index key file (key_id -> base64)")
+    p_prov_verify.add_argument("--index-keys-digest")
+    p_prov_verify.add_argument("--verifier-digest", required=True,
+                               help="pinned TDX verifier implementation digest")
+    p_prov_verify.add_argument("--mechanism", default="validated_supply_v1")
+    p_prov_verify.add_argument("--source-epoch", type=int,
+                               help="verify a specific epoch (default: index latest)")
+    p_prov_verify.add_argument("--index-max-age-secs", type=float, default=3600.0)
+    p_prov_verify.add_argument(
+        "--registry-max-age-secs", type=int, default=86400,
+        help="reject a registry whose publication (generated_at) is older "
+             "than this many seconds (default 24 hours, fail closed)",
+    )
+    p_prov_verify.add_argument("--publisher-url",
+                               help="also fetch Cathedral's signed vector and compare")
+    p_prov_verify.add_argument(
+        "--weight-policy-public-key-hex",
+        default=os.environ.get("CATHEDRAL_WEIGHT_POLICY_PUBLIC_KEY", ""),
+        help="pinned weight-vector signing key (hex) for --publisher-url comparison",
+    )
+    p_prov_verify.add_argument("--weight-policy-key-id", default="cathedral-weight-policy")
+    p_prov_verify.add_argument("--jsonl", help="append JSONL events to this file")
+    p_prov_verify.add_argument("--audit-out", help="write the audit record JSON here")
+    p_prov_verify.add_argument(
+        "--state-file",
+        help="durable anti-rollback fences (index high-water epoch/manifest)",
+    )
+    p_prov_verify.add_argument(
+        "--controlled-dir",
+        help="controlled-disclosure envelope directory; enables FULL assurance "
+             "(raw-evidence replay through the pinned verifier)",
+    )
+    p_prov_verify.add_argument(
+        "--verifier-binary",
+        help="local verifier binary (must match the manifest's binary blob "
+             "digest); default: fetched from the evidence store",
+    )
+    p_prov_verify.add_argument(
+        "--source-revision",
+        help="independent pin of the expected source revision; the manifest "
+             "must match (never self-authorized)",
+    )
+    p_prov_verify.add_argument(
+        "--production",
+        action="store_true",
+        help="require every independent pin (key digests + source revision)",
+    )
+    p_prov_verify.add_argument(
+        "--allow-receipts-only",
+        action="store_true",
+        help="exit 0 for a receipts-only chain; the result is still recorded "
+             "and logged as NOT_PROVEN, never as full provenance",
+    )
+    p_prov_verify.add_argument(
+        "--allow-private-evidence-host",
+        action="store_true",
+        help="testing only: permit evidence hosts resolving to private ranges",
+    )
+    p_prov_verify.set_defaults(func=cmd_provenance_verify)
+
+    p_controlled = provenance_sub.add_parser(
+        "export-controlled",
+        help="package controlled-disclosure envelopes for an authorized validator",
+    )
+    p_controlled.add_argument("--ledger-db", required=True)
+    p_controlled.add_argument("--epoch-id", default="latest-published")
+    p_controlled.add_argument("--retention-dir", required=True)
+    p_controlled.add_argument("--out-dir", required=True)
+    p_controlled.set_defaults(func=cmd_runtime_export_controlled)
 
     return parser
 
