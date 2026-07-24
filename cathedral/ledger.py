@@ -9,11 +9,12 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Protocol, Self
 
 from cathedral.lanes.sat import (
     CUSTOMER_SAT_WORK_UNITS,
@@ -21,6 +22,12 @@ from cathedral.lanes.sat import (
     validate_sat_work_item,
 )
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+from cathedral.launch_limits import (
+    MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_VERIFIED_CANDIDATES,
+    MAX_LAUNCH_WIRE_REPORT_BYTES,
+    is_launch_hotkey,
+)
 from cathedral.lifecycle import (
     LifecycleReason,
     LifecycleSnapshot,
@@ -56,6 +63,55 @@ _GPU_POLICY_MODE_RE = re.compile(
     r"(?:@release=none@registry=none|"
     r"@release=[1-9][0-9]{0,18}@registry=sha256:[0-9a-f]{64})"
 )
+
+
+def _validate_launch_report_cardinality(body: bytes) -> None:
+    """Refuse a confidential report the public verifier cannot reproduce."""
+
+    if len(body) > MAX_LAUNCH_WIRE_REPORT_BYTES:
+        raise LedgerError(
+            "persisted confidential score report exceeds the subnet intake "
+            f"limit ({len(body)} > {MAX_LAUNCH_WIRE_REPORT_BYTES})"
+        )
+    try:
+        document = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise LedgerError("persisted score report is not valid JSON") from exc
+    if not isinstance(document, dict) or document.get("source") != "cathedral_confidential_tdx":
+        raise LedgerError("persisted score report is not a confidential score report")
+    scores = document.get("scores")
+    if not isinstance(scores, list):
+        raise LedgerError("persisted confidential score report has no scores list")
+    if len(scores) > MAX_LAUNCH_CANDIDATES:
+        raise LedgerError(
+            "confidential score report exceeds the shared launch candidate limit "
+            f"({len(scores)} > {MAX_LAUNCH_CANDIDATES})"
+        )
+    verified_count = 0
+    seen_hotkeys: set[str] = set()
+    for row in scores:
+        if not isinstance(row, dict):
+            raise LedgerError("persisted confidential score report has an invalid score row")
+        hotkey = row.get("miner_hotkey")
+        if not is_launch_hotkey(hotkey) or hotkey in seen_hotkeys:
+            raise LedgerError(
+                "persisted confidential score report has an invalid or duplicate hotkey"
+            )
+        seen_hotkeys.add(hotkey)
+        value = row.get("score")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise LedgerError("persisted confidential score report has an invalid score")
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0 or number > 1.0:
+            raise LedgerError("persisted confidential score report has an invalid score")
+        if number > 0.0:
+            verified_count += 1
+    if verified_count > MAX_LAUNCH_VERIFIED_CANDIDATES:
+        raise LedgerError(
+            "confidential score report exceeds the shared launch verified-candidate "
+            f"limit ({verified_count} > {MAX_LAUNCH_VERIFIED_CANDIDATES}); "
+            "refusing publication before network I/O"
+        )
 
 
 def _epochs_table_sql(table_name: str) -> str:
@@ -131,6 +187,12 @@ CREATE TABLE IF NOT EXISTS epoch_scores (
     PRIMARY KEY (epoch_id, hotkey)
 );
 
+CREATE TABLE IF NOT EXISTS work_artifacts (
+    challenge_id TEXT PRIMARY KEY,
+    work_item_body BLOB NOT NULL,
+    result_body BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS assurance_receipts (
     receipt_id TEXT PRIMARY KEY,
     epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
@@ -215,7 +277,7 @@ ON customer_jobs(status, available_at, submitted_at, job_id);
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _validated_generated_at(value: str | None) -> str:
@@ -224,7 +286,7 @@ def _validated_generated_at(value: str | None) -> str:
     if not isinstance(value, str):
         raise LedgerError("generated_at must be a timezone-aware ISO-8601 string")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
         offset = parsed.utcoffset()
     except (TypeError, ValueError, OverflowError) as exc:
         raise LedgerError("generated_at must be a timezone-aware ISO-8601 string") from exc
@@ -358,9 +420,7 @@ def _validate_customer_result(
         raise LedgerError("customer job SAT result assignment is invalid")
     if any(isinstance(literal, bool) or not isinstance(literal, int) for literal in assignment):
         raise LedgerError("customer job SAT result assignment is invalid")
-    if {abs(literal) for literal in assignment} != set(
-        range(1, lease.item.instance.n_vars + 1)
-    ):
+    if {abs(literal) for literal in assignment} != set(range(1, lease.item.instance.n_vars + 1)):
         raise LedgerError("customer job SAT result assignment is invalid")
     true_literals = set(assignment)
     if any(
@@ -480,8 +540,15 @@ class Ledger:
         self._migrate_epochs_table_if_needed()
         self._migrate_registry_policy_fields_if_needed()
         self._migrate_attestation_policy_mode_if_needed()
+        # The GPU widening rebuild must run BEFORE the envelope-digest column
+        # is added: it recreates epoch_attestations from a fixed column list,
+        # and running it afterwards would silently drop the new column on a
+        # historical CPU-only database.
         self._migrate_gpu_attestations_if_needed()
+        self._migrate_attestation_envelope_if_needed()
+        self._migrate_attestation_challenge_if_needed()
         self._migrate_worker_lifecycle_fields_if_needed()
+        self._migrate_epoch_anchor_fields_if_needed()
 
     def _migrate_registry_policy_fields_if_needed(self) -> None:
         columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")}
@@ -496,6 +563,63 @@ class Ledger:
                 )
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add registry policy audit fields") from exc
+
+    def _migrate_epoch_anchor_fields_if_needed(self) -> None:
+        """Add the durable challenge-anchor columns to the epochs table.
+
+        The finalized-block challenge anchor (and its audience) must survive
+        on the EPOCH, not in transient runtime configuration: score-class
+        export and evidence export both re-read it from here, so a later,
+        unrelated snapshot can never be substituted for the one the epoch's
+        nonces were actually derived from. NULL means the epoch predates
+        anchoring (development databases only; production preflight refuses
+        to score without an anchor)."""
+        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")}
+        try:
+            for name, sql_type in (
+                ("anchor_network", "TEXT"),
+                ("anchor_netuid", "INTEGER"),
+                ("challenge_anchor_block", "INTEGER"),
+                ("challenge_anchor_hash", "TEXT"),
+            ):
+                if name not in columns:
+                    self._connection.execute(f"ALTER TABLE epochs ADD COLUMN {name} {sql_type}")
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add epoch challenge-anchor fields") from exc
+
+    def _migrate_attestation_challenge_if_needed(self) -> None:
+        """Add the per-epoch challenge-randomness commitment column."""
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "challenge_digest" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN challenge_digest TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation challenge audit field") from exc
+
+    def _migrate_attestation_envelope_if_needed(self) -> None:
+        """Add the retained-envelope digest binding to historical rows.
+
+        NULL means "no controlled envelope was retained for this row" —
+        exactly the state of every pre-migration attestation. Full-provenance
+        replay of such rows reports NOT_PROVEN.
+        """
+
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "envelope_digest" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN envelope_digest TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation envelope audit field") from exc
 
     def _migrate_attestation_policy_mode_if_needed(self) -> None:
         """Mark historical attestation rows as compatibility-mode evidence."""
@@ -527,6 +651,16 @@ class Ledger:
             return
         temporary = f"epoch_attestations_gpu_{uuid.uuid4().hex}"
         previous_foreign_keys = self._connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        # Preserve every column added by other migrations: a rebuild must
+        # never silently drop data (the envelope-digest binding in particular).
+        has_envelope = "envelope_digest" in columns
+        has_challenge = "challenge_digest" in columns
+        envelope_column_sql = ("envelope_digest TEXT," if has_envelope else "") + (
+            "challenge_digest TEXT," if has_challenge else ""
+        )
+        envelope_select_sql = (",envelope_digest" if has_envelope else "") + (
+            ",challenge_digest" if has_challenge else ""
+        )
         self._connection.execute("PRAGMA foreign_keys = OFF")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -541,6 +675,7 @@ class Ledger:
                 "policy_mode TEXT NOT NULL DEFAULT 'compatibility',"
                 "score_eligible INTEGER NOT NULL CHECK(score_eligible IN (0,1)),"
                 "attested_at TEXT NOT NULL,"
+                f"{envelope_column_sql}"
                 "CHECK ((tee_type='TDX' AND workload='CPU') OR "
                 "(tee_type='TDX+GPU_CC' AND workload='GPU')),"
                 "PRIMARY KEY (epoch_id,hotkey))"
@@ -549,7 +684,7 @@ class Ledger:
                 f"INSERT INTO {temporary} "
                 "SELECT epoch_id,hotkey,verdict,tee_type,workload,evidence_digest,"
                 "policy_mode,CASE WHEN tee_type='TDX' AND workload='CPU' THEN 1 ELSE 0 END,"
-                "attested_at FROM epoch_attestations"
+                f"attested_at{envelope_select_sql} FROM epoch_attestations"
             )
             self._connection.execute("DROP TABLE epoch_attestations")
             self._connection.execute(f"ALTER TABLE {temporary} RENAME TO epoch_attestations")
@@ -773,7 +908,7 @@ class Ledger:
                 self._connection.close()
                 self._closed = True
 
-    def __enter__(self) -> Ledger:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -828,8 +963,13 @@ class Ledger:
             if int(customer_active) >= MAX_ACTIVE_CUSTOMER_JOBS_PER_CUSTOMER:
                 raise LedgerError("customer active-job quota reached")
             reserved_bytes = len(body) + _MAX_CUSTOMER_JOB_RESULT_BYTES
-            if int(capacity["storage_bytes"] or 0) + reserved_bytes > MAX_CUSTOMER_JOB_STORAGE_BYTES:
-                raise LedgerError("customer job ledger storage capacity reached; prune terminal jobs")
+            if (
+                int(capacity["storage_bytes"] or 0) + reserved_bytes
+                > MAX_CUSTOMER_JOB_STORAGE_BYTES
+            ):
+                raise LedgerError(
+                    "customer job ledger storage capacity reached; prune terminal jobs"
+                )
             job_id = f"job-{uuid.uuid4().hex}"
             now = _now()
             cx.execute(
@@ -838,9 +978,7 @@ class Ledger:
                 "submitted_at,available_at) VALUES (?,?,?,?,?, 'queued',?,?)",
                 (job_id, customer_id, idempotency_key, body, digest, now, now),
             )
-            row = cx.execute(
-                "SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
+            row = cx.execute("SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)).fetchone()
             assert row is not None
             return self._customer_job_snapshot(row)
 
@@ -909,7 +1047,7 @@ class Ledger:
         if (
             not isinstance(resolved_before, datetime)
             or resolved_before.tzinfo is None
-            or resolved_before.utcoffset() != timezone.utc.utcoffset(None)
+            or resolved_before.utcoffset() != UTC.utcoffset(None)
         ):
             raise LedgerError("resolved_before must be a UTC timestamp")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
@@ -956,7 +1094,7 @@ class Ledger:
                 raise LedgerError(f"{name} must be between 1 and {maximum}")
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "claim customer jobs")
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(UTC)
             now = now_dt.isoformat()
             expired = cx.execute(
                 "SELECT job_id,lease_challenge_id,attempt_count FROM customer_jobs "
@@ -1042,12 +1180,49 @@ class Ledger:
         *,
         policy_registry_release: int | None = None,
         policy_registry_digest: str | None = None,
+        network: str | None = None,
+        netuid: int | None = None,
+        challenge_anchor_block: int | None = None,
+        challenge_anchor_hash: str | None = None,
     ) -> int:
-        """Begin the next attempt, reusing an aborted attempt's source epoch."""
+        """Begin the next attempt, reusing an aborted attempt's source epoch.
+
+        The challenge anchor — the finalized chain block (and hash) every
+        derived TDX nonce for this epoch commits to — is persisted HERE, at
+        epoch begin, as a validated pair together with its audience. Every
+        later export re-reads it from the epoch row, so no unrelated
+        snapshot can be swapped in after the fact."""
         if isinstance(source_epoch, bool) or not isinstance(source_epoch, int) or source_epoch < 0:
             raise LedgerError("source_epoch must be a nonnegative integer")
         if (policy_registry_release is None) != (policy_registry_digest is None):
             raise LedgerError("policy registry release and digest must be supplied together")
+        if (challenge_anchor_block is None) != (challenge_anchor_hash is None):
+            raise LedgerError(
+                "challenge anchor block and hash must be supplied together as a validated pair"
+            )
+        anchor_hash_normalized: str | None = None
+        if challenge_anchor_block is not None:
+            if (
+                isinstance(challenge_anchor_block, bool)
+                or not isinstance(challenge_anchor_block, int)
+                or not 0 <= challenge_anchor_block <= _MAX_SQLITE_INTEGER
+            ):
+                raise LedgerError("challenge anchor block is invalid")
+            from cathedral.challenge import ChallengeError, normalize_block_hash
+
+            try:
+                anchor_hash_normalized = normalize_block_hash(challenge_anchor_hash)
+            except ChallengeError as exc:
+                raise LedgerError(f"challenge anchor hash is invalid: {exc}") from exc
+            if network is None or netuid is None:
+                raise LedgerError("a challenge anchor requires its audience (network and netuid)")
+        if (network is None) != (netuid is None):
+            raise LedgerError("network and netuid must be supplied together")
+        if network is not None:
+            try:
+                network, netuid = validate_score_audience(network, netuid)
+            except ValueError as exc:
+                raise LedgerError(str(exc)) from exc
         if policy_registry_release is not None and (
             isinstance(policy_registry_release, bool)
             or not isinstance(policy_registry_release, int)
@@ -1084,16 +1259,38 @@ class Ledger:
 
             cursor = cx.execute(
                 "INSERT INTO epochs(source_epoch, status, started_at, "
-                "policy_registry_release, policy_registry_digest) "
-                "VALUES (?, 'running', ?, ?, ?)",
+                "policy_registry_release, policy_registry_digest, "
+                "anchor_network, anchor_netuid, challenge_anchor_block, "
+                "challenge_anchor_hash) "
+                "VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     source_epoch,
                     _now(),
                     policy_registry_release,
                     policy_registry_digest,
+                    network,
+                    netuid,
+                    challenge_anchor_block,
+                    anchor_hash_normalized,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def epoch_challenge_anchor(self, epoch_id: int) -> Mapping[str, Any] | None:
+        """The durable challenge anchor persisted at ``begin_epoch``, or None
+        for a pre-anchoring epoch."""
+        with self._lock:
+            row = self._epoch(self._connection, epoch_id)
+            if row["challenge_anchor_block"] is None:
+                return None
+            return MappingProxyType(
+                {
+                    "network": str(row["anchor_network"]),
+                    "netuid": int(row["anchor_netuid"]),
+                    "block": int(row["challenge_anchor_block"]),
+                    "block_hash": str(row["challenge_anchor_hash"]),
+                }
+            )
 
     def abort_epoch(self, epoch_id: int) -> None:
         with self._transaction() as cx:
@@ -1429,9 +1626,7 @@ class Ledger:
         cx: sqlite3.Connection,
         lease: CustomerJobLease,
     ) -> None:
-        row = cx.execute(
-            "SELECT * FROM customer_jobs WHERE job_id = ?", (lease.job_id,)
-        ).fetchone()
+        row = cx.execute("SELECT * FROM customer_jobs WHERE job_id = ?", (lease.job_id,)).fetchone()
         if row is None:
             raise LedgerError(f"customer job {lease.job_id!r} not found")
         expected = (
@@ -1476,9 +1671,7 @@ class Ledger:
         else:
             final_status = "failed"
         result_digest = (
-            "sha256:" + hashlib.sha256(result_body).hexdigest()
-            if result_body is not None
-            else None
+            "sha256:" + hashlib.sha256(result_body).hexdigest() if result_body is not None else None
         )
         cursor = cx.execute(
             "UPDATE customer_jobs SET status = ?,available_at = ?,"
@@ -1511,8 +1704,28 @@ class Ledger:
         evidence_digest: str,
         policy_mode: str = "compatibility",
         score_eligible: bool | None = None,
+        envelope_digest: str | None = None,
+        envelope_required: bool = False,
+        challenge_digest: str | None = None,
     ) -> None:
-        """Add exact CPU or composite-GPU evidence to a running epoch."""
+        """Add exact CPU or composite-GPU evidence to a running epoch.
+
+        ``envelope_required`` is set by production CPU scoring: a scoring
+        attestation without a durably retained raw-evidence envelope fails
+        closed here, as a second gate behind the runtime's retention check.
+        """
+        if envelope_digest is not None and (
+            not isinstance(envelope_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", envelope_digest) is None
+        ):
+            raise LedgerError("attestation envelope digest is invalid")
+        if envelope_required and envelope_digest is None:
+            raise LedgerError("production scoring attestation requires a retained envelope digest")
+        if challenge_digest is not None and (
+            not isinstance(challenge_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", challenge_digest) is None
+        ):
+            raise LedgerError("attestation challenge digest is invalid")
         hardware_shape = (verdict, tee_type, workload)
         if hardware_shape not in {
             ("VERIFIED", "TDX", "CPU"),
@@ -1534,17 +1747,24 @@ class Ledger:
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "add attestations")
             existing = cx.execute(
-                "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible "
+                "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible,"
+                "envelope_digest,challenge_digest "
                 "FROM epoch_attestations "
                 "WHERE epoch_id = ? AND hotkey = ?",
                 (epoch_id, hotkey),
             ).fetchone()
             if existing:
+                if envelope_required and existing["envelope_digest"] is None:
+                    raise LedgerError(
+                        "production scoring attestation requires a retained envelope digest"
+                    )
                 if (
                     existing["evidence_digest"] != evidence_digest
                     or existing["policy_mode"] != policy_mode
                     or existing["tee_type"] != tee_type
                     or existing["workload"] != workload
+                    or existing["envelope_digest"] != envelope_digest
+                    or existing["challenge_digest"] != challenge_digest
                     or bool(existing["score_eligible"]) is not score_eligible
                 ):
                     raise LedgerError("attestation evidence is immutable within an epoch")
@@ -1552,8 +1772,9 @@ class Ledger:
             cx.execute(
                 "INSERT INTO epoch_attestations "
                 "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, "
-                "policy_mode, score_eligible, attested_at) "
-                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?)",
+                "policy_mode, score_eligible, attested_at, envelope_digest, "
+                "challenge_digest) "
+                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     epoch_id,
                     hotkey,
@@ -1563,6 +1784,8 @@ class Ledger:
                     policy_mode,
                     int(score_eligible),
                     _now(),
+                    envelope_digest,
+                    challenge_digest,
                 ),
             )
 
@@ -1667,7 +1890,7 @@ class Ledger:
         if score_authority_valid_until is not None and (
             not isinstance(score_authority_valid_until, datetime)
             or score_authority_valid_until.tzinfo is None
-            or score_authority_valid_until.utcoffset() != timezone.utc.utcoffset(None)
+            or score_authority_valid_until.utcoffset() != UTC.utcoffset(None)
         ):
             raise LedgerError("score authority expiry must be a UTC timestamp")
         universe = set(all_hotkeys)
@@ -1679,6 +1902,18 @@ class Ledger:
                 return self._load_scores(cx, epoch_id)
             if epoch["status"] != "running":
                 raise LedgerError(f"epoch {epoch_id} is {epoch['status']}; cannot complete")
+            if epoch["anchor_network"] is not None:
+                anchored = (str(epoch["anchor_network"]), int(epoch["anchor_netuid"]))
+                if audience is None:
+                    raise LedgerError(
+                        "an anchored epoch must be completed with its anchored "
+                        f"score audience {anchored[0]}/{anchored[1]}"
+                    )
+                if audience != anchored:
+                    raise LedgerError(
+                        f"score audience {audience[0]}/{audience[1]} does not match "
+                        f"the epoch's anchored audience {anchored[0]}/{anchored[1]}"
+                    )
             unresolved = cx.execute(
                 "SELECT COUNT(*) FROM challenges WHERE epoch_id = ? AND status = 'issued'",
                 (epoch_id,),
@@ -1791,6 +2026,16 @@ class Ledger:
             scores = {
                 hotkey: (units / maximum if maximum > 0 else 0.0) for hotkey, units in gated.items()
             }
+            # The external-score wire already carries an explicit score for
+            # every candidate.  Lifecycle detail is useful only for rows that
+            # can earn in this report; duplicating it for thousands of
+            # zero-score candidates can make an otherwise supported maximal
+            # epoch exceed the subnet's hard 1 MiB intake limit.  The complete
+            # lifecycle ledger remains durable, while the public evidence
+            # manifest accounts for every anchored candidate separately.
+            earning_lifecycle_rows = [
+                row for row in lifecycle_rows if scores.get(str(row["hotkey"]), 0.0) > 0.0
+            ]
             report = {
                 "complete": True,
                 "epoch": epoch["source_epoch"],
@@ -1814,7 +2059,7 @@ class Ledger:
                             "snapshot_at": row["snapshot_at"],
                             "state": row["state"],
                         }
-                        for row in lifecycle_rows
+                        for row in earning_lifecycle_rows
                     ],
                 },
                 "scores": [
@@ -1825,8 +2070,9 @@ class Ledger:
             if audience is not None:
                 report["network"], report["netuid"] = audience
             body = _canonical_json(report)
+            _validate_launch_report_cardinality(body)
             digest = hashlib.sha256(body).hexdigest()
-            completion_time = datetime.now(timezone.utc)
+            completion_time = datetime.now(UTC)
             if (
                 score_authority_valid_until is not None
                 and completion_time >= score_authority_valid_until
@@ -1918,6 +2164,11 @@ class Ledger:
             digest = hashlib.sha256(body).hexdigest()
             if digest != str(row["report_digest"]):
                 raise LedgerError("persisted report bytes do not match their frozen digest")
+            # Recheck the exact frozen bytes immediately before the network
+            # call. This protects completed epochs created by an older binary
+            # from publishing a report the current evidence grammar cannot
+            # export or independently verify.
+            _validate_launch_report_cardinality(body)
         acknowledgement = poster.post(body)
         if acknowledgement.get("status") != "accepted":
             raise LedgerError("publication acknowledgement status must be 'accepted'")
@@ -1930,6 +2181,47 @@ class Ledger:
                 "SELECT * FROM epochs WHERE epoch_id = ?", (epoch_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def record_work_artifacts(
+        self, challenge_id: str, work_item_body: bytes, result_body: bytes
+    ) -> None:
+        """Persist the canonical SAT work item and raw result bytes.
+
+        Idempotent for identical bytes; different bytes for a recorded
+        challenge are equivocation and fail closed.
+        """
+        if (
+            not challenge_id
+            or not isinstance(work_item_body, bytes)
+            or not isinstance(result_body, bytes)
+        ):
+            raise LedgerError("work artifacts are invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT work_item_body, result_body FROM work_artifacts WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    bytes(row["work_item_body"]) != work_item_body
+                    or bytes(row["result_body"]) != result_body
+                ):
+                    raise LedgerError(f"work artifacts for {challenge_id!r} are immutable")
+                return
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO work_artifacts (challenge_id, work_item_body, "
+                    "result_body, created_at) VALUES (?, ?, ?, ?)",
+                    (challenge_id, work_item_body, result_body, _now()),
+                )
+
+    def work_artifacts_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT work_item_body, result_body FROM work_artifacts WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
 
     def receipt_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
         with self._lock:
@@ -1995,6 +2287,16 @@ class Ledger:
                 "netuid": report.get("netuid"),
                 "policy_registry_release": epoch["policy_registry_release"],
                 "policy_registry_digest": epoch["policy_registry_digest"],
+                "challenge_anchor_block": (
+                    int(epoch["challenge_anchor_block"])
+                    if epoch["challenge_anchor_block"] is not None
+                    else None
+                ),
+                "challenge_anchor_hash": (
+                    str(epoch["challenge_anchor_hash"])
+                    if epoch["challenge_anchor_hash"] is not None
+                    else None
+                ),
                 "report_digest": "sha256:" + str(epoch["report_digest"]),
                 "rows": tuple(MappingProxyType(dict(row)) for row in rows),
             }
@@ -2151,6 +2453,27 @@ class Ledger:
                 "SELECT hotkey FROM epoch_attestations WHERE epoch_id = ?", (epoch_id,)
             ).fetchall()
             return frozenset(row["hotkey"] for row in rows)
+
+    def attestation_rows(self, epoch_id: int) -> tuple[Mapping[str, Any], ...]:
+        """Read-only attestation facts for one epoch (evidence export)."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT hotkey, verdict, tee_type, workload, evidence_digest, "
+                "policy_mode, score_eligible, attested_at, envelope_digest, "
+                "challenge_digest "
+                "FROM epoch_attestations WHERE epoch_id = ? ORDER BY hotkey",
+                (epoch_id,),
+            ).fetchall()
+            return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def latest_published_epoch_id(self) -> int | None:
+        """Newest epoch whose report has been durably published, if any."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT epoch_id FROM epochs WHERE status = 'published' "
+                "ORDER BY epoch_id DESC LIMIT 1"
+            ).fetchone()
+            return int(row["epoch_id"]) if row is not None else None
 
     def _load_scores(self, cx: sqlite3.Connection, epoch_id: int) -> dict[str, float]:
         rows = cx.execute(

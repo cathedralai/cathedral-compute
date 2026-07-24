@@ -34,6 +34,10 @@ MIN_SEED = -(2**63)
 MAX_SEED = 2**63 - 1
 MAX_CUSTOMER_WORK_BYTES = 60 * 1024
 CUSTOMER_SAT_WORK_UNITS = 20.0
+# THE versioned work-unit rule shared verbatim by the producer
+# (SatLane.verify) and every independent verifier (cathedral.workproof).
+# Any change to the derivation MUST introduce a new rule id.
+SAT_WORK_UNIT_RULE = "sat_work_units_v1"
 
 
 def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
@@ -51,18 +55,29 @@ def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
     return h.hexdigest()
 
 
+def derived_work_units(item: SatWorkItem) -> float:
+    """``sat_work_units_v1``: the ONLY work-unit derivation, computed purely
+    from committed work-item bytes — never from a signer or miner claim.
+
+    An item whose instance is EXACTLY the canonical derivation from its own
+    seed is validator-derived audit work worth its clause count; anything
+    else is a bounded customer job worth the fixed CUSTOMER_SAT_WORK_UNITS.
+    Both the producer and the independent replayer call this same function,
+    so a receipt the producer signs is exactly what a full validator
+    re-derives."""
+    if item.instance == _canonical_instance(item.seed):
+        return float(len(item.instance.clauses))
+    return CUSTOMER_SAT_WORK_UNITS
+
+
 def validate_sat_instance(instance: SatInstance) -> None:
     """Reject malformed or resource-unbounded SAT input."""
 
     if not isinstance(instance, SatInstance):
-        raise ValueError("invalid SAT instance")
+        raise ValueError("invalid SAT instance")  # noqa: TRY004 - ValueError is the stable fail-closed contract
     n_vars = instance.n_vars
     clauses = instance.clauses
-    if (
-        isinstance(n_vars, bool)
-        or not isinstance(n_vars, int)
-        or not 1 <= n_vars <= MAX_N_VARS
-    ):
+    if isinstance(n_vars, bool) or not isinstance(n_vars, int) or not 1 <= n_vars <= MAX_N_VARS:
         raise ValueError("invalid SAT n_vars")
     if not isinstance(clauses, list) or len(clauses) > MAX_CLAUSES:
         raise ValueError("invalid SAT clauses")
@@ -87,7 +102,7 @@ def validate_sat_work_item(item: SatWorkItem) -> None:
     """Validate a work item at every durable or network trust boundary."""
 
     if not isinstance(item, SatWorkItem):
-        raise ValueError("invalid SAT work item")
+        raise ValueError("invalid SAT work item")  # noqa: TRY004 - ValueError is the stable fail-closed contract
     if (
         not isinstance(item.challenge_id, str)
         or len(item.challenge_id) != 64
@@ -348,11 +363,7 @@ class SatLane(Lane):
         # work_units. The returned certificate always carries the validator's
         # value so score() never touches a miner-supplied number. Defending
         # against 1e300, NaN, Infinity, negative, or any forged claim.
-        validator_work_units = (
-            CUSTOMER_SAT_WORK_UNITS
-            if item.challenge_id in self._customer_ids
-            else float(len(instance.clauses))
-        )
+        validator_work_units = derived_work_units(item)
         if not math.isfinite(validator_work_units) or validator_work_units < 0:
             return None  # defense-in-depth (should never happen)
 

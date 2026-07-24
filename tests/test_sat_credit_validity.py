@@ -75,10 +75,9 @@ class TestInvalidCreditValues:
         lane = SatLane()
         inst = SatInstance(n_vars=1, clauses=[[1]])
         from cathedral.lanes.sat import _compute_challenge_id
+
         challenge_id = _compute_challenge_id(inst, 0)
-        item = SatWorkItem(
-            instance=inst, seed=0, challenge_id=challenge_id
-        )
+        item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
         lane._issued_ids.add(challenge_id)
         lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
@@ -90,17 +89,18 @@ class TestInvalidCreditValues:
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        assert verified.work_units == 1.0  # validator-derived, not NaN
+        # sat_work_units_v1: a non-canonical (customer-shaped) item is
+        # worth the fixed CUSTOMER_SAT_WORK_UNITS - never the forged NaN.
+        assert verified.work_units == 20.0
 
     def test_verify_ignores_infinity_work_units_claim(self):
         """Cert claiming +inf work_units is replaced with validator-derived value."""
         lane = SatLane()
         inst = SatInstance(n_vars=1, clauses=[[1]])
         from cathedral.lanes.sat import _compute_challenge_id
+
         challenge_id = _compute_challenge_id(inst, 0)
-        item = SatWorkItem(
-            instance=inst, seed=0, challenge_id=challenge_id
-        )
+        item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
         lane._issued_ids.add(challenge_id)
         lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
@@ -112,17 +112,18 @@ class TestInvalidCreditValues:
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        assert verified.work_units == 1.0  # validator-derived, not inf
+        # sat_work_units_v1: a non-canonical (customer-shaped) item is
+        # worth the fixed CUSTOMER_SAT_WORK_UNITS - never the forged inf.
+        assert verified.work_units == 20.0
 
     def test_verify_ignores_neg_infinity_work_units_claim(self):
         """Cert claiming -inf work_units is replaced with validator-derived value."""
         lane = SatLane()
         inst = SatInstance(n_vars=1, clauses=[[1]])
         from cathedral.lanes.sat import _compute_challenge_id
+
         challenge_id = _compute_challenge_id(inst, 0)
-        item = SatWorkItem(
-            instance=inst, seed=0, challenge_id=challenge_id
-        )
+        item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
         lane._issued_ids.add(challenge_id)
         lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
@@ -134,17 +135,18 @@ class TestInvalidCreditValues:
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        assert verified.work_units == 1.0  # validator-derived, not -inf
+        # sat_work_units_v1: a non-canonical (customer-shaped) item is
+        # worth the fixed CUSTOMER_SAT_WORK_UNITS - never the forged -inf.
+        assert verified.work_units == 20.0
 
     def test_verify_ignores_large_claimed_work_units(self):
         """Cert claiming 1e300 work_units is replaced with validator-derived value."""
         lane = SatLane()
         inst = SatInstance(n_vars=1, clauses=[[1]])
         from cathedral.lanes.sat import _compute_challenge_id
+
         challenge_id = _compute_challenge_id(inst, 0)
-        item = SatWorkItem(
-            instance=inst, seed=0, challenge_id=challenge_id
-        )
+        item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
         lane._issued_ids.add(challenge_id)
         lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
@@ -156,17 +158,18 @@ class TestInvalidCreditValues:
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        assert verified.work_units == 1.0  # validator-derived, not 1e300
+        # sat_work_units_v1: a non-canonical (customer-shaped) item is
+        # worth the fixed CUSTOMER_SAT_WORK_UNITS - never the forged 1e300.
+        assert verified.work_units == 20.0
 
     def test_verify_ignores_negative_work_units_claim(self):
         """Cert claiming negative work_units is replaced with validator-derived value."""
         lane = SatLane()
         inst = SatInstance(n_vars=1, clauses=[[1]])
         from cathedral.lanes.sat import _compute_challenge_id
+
         challenge_id = _compute_challenge_id(inst, 0)
-        item = SatWorkItem(
-            instance=inst, seed=0, challenge_id=challenge_id
-        )
+        item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
         lane._issued_ids.add(challenge_id)
         lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
@@ -178,14 +181,18 @@ class TestInvalidCreditValues:
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        assert verified.work_units == 1.0  # validator-derived, not -5.0
+        # sat_work_units_v1: a non-canonical (customer-shaped) item is
+        # worth the fixed CUSTOMER_SAT_WORK_UNITS - never the forged -5.0.
+        assert verified.work_units == 20.0
 
     def test_score_ignores_nan_work_units(self):
         """Score ignores unverified certs regardless of work_units value."""
         # All certs are unverified (not produced by verify()), so score is 0
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
-            SatCertificate(satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id="c2"),
+            SatCertificate(
+                satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id="c2"
+            ),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c3"),
         ]
         assert SatLane().score("miner-x", certs) == 0.0
@@ -195,7 +202,9 @@ class TestInvalidCreditValues:
         # All certs are unverified (not produced by verify()), so score is 0
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
-            SatCertificate(satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id="c2"),
+            SatCertificate(
+                satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id="c2"
+            ),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c3"),
         ]
         assert SatLane().score("miner-x", certs) == 0.0
@@ -213,7 +222,9 @@ class TestInvalidCreditValues:
     def test_score_ignores_non_numeric_work_units(self):
         """Score ignores unverified certs regardless of work_units value."""
         # Unverified cert, even with valid work_units, contributes zero
-        cert_good = SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1")
+        cert_good = SatCertificate(
+            satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1"
+        )
         certs = [cert_good]
         assert SatLane().score("miner-x", certs) == 0.0
 
@@ -236,6 +247,7 @@ class TestDuplicateCreditPrevention:
         lane = SatLane()
         item = lane.dispatch("miner-1", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -261,6 +273,7 @@ class TestDuplicateCreditPrevention:
         lane = SatLane()
         item = lane.dispatch("miner-1", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -279,6 +292,7 @@ class TestDuplicateCreditPrevention:
         lane = SatLane()
         inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(inst)
         assert assignment is not None
 
@@ -300,6 +314,7 @@ class TestDuplicateCreditPrevention:
         lane = SatLane()
         item = lane.dispatch("miner-1", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -337,9 +352,13 @@ class TestEmptyInputs:
     def test_score_all_invalid_certs(self):
         """Score when all certs are invalid is zero."""
         certs = [
-            SatCertificate(satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id="c1"),
+            SatCertificate(
+                satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id="c1"
+            ),
             SatCertificate(satisfiable=True, assignment=[1], work_units=-5.0, challenge_id="c2"),
-            SatCertificate(satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id="c3"),
+            SatCertificate(
+                satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id="c3"
+            ),
         ]
         assert SatLane().score("miner-x", certs) == 0.0
 
@@ -412,9 +431,7 @@ class TestRoutingInvariants:
 
     def test_routing_conserves_with_mixed_valid_invalid_scores(self):
         """Mix of valid and invalid scores still conserves."""
-        lane_scores = {
-            "sat_benchmark": {"m1": 1.0, "m2": float("inf"), "m3": 2.0}
-        }
+        lane_scores = {"sat_benchmark": {"m1": 1.0, "m2": float("inf"), "m3": 2.0}}
         weights, burn = apply_routing(lane_scores, {"sat_benchmark": 1.0}, floor=0.1)
         total = sum(weights.values()) + burn
         assert abs(total - 1.0) < 1e-9
@@ -423,9 +440,9 @@ class TestRoutingInvariants:
         # Only m1 and m3 contribute to work layer (0.9 in ratio 1:2)
         # m1 work share: 0.9 * (1/3) = 0.3
         # m3 work share: 0.9 * (2/3) = 0.6
-        assert abs(weights.get("m1", 0) - (0.1/3 + 0.3)) < 1e-9
-        assert abs(weights.get("m2", 0) - (0.1/3)) < 1e-9  # only floor
-        assert abs(weights.get("m3", 0) - (0.1/3 + 0.6)) < 1e-9
+        assert abs(weights.get("m1", 0) - (0.1 / 3 + 0.3)) < 1e-9
+        assert abs(weights.get("m2", 0) - (0.1 / 3)) < 1e-9  # only floor
+        assert abs(weights.get("m3", 0) - (0.1 / 3 + 0.6)) < 1e-9
 
 
 class TestFreshLaneNonCollision:
@@ -467,14 +484,18 @@ class TestScoreDeduplication:
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c2"),
-            SatCertificate(satisfiable=True, assignment=[1], work_units=7.0, challenge_id="c1"),  # dup
+            SatCertificate(
+                satisfiable=True, assignment=[1], work_units=7.0, challenge_id="c1"
+            ),  # dup
         ]
         assert SatLane().score("miner-x", certs) == 0.0
 
     def test_score_ignores_missing_challenge_id(self):
         """Score ignores unverified certs regardless of challenge_id value."""
         # All certs are unverified (not produced by verify()), so score is 0
-        cert_good = SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1")
+        cert_good = SatCertificate(
+            satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1"
+        )
         cert_bad = SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="")
         certs = [cert_good, cert_bad]
         assert SatLane().score("miner-x", certs) == 0.0
@@ -484,6 +505,7 @@ class TestScoreDeduplication:
         lane = SatLane()
         item = lane.dispatch("miner-1", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -526,6 +548,7 @@ class TestChallengeOwnership:
         assert owner_at_dispatch == "miner-x"
 
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -547,6 +570,7 @@ class TestChallengeOwnership:
         lane = SatLane()
         item = lane.dispatch("miner-a", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -575,6 +599,7 @@ class TestChallengeOwnership:
         lane = SatLane()
         item = lane.dispatch("miner-a", 0)
         from cathedral.lanes.sat import solve_sat
+
         assignment = solve_sat(item.instance)
         assert assignment is not None
 
@@ -600,6 +625,7 @@ class TestChallengeOwnership:
         item_b = lane.dispatch("miner-2", 0)
 
         from cathedral.lanes.sat import solve_sat
+
         assignment_a = solve_sat(item_a.instance)
         assignment_b = solve_sat(item_b.instance)
         assert assignment_a is not None

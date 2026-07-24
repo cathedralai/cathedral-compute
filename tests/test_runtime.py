@@ -6,15 +6,14 @@ import ast
 import hashlib
 import hmac
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 import cathedral.runtime as runtime_module
-
 from cathedral.assurance import ClaimStatus, attestation_claims
 from cathedral.common import (
     Attested,
@@ -32,15 +31,14 @@ from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.runtime import (
+    SAT_WORK_POLICY_DIGEST,
     ConfidentialRuntime,
     MinerTarget,
     RuntimeConfig,
     RuntimeError,
-    SAT_WORK_POLICY_DIGEST,
     _evidence_digest,
     _work_assurance,
 )
-
 
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
 
@@ -148,7 +146,7 @@ def verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | Non
     )
 
 
-setattr(verifier, "production_ready", True)
+verifier.production_ready = True
 
 
 def production_policy() -> Policy:
@@ -290,6 +288,10 @@ def _production_runtime(
             production_mode=True,
             score_network="finney",
             score_netuid=39,
+            # Production CPU scoring requires durable raw-evidence retention.
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
         ),
     )
     return runtime, ledger, factory
@@ -321,19 +323,23 @@ def test_direct_production_epoch_requires_audience_before_network_or_epoch(
     factory = FakeFactory(specs)
     policy = production_policy()
     monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
-    runtime = ConfidentialRuntime(
-        registry,
-        ledger,
-        policy,
-        token_provider=lambda _hotkey: "token",
-        policy_refresher=lambda: policy,
-        remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
-    )
-
-    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
-    with pytest.raises(RuntimeError, match="explicit score network and netuid"):
-        runtime.run_epoch(1, canary)
+    # The missing audience now fails PREFLIGHT, before any network or epoch
+    # activity can start at all.
+    with pytest.raises(ValueError, match="requires its score audience"):
+        ConfidentialRuntime(
+            registry,
+            ledger,
+            policy,
+            token_provider=lambda _hotkey: "token",
+            policy_refresher=lambda: policy,
+            remote_factory=factory,
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
+        )
     assert factory.log == {}
     assert ledger.blocking_epoch() is None
 
@@ -347,7 +353,12 @@ def test_production_runtime_rejects_unsigned_or_compatibility_policy(tmp_path: P
             ledger,
             Policy(allowed_measurements={"measurement"}),
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -366,7 +377,12 @@ def test_production_runtime_rejects_forged_registry_metadata(tmp_path: Path) -> 
             Ledger(tmp_path / "ledger.sqlite"),
             forged,
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -388,7 +404,14 @@ def test_production_runtime_refreshes_policy_and_rejects_mid_epoch_change(
         initial,
         policy_refresher=lambda: replacement,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
+            score_network="local",
+            score_netuid=1,
+        ),
     )
     runtime._active_policy_authority = initial.registry_authority_identity
 
@@ -406,7 +429,12 @@ def test_production_runtime_rejects_custom_verifier_escape_hatch(tmp_path: Path)
             policy,
             policy_refresher=lambda: policy,
             verifier=verifier,
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -416,7 +444,12 @@ def test_production_runtime_requires_live_policy_refresher(tmp_path: Path) -> No
             RegistryStore(str(tmp_path / "registry.sqlite")),
             Ledger(tmp_path / "ledger.sqlite"),
             production_policy(),
-            config=RuntimeConfig(production_mode=True),
+            config=RuntimeConfig(
+                production_mode=True,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
         )
 
 
@@ -685,8 +718,7 @@ def test_negative_customer_result_reaches_exact_attempt_cap_without_validator_se
 
     snapshot = ledger.customer_job(submitted.job_id)
     challenges = [
-        factory.log[f"sat:{hotkey}"][0]
-        for hotkey in ("worker-a", "worker-b", "worker-c")
+        factory.log[f"sat:{hotkey}"][0] for hotkey in ("worker-a", "worker-b", "worker-c")
     ]
     assert snapshot.status == "failed"
     assert snapshot.attempt_count == 3
@@ -735,7 +767,14 @@ def test_production_rejects_legacy_report_data_before_work(tmp_path: Path, monke
         policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            evidence_retention_dir=str(tmp_path / "retained-evidence"),
+            challenge_anchor_block=100,
+            challenge_anchor_hash="0x" + "ab" * 32,
+            score_network="local",
+            score_netuid=1,
+        ),
     )
 
     with pytest.raises(RuntimeError, match="report data v2"):
@@ -770,12 +809,12 @@ def test_invalid_untrusted_certificate_still_produces_failed_work_claim():
 
 
 def test_evidence_audit_digest_commits_to_report_version_and_channel_binding():
-    common = dict(
-        kind=EvidenceKind.TDX,
-        quote=b"quote",
-        nonce=b"n" * 32,
-        miner_hotkey="miner",
-    )
+    common = {
+        "kind": EvidenceKind.TDX,
+        "quote": b"quote",
+        "nonce": b"n" * 32,
+        "miner_hotkey": "miner",
+    }
     legacy = Evidence(**common)
     first = Evidence(
         **common,
@@ -1027,18 +1066,9 @@ def test_policy_revocation_publishes_signed_positive_to_explicit_zero_without_ne
     assert zero.scores["miner"] == 0.0
     assert {outcome.status for outcome in zero.outcomes} == {"revoked"}
     assert len(factory.log["nonce:miner"]) == worker_calls
-    assert lifecycle == [
-        {
-            "event_id": lifecycle[0]["event_id"],
-            "evidence_expires_at": lifecycle[0]["evidence_expires_at"],
-            "generation": 1,
-            "hotkey": "miner",
-            "reason": "policy_revoked",
-            "revision": 3,
-            "snapshot_at": lifecycle[0]["snapshot_at"],
-            "state": "revoked",
-        }
-    ]
+    # Zero-score lifecycle rows stay in the durable ledger and the exhaustive
+    # evidence manifest, but are not duplicated into the 1 MiB score wire.
+    assert lifecycle == []
     assert poster.bodies == [
         ledger.report_bytes(positive.epoch_id),
         ledger.report_bytes(zero.epoch_id),
@@ -1105,7 +1135,7 @@ def test_abandon_completed_unblocks_begin_epoch_and_is_audited(tmp_path: Path) -
 
 
 def test_abandon_completed_requires_exact_blocking_epoch(tmp_path: Path) -> None:
-    runtime, ledger, _ = make_runtime(tmp_path, [], default_specs())
+    runtime, _ledger, _ = make_runtime(tmp_path, [], default_specs())
     run = runtime.run_epoch(1, CANARY)
     with pytest.raises(RuntimeError, match="exact completed"):
         runtime.abandon_completed(run.epoch_id + 1, "reason")
@@ -1154,3 +1184,31 @@ def test_sat_lane_still_rejects_wrong_owner() -> None:
         "other",
     )
     assert lane.verify(item, cert) is None
+
+
+def test_production_cpu_preflight_requires_safe_retention_dir(tmp_path: Path) -> None:
+    from cathedral.runtime import _preflight_evidence_retention
+
+    with pytest.raises(ValueError, match="requires --evidence-retention-dir"):
+        _preflight_evidence_retention(None)
+
+    good = tmp_path / "retained"
+    _preflight_evidence_retention(str(good))  # creates 0700
+    assert (good.stat().st_mode & 0o777) == 0o700
+
+    lax = tmp_path / "lax"
+    lax.mkdir()
+    lax.chmod(0o755)
+    with pytest.raises(ValueError, match="0700"):
+        _preflight_evidence_retention(str(lax))
+
+    link = tmp_path / "link"
+    link.symlink_to(good)
+    with pytest.raises(ValueError, match="non-symlink"):
+        _preflight_evidence_retention(str(link))
+
+    not_dir = tmp_path / "file"
+    not_dir.write_text("x")
+    not_dir.chmod(0o700)
+    with pytest.raises(ValueError, match="non-symlink directory|not a directory"):
+        _preflight_evidence_retention(str(not_dir))

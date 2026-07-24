@@ -11,21 +11,29 @@ import hashlib
 import json
 import re
 import urllib.parse
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cathedral.launch_limits import (
+    MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_EVIDENCE_BASE_URI_BYTES,
+    MAX_LAUNCH_SCORE_REPORT_BYTES,
+    is_launch_hotkey,
+)
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptError, parse_receipt_json
 
-
-REPORT_SCHEMA = "cathedral_score_class_report_v1"
+REPORT_SCHEMA = "cathedral_score_class_report_v2"
 REPORT_DOMAIN = b"cathedral-score-class-report-v1\x00"
 REPORT_ID_DOMAIN = b"cathedral-score-class-id-v1\x00"
-MAX_REPORT_BYTES = 1_048_576
-MAX_REPORT_ENTRIES = 4096
+CANDIDATE_SNAPSHOT_SCHEMA = "cathedral_candidate_snapshot_v1"
+_BLOCK_HASH_RE = re.compile(r"^(0x)?[0-9a-f]{64}$")
+MAX_REPORT_BYTES = MAX_LAUNCH_SCORE_REPORT_BYTES
+MAX_REPORT_ENTRIES = MAX_LAUNCH_CANDIDATES
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _DIGEST_RE = re.compile(r"(?:sha256|receipt-sha256):[0-9a-f]{64}")
@@ -34,6 +42,47 @@ _METRIC_DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,12})?")
 
 class ScoreClassError(ValueError):
     """The ledger cannot produce a valid, provenance-complete score report."""
+
+
+def parse_score_report_json(data: bytes) -> dict[str, Any]:
+    """Parse one canonical score report under its own 2 MiB artifact cap.
+
+    Policy registries intentionally remain capped at 1 MiB.  Score reports
+    have a separate 2 MiB launch contract, so reusing the registry parser
+    makes a producer-valid maximal report impossible to verify.
+    """
+
+    if not isinstance(data, bytes) or not data or len(data) > MAX_REPORT_BYTES:
+        raise ScoreClassError("score report is empty or exceeds its artifact cap")
+
+    def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ScoreClassError(f"duplicate score report JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        document = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicates,
+            parse_float=lambda _value: (_ for _ in ()).throw(
+                ScoreClassError("floating-point score report JSON is not canonical")
+            ),
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ScoreClassError("non-finite score report JSON is not canonical")
+            ),
+        )
+    except ScoreClassError:
+        raise
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ScoreClassError("score report is not valid UTF-8 JSON") from exc
+    if not isinstance(document, dict):
+        raise ScoreClassError("score report must be a JSON object")
+    if canonical_json(document) != data:
+        raise ScoreClassError("score report bytes are not canonical JSON")
+    return document
 
 
 def canonical_json(value: Mapping[str, Any]) -> bytes:
@@ -95,7 +144,11 @@ def _decimal_text(value: Decimal) -> str:
 def _receipt_uri(base_uri: str | None, receipt_id: str) -> str | None:
     if base_uri is None:
         return None
-    if not isinstance(base_uri, str) or not base_uri.endswith("/"):
+    if (
+        not isinstance(base_uri, str)
+        or not base_uri.endswith("/")
+        or len(base_uri.encode("utf-8")) > MAX_LAUNCH_EVIDENCE_BASE_URI_BYTES
+    ):
         raise ScoreClassError("evidence base URI must end with a slash")
     parsed = urllib.parse.urlsplit(base_uri)
     if (
@@ -108,6 +161,55 @@ def _receipt_uri(base_uri: str | None, receipt_id: str) -> str | None:
     ):
         raise ScoreClassError("evidence base URI must be credential-free HTTPS")
     return base_uri + urllib.parse.quote(receipt_id, safe=":-") + ".json"
+
+
+def validate_candidate_snapshot(
+    document: Mapping[str, Any], *, network: str, netuid: int
+) -> dict[str, Any]:
+    """Validate a ``cathedral_candidate_snapshot_v1`` and return its normalized
+    binding: {digest, block, block_hash, hotkeys}.
+
+    The digest commits to the EXACT snapshot document (canonical JSON), so the
+    score report, the evidence manifest, and any later export can only ever be
+    built from the one snapshot the epoch actually observed."""
+    if not isinstance(document, Mapping):
+        raise ScoreClassError("candidate snapshot must be a JSON object")
+    if frozenset(document) != {
+        "schema",
+        "network",
+        "netuid",
+        "block",
+        "block_hash",
+        "hotkeys",
+    }:
+        raise ScoreClassError("candidate snapshot has missing or unknown fields")
+    if document["schema"] != CANDIDATE_SNAPSHOT_SCHEMA:
+        raise ScoreClassError("candidate snapshot schema is unsupported")
+    if document["network"] != network or document["netuid"] != netuid:
+        raise ScoreClassError("candidate snapshot audience does not match the report")
+    block = document["block"]
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        raise ScoreClassError("candidate snapshot block is invalid")
+    block_hash = document["block_hash"]
+    if (
+        not isinstance(block_hash, str)
+        or _BLOCK_HASH_RE.fullmatch(block_hash.strip().lower()) is None
+    ):
+        raise ScoreClassError("candidate snapshot block hash is invalid")
+    hotkeys = document["hotkeys"]
+    if not isinstance(hotkeys, list) or len(hotkeys) > MAX_REPORT_ENTRIES:
+        raise ScoreClassError("candidate snapshot hotkeys are invalid")
+    for hotkey in hotkeys:
+        if not is_launch_hotkey(hotkey):
+            raise ScoreClassError("candidate snapshot carries an invalid hotkey")
+    if len(set(hotkeys)) != len(hotkeys):
+        raise ScoreClassError("candidate snapshot carries duplicate hotkeys")
+    return {
+        "digest": "sha256:" + hashlib.sha256(canonical_json(document)).hexdigest(),
+        "block": int(block),
+        "block_hash": block_hash.strip().lower().removeprefix("0x"),
+        "hotkeys": sorted(hotkeys),
+    }
 
 
 def _report_id(document: Mapping[str, Any]) -> str:
@@ -151,15 +253,20 @@ def export_score_class_report(
     valid_from_block: int,
     valid_until_block: int,
     verifier_digest: str,
+    candidate_snapshot: Mapping[str, Any],
     policy_digest: str | None = None,
     previous_report_id: str | None = None,
     evidence_base_uri: str | None = None,
+    require_epoch_anchor: bool = True,
 ) -> bytes:
     """Export one frozen epoch as a thin-subnet-compatible signed report.
 
     Every positive metric is derived from the exact signed assurance receipt
-    persisted atomically with that miner's verified challenge.  Zero rows are
-    retained so a complete report can explicitly revoke prior positive work.
+    persisted atomically with that miner's verified challenge.  The report
+    accounts for EVERY candidate in the anchored historical snapshot —
+    ledger-scored or not — with explicit zero rows, and binds the snapshot's
+    digest, block, hash, and full sorted hotkey set into the signed body so
+    manifest, report, and recomputation always cover the identical set.
     """
 
     if not isinstance(ledger, Ledger):
@@ -202,6 +309,33 @@ def export_score_class_report(
         raise ScoreClassError(str(exc)) from exc
     if (snapshot["network"], snapshot["netuid"]) != (network, netuid):
         raise ScoreClassError("frozen epoch audience does not match score report audience")
+    snapshot_binding = validate_candidate_snapshot(
+        candidate_snapshot, network=network, netuid=netuid
+    )
+    anchor_block = snapshot["challenge_anchor_block"]
+    anchor_hash = snapshot["challenge_anchor_hash"]
+    if anchor_block is None:
+        if require_epoch_anchor:
+            raise ScoreClassError(
+                "epoch has no durable challenge anchor; production reports "
+                "require begin_epoch to persist the finalized-block anchor"
+            )
+    elif (int(anchor_block), str(anchor_hash)) != (
+        snapshot_binding["block"],
+        snapshot_binding["block_hash"],
+    ):
+        raise ScoreClassError(
+            "candidate snapshot block/hash does not match the epoch's durable "
+            "challenge anchor; the report must bind the snapshot the epoch's "
+            "nonces were actually derived from"
+        )
+    if valid_from_block < snapshot_binding["block"]:
+        raise ScoreClassError(
+            f"valid_from_block {valid_from_block} precedes the anchored "
+            f"candidate snapshot block {snapshot_binding['block']}; the "
+            "report's validity window cannot start before the finalized "
+            "state it was derived from"
+        )
     selected_policy_digest = policy_digest or snapshot["policy_registry_digest"]
     checked_policy_digest = _digest(selected_policy_digest, "policy digest")
     prior_export = ledger.previous_score_class_export(
@@ -224,11 +358,42 @@ def export_score_class_report(
     if not isinstance(rows, tuple) or len(rows) > MAX_REPORT_ENTRIES:
         raise ScoreClassError("score report has too many entries")
 
-    entries: list[dict[str, Any]] = []
+    # Exhaustive candidate accounting (defect 4): the report's entry set must
+    # be EXACTLY the anchored snapshot's hotkey set. A ledger row outside the
+    # snapshot means the epoch scored an unregistered hotkey — refuse; a
+    # snapshot candidate with no ledger row gets an explicit zero entry.
+    rows_by_hotkey: dict[str, Any] = {}
     for row in rows:
         hotkey = row["hotkey"]
-        if not isinstance(hotkey, str) or not 1 <= len(hotkey.encode("utf-8")) <= 512:
+        if not is_launch_hotkey(hotkey):
             raise ScoreClassError("invalid miner hotkey in frozen epoch")
+        rows_by_hotkey[hotkey] = row
+    for hotkey in sorted(set(rows_by_hotkey) - set(snapshot_binding["hotkeys"])):
+        row = rows_by_hotkey.pop(hotkey)
+        if _decimal(row["work_units"], "frozen work units") > 0:
+            raise ScoreClassError(
+                "frozen epoch carries POSITIVE work for a hotkey that is not "
+                f"registered in the anchored candidate snapshot: {hotkey!r}"
+            )
+        # A zero-valued historical row for a since-deregistered hotkey is
+        # simply omitted: it earns nothing, it is not a candidate, and the
+        # report's entry set must remain EXACTLY the signed snapshot — a
+        # departed miner must never permanently block future epochs.
+
+    entries: list[dict[str, Any]] = []
+    for hotkey in snapshot_binding["hotkeys"]:
+        row = rows_by_hotkey.get(hotkey)
+        if row is None:
+            entries.append(
+                {
+                    "miner_hotkey": hotkey,
+                    "metrics": {"verified_work_units": "0"},
+                    "asserted_score": None,
+                    "reason_codes": ["not_admitted"],
+                    "evidence": [],
+                }
+            )
+            continue
         frozen_units = _decimal(row["work_units"], "frozen work units")
         evidence: list[dict[str, Any]] = []
         reasons = ["no_verified_work"]
@@ -275,9 +440,12 @@ def export_score_class_report(
         metric_text = _decimal_text(metric_units)
         if _METRIC_DECIMAL_RE.fullmatch(metric_text) is None:
             # One out-of-range receipt must not invalidate every honest miner.
-            # Preserve its exact provenance, score only that row as zero, and
-            # make the exclusion explicit in the decision record.
+            # Exclude both its units and receipt reference: public evidence
+            # bundles cover exactly the positive candidate set, so retaining
+            # evidence on a zero row would make the otherwise fail-closed
+            # report impossible to export.
             metric_text = "0"
+            evidence = []
             reasons = ["unsupported_work_unit_precision"]
         entries.append(
             {
@@ -304,6 +472,7 @@ def export_score_class_report(
         "policy_digest": checked_policy_digest,
         "verifier_digest": checked_verifier_digest,
         "previous_report_id": checked_previous,
+        "candidate_snapshot": snapshot_binding,
         "entries": entries,
         "signing_key_id": signing_key_id,
     }

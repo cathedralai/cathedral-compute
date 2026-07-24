@@ -11,12 +11,15 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
 import threading
 import urllib.parse
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol
+from typing import Protocol
 
 from cathedral.assurance import (
     ATTESTATION_ADMISSION_POLICY,
@@ -31,16 +34,16 @@ from cathedral.assurance import (
     with_verified_channel,
 )
 from cathedral.common import (
+    MAX_EVIDENCE_RESPONSE_BODY,
+    MAX_GPU_EVIDENCE_CONCURRENCY,
     Attested,
     ChannelBinding,
     Evidence,
     EvidenceKind,
-    MAX_EVIDENCE_RESPONSE_BODY,
-    MAX_GPU_EVIDENCE_CONCURRENCY,
     Policy,
     Tier,
-    issue_nonce,
     is_globally_routable,
+    issue_nonce,
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
@@ -55,8 +58,8 @@ from cathedral.lifecycle import (
     WorkerLifecycleState,
 )
 from cathedral.poster import Poster
-from cathedral.remote import RemoteMiner
 from cathedral.receipt import ReceiptIssuer
+from cathedral.remote import RemoteMiner
 from cathedral.score_audience import validate_score_audience
 from cathedral.verify import preflight_tdx_verifier, verify
 
@@ -104,6 +107,18 @@ class RuntimeConfig:
     customer_job_max_attempts: int = 3
     score_network: str | None = None
     score_netuid: int | None = None
+    # Publicly derivable challenge anchor: the finalized SN39 block (and its
+    # hash) each epoch's TDX challenge nonces are derived from. REQUIRED for
+    # production CPU scoring - a random issuer nonce is not a public
+    # freshness proof.
+    challenge_anchor_block: int | None = None
+    challenge_anchor_hash: str | None = None
+    # Controlled-disclosure retention of raw admission evidence (quotes and
+    # their binding material). REQUIRED for production CPU scoring: the
+    # runtime refuses to start without a safe retention directory, and any
+    # retention failure refuses that admission (fail closed). None disables
+    # retention in development only.
+    evidence_retention_dir: str | None = None
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -127,15 +142,15 @@ class RuntimeConfig:
         ):
             raise ValueError("max_workers must be between 1 and 64")
         if not isinstance(self.production_mode, bool):
-            raise ValueError("production_mode must be a boolean")
+            raise ValueError("production_mode must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if not isinstance(self.allow_insecure_http_for_tests, bool):
-            raise ValueError("allow_insecure_http_for_tests must be a boolean")
+            raise ValueError("allow_insecure_http_for_tests must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.production_mode and self.allow_insecure_http_for_tests:
             raise ValueError("insecure HTTP is unavailable in production mode")
         if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
             raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
         if not isinstance(self.admission_enabled, bool):
-            raise ValueError("admission_enabled must be a boolean")
+            raise ValueError("admission_enabled must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.score_network is not None or self.score_netuid is not None:
             validate_score_audience(self.score_network, self.score_netuid)
         minimum_lease = math.ceil(float(timeout) * self.miner_attempts) + 5
@@ -220,6 +235,8 @@ class _AttestationResult:
     endpoint: str
     attested: Attested | None = None
     evidence_digest: str | None = None
+    envelope_digest: str | None = None
+    challenge_digest: str | None = None
     client: MinerClient | None = None
     error: str | None = None
     error_category: str | None = None
@@ -320,6 +337,24 @@ class ConfidentialRuntime:
             if self.policy_refresher is None:
                 raise ValueError("production runtime requires a live policy registry refresher")
             preflight_tdx_verifier(self.policy)
+            if self.config.expected_tier is Tier.CC_CPU_TDX:
+                _preflight_evidence_retention(self.config.evidence_retention_dir)
+                if (
+                    self.config.challenge_anchor_hash is None
+                    or self.config.challenge_anchor_block is None
+                ):
+                    raise ValueError(
+                        "production CPU scoring requires the finalized-block "
+                        "challenge anchor as a VALIDATED PAIR "
+                        "(--challenge-anchor-block AND --challenge-anchor-hash); "
+                        "issuer-random nonces are not a public freshness proof"
+                    )
+                if self.config.score_network is None or self.config.score_netuid is None:
+                    raise ValueError(
+                        "an anchored production runtime requires its score "
+                        "audience (--score-network/--score-netuid)"
+                    )
+                self._config_challenge_anchor()
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -506,6 +541,33 @@ class ConfidentialRuntime:
             self._active_policy_authority = None
             self._run_lock.release()
 
+    def _config_challenge_anchor(self) -> dict | None:
+        """The validated {network, netuid, block, block_hash} challenge-anchor
+        pair from configuration, hash-normalized, or None when unanchored
+        (development only; production CPU preflight refuses to start)."""
+        block = self.config.challenge_anchor_block
+        block_hash = self.config.challenge_anchor_hash
+        if block is None and block_hash is None:
+            return None
+        if block is None or block_hash is None:
+            raise ValueError(
+                "challenge anchor block and hash must be configured together as a validated pair"
+            )
+        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+            raise ValueError("challenge anchor block is invalid")
+        if self.config.score_network is None or self.config.score_netuid is None:
+            raise ValueError(
+                "a challenge anchor requires the score audience (score_network/score_netuid)"
+            )
+        from cathedral.challenge import normalize_block_hash
+
+        return {
+            "network": self.config.score_network,
+            "netuid": int(self.config.score_netuid),
+            "block": int(block),
+            "block_hash": normalize_block_hash(block_hash),
+        }
+
     def _run_epoch_once(
         self,
         source_epoch: int,
@@ -514,7 +576,13 @@ class ConfidentialRuntime:
         publish: bool = False,
     ) -> EpochRun:
         if not isinstance(publish, bool):
-            raise ValueError("publish must be a boolean")
+            raise ValueError("publish must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
+        # The active epoch anchors every derived challenge nonce this cycle.
+        # ONE anchor snapshot is taken here; the same values are persisted on
+        # the epoch row at begin_epoch and asserted on read-back, so nonce
+        # derivation and the durable epoch record can never diverge.
+        self._active_source_epoch = int(source_epoch)
+        self._active_challenge_anchor = self._config_challenge_anchor()
         self._require_live_gpu_profile()
         canary_target, canary_endpoint = self._validate_target(canary)
 
@@ -601,11 +669,35 @@ class ConfidentialRuntime:
                     raise RuntimeError("an enrolled miner shares the dedicated canary GPU identity")
 
             self._require_live_gpu_profile()
+            anchor = getattr(self, "_active_challenge_anchor", None)
             epoch_id = self.ledger.begin_epoch(
                 source_epoch,
                 policy_registry_release=self.policy.registry_release,
                 policy_registry_digest=self.policy.registry_digest,
+                network=(anchor or {}).get("network") or self.config.score_network,
+                netuid=(
+                    (anchor or {}).get("netuid") if anchor is not None else self.config.score_netuid
+                ),
+                challenge_anchor_block=(anchor or {}).get("block"),
+                challenge_anchor_hash=(anchor or {}).get("block_hash"),
             )
+            if anchor is not None:
+                stored = self.ledger.epoch_challenge_anchor(epoch_id)
+                if stored is None or (
+                    stored["network"],
+                    stored["netuid"],
+                    stored["block"],
+                    stored["block_hash"],
+                ) != (
+                    anchor["network"],
+                    anchor["netuid"],
+                    anchor["block"],
+                    anchor["block_hash"],
+                ):
+                    raise RuntimeError(
+                        "durable epoch challenge anchor does not match the "
+                        "anchor the epoch's nonces were derived from"
+                    )
             try:
                 admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
                 self._run_sat(epoch_id, source_epoch, admitted, outcomes)
@@ -698,7 +790,7 @@ class ConfidentialRuntime:
     def __del__(self) -> None:  # pragma: no cover - interpreter cleanup fallback
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort close on interpreter teardown
             pass
 
     def abort_running(self) -> int:
@@ -775,7 +867,7 @@ class ConfidentialRuntime:
             for hotkey in sorted(futures):
                 result = futures[hotkey].result()
                 if result.attested is None:
-                    target, endpoint = by_hotkey[hotkey]
+                    _target, endpoint = by_hotkey[hotkey]
                     if (
                         result.lifecycle_generation is not None
                         and result.lifecycle_revision is not None
@@ -848,6 +940,44 @@ class ConfidentialRuntime:
             lifecycle_generation=snapshot.generation,
             lifecycle_revision=snapshot.revision,
         )
+
+    def _retain_admission_evidence(
+        self,
+        evidences: tuple[Evidence, ...],
+        evidence_digest: str,
+        hotkey: str,
+    ) -> str | None:
+        """Durably retain verified raw evidence for controlled disclosure.
+
+        When retention is configured it MUST succeed: production scoring
+        requires the durable raw evidence that full provenance replays, so a
+        retention failure refuses this admission (the target fails closed to
+        zero/burn like any other evidence failure). There is no silent
+        best-effort path. Returns the envelope digest binding the controlled
+        artifact into the public manifest.
+        """
+        directory = self.config.evidence_retention_dir
+        if not directory:
+            if self.config.production_mode and self.config.expected_tier is Tier.CC_CPU_TDX:
+                raise RuntimeError(
+                    "production CPU scoring requires evidence retention; "
+                    "configure --evidence-retention-dir"
+                )
+            return None
+        try:
+            from cathedral.evidence import RetentionStore
+
+            envelope = _retained_evidence_envelope(evidences, evidence_digest)
+            return RetentionStore(directory).retain(
+                envelope,
+                kind="admission_evidence",
+                hotkey=hotkey,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"evidence retention failed; refusing admission without a "
+                f"durable raw-evidence envelope: {_safe_error(exc)}"
+            ) from exc
 
     def _admit_unique_chips(
         self,
@@ -989,6 +1119,11 @@ class ConfidentialRuntime:
                 evidence_digest=result.evidence_digest,
                 policy_mode=result.attested.policy_mode or "compatibility",
                 score_eligible=score_eligible,
+                envelope_digest=result.envelope_digest,
+                challenge_digest=result.challenge_digest,
+                envelope_required=(
+                    self.config.production_mode and self.config.expected_tier is Tier.CC_CPU_TDX
+                ),
             )
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey,
@@ -1072,7 +1207,9 @@ class ConfidentialRuntime:
         # audit work without consuming a customer attempt.
         customer_capable: set[str] = set()
         if self.config.expected_tier is Tier.CC_CPU_TDX and eligible:
-            with ThreadPoolExecutor(max_workers=min(len(eligible), self.config.max_workers)) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(len(eligible), self.config.max_workers)
+            ) as executor:
                 capability_futures = {
                     result.target.hotkey: executor.submit(
                         result.client.supports_customer_sat  # type: ignore[union-attr]
@@ -1084,7 +1221,7 @@ class ConfidentialRuntime:
                     try:
                         if future.result() is True:
                             customer_capable.add(hotkey)
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110 - probe failure is not a customer attempt
                         # Capability failure is not a customer attempt. The
                         # worker still receives safe canonical audit work.
                         pass
@@ -1193,6 +1330,7 @@ class ConfidentialRuntime:
                         assurance,
                         status="verified",
                         work_units=units,
+                        certificate=certificate,
                         customer_lease=lease,
                         customer_disposition="succeeded" if lease is not None else None,
                         customer_result=(
@@ -1223,7 +1361,18 @@ class ConfidentialRuntime:
         customer_disposition: str | None = None,
         customer_result: Mapping[str, object] | None = None,
         customer_error: str | None = None,
+        certificate: SatCertificate | None = None,
     ) -> None:
+        if status == "verified" and certificate is not None:
+            # Durable canonical work artifacts: the exact bytes the receipt's
+            # manifest/result digests sign, so full provenance can replay the
+            # workload independently. Recorded before the receipt so a crash
+            # can never leave a receipt without its replayable work.
+            self.ledger.record_work_artifacts(
+                item.challenge_id,
+                _sat_manifest_bytes(item),
+                _sat_result_bytes(item, certificate),
+            )
         if self.receipt_issuer is None:
             self.ledger.resolve_challenge(
                 item.challenge_id,
@@ -1292,7 +1441,7 @@ class ConfidentialRuntime:
                 target.hotkey,
                 **remote_options,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized attestation error
             return _AttestationResult(target, endpoint, error=_safe_error(exc))
 
         last_error = "attestation rejected"
@@ -1302,7 +1451,30 @@ class ConfidentialRuntime:
                 return _AttestationResult(target, endpoint, error="reattestation cancelled")
             gpu_budget_reserved = False
             try:
-                nonce = self.nonce_factory()
+                anchor = getattr(self, "_active_challenge_anchor", None) or (
+                    self._config_challenge_anchor()
+                )
+                if anchor is not None:
+                    # Anchored, publicly derivable challenge: any validator can
+                    # recompute this exact nonce from the finalized block hash,
+                    # audience, epoch, and hotkey. The anchor is the SAME
+                    # snapshot begin_epoch durably persists on the epoch row
+                    # (read-back asserted), so exports verify against exactly
+                    # what these nonces were derived from. (Lifecycle
+                    # re-attestations between epochs reuse the last epoch's
+                    # anchor slot.)
+                    from cathedral.challenge import derive_challenge_nonce
+
+                    nonce = derive_challenge_nonce(
+                        block=anchor["block"],
+                        block_hash=anchor["block_hash"],
+                        network=anchor["network"],
+                        netuid=anchor["netuid"],
+                        source_epoch=int(getattr(self, "_active_source_epoch", 0)),
+                        miner_hotkey=target.hotkey,
+                    )
+                else:
+                    nonce = self.nonce_factory()
                 if not isinstance(nonce, bytes) or len(nonce) != 32:
                     raise RuntimeError("nonce_factory must return exactly 32 bytes")
                 if self.config.expected_tier is Tier.CC_GPU:
@@ -1405,16 +1577,23 @@ class ConfidentialRuntime:
                     verdict.assurance
                 ):
                     raise RuntimeError("production evidence requires a verified channel binding")
+                envelope_digest = None
+                if self.config.expected_tier is Tier.CC_CPU_TDX:
+                    envelope_digest = self._retain_admission_evidence(
+                        evidences, evidence_digest, target.hotkey
+                    )
                 return _AttestationResult(
                     target,
                     endpoint,
                     attested=verdict,
                     evidence_digest=evidence_digest,
+                    envelope_digest=envelope_digest,
+                    challenge_digest="sha256:" + hashlib.sha256(nonce).hexdigest(),
                     client=client,
                     component_audit=component_audit,
                     gpu_component=gpu_component,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized attestation error
                 last_error = _safe_error(exc)
                 last_error_category = _safe_error_category(exc)
             finally:
@@ -1441,7 +1620,7 @@ class ConfidentialRuntime:
         for _ in range(self.config.miner_attempts):
             try:
                 return client.do_sat_work(item), None
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - any miner fault becomes a categorized work error
                 last_error = _safe_error(exc)
         return None, last_error
 
@@ -1513,7 +1692,9 @@ def _work_assurance(
     return claims.with_claim(AssuranceDimension.WORK, work)
 
 
-def _sat_manifest_digest(item: SatWorkItem) -> str:
+def _sat_manifest_bytes(item: SatWorkItem) -> bytes:
+    """The EXACT canonical work-item bytes the receipt's manifest digest
+    signs — persisted so full provenance can replay the workload."""
     manifest = {
         "schema": "cathedral_sat_manifest_v1",
         "challenge_id": item.challenge_id,
@@ -1523,14 +1704,40 @@ def _sat_manifest_digest(item: SatWorkItem) -> str:
             "clauses": item.instance.clauses,
         },
     }
-    encoded = json.dumps(
+    return json.dumps(
         manifest,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
         allow_nan=False,
     ).encode("ascii")
-    return sha256_digest(encoded)
+
+
+def _sat_result_bytes(item: SatWorkItem, certificate: SatCertificate | None) -> bytes:
+    """The EXACT canonical result bytes the work claim's evidence digest
+    signs (mirrors _work_assurance's material encoding)."""
+    material = {
+        "assigned_hotkey": certificate.assigned_hotkey if certificate else None,
+        "assignment": (
+            list(certificate.assignment)
+            if certificate is not None and isinstance(certificate.assignment, list)
+            else None
+        ),
+        "challenge_id": item.challenge_id,
+        "satisfiable": certificate.satisfiable if certificate else None,
+        "work_units": certificate.work_units if certificate else None,
+    }
+    return json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def _sat_manifest_digest(item: SatWorkItem) -> str:
+    return sha256_digest(_sat_manifest_bytes(item))
 
 
 def _sat_certificate_json(certificate: SatCertificate) -> Mapping[str, object]:
@@ -1551,7 +1758,7 @@ def _sat_certificate_json(certificate: SatCertificate) -> Mapping[str, object]:
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
     if not isinstance(endpoint, str):
-        raise ValueError("endpoint must be a string")
+        raise ValueError("endpoint must be a string")  # noqa: TRY004 - ValueError is the stable fail-closed contract
     parsed = urllib.parse.urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError("endpoint must be an absolute HTTP(S) URL")
@@ -1593,6 +1800,93 @@ def _validate_bearer_token(token: str | None, *, required: bool) -> None:
         or any(ord(character) < 0x21 or ord(character) > 0x7E for character in token)
     ):
         raise ValueError("bearer token must be a nonempty bounded ASCII value")
+
+
+def _preflight_evidence_retention(directory: str | None) -> None:
+    """Fail closed at startup, before any network or epoch work, if the
+    production retention directory is absent or unsafe (symlink, non-dir,
+    group/world-writable, foreign-owned). Creates it 0700 when missing."""
+    import stat as stat_module
+
+    if not directory:
+        raise ValueError(
+            "production CPU scoring requires --evidence-retention-dir; "
+            "refusing to start without durable raw-evidence retention"
+        )
+    path = Path(directory)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    metadata = os.lstat(path)
+    if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
+        raise ValueError("evidence retention dir must be a real non-symlink directory")
+    if metadata.st_mode & 0o077:
+        raise ValueError("evidence retention dir must be mode 0700 (no group/world)")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise ValueError("evidence retention dir must be owned by the runtime user")
+    probe = path / f".preflight.{os.getpid()}"
+    try:
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+
+
+RETAINED_EVIDENCE_SCHEMA = "cathedral_retained_evidence_v1"
+
+
+def _retained_evidence_envelope(evidences: tuple[Evidence, ...], evidence_digest: str) -> bytes:
+    """Serialize verified CPU-TDX admission evidence for controlled retention.
+
+    The envelope carries exactly the fields hashed by ``_evidence_digest`` so
+    an authorized reviewer can recompute the digest recorded in the ledger and
+    published (digest-only) in the evidence manifest, then replay the raw
+    quote through the pinned verifier.
+
+    Launch scope is CPU TDX only, and token-shaped material is never
+    persisted: a component of any other kind, or one carrying a composite
+    JWT, refuses retention outright (which in production refuses admission).
+    """
+    import base64 as _base64
+
+    def _b64(value: bytes | None) -> str | None:
+        return None if value is None else _base64.b64encode(value).decode("ascii")
+
+    components = []
+    for evidence in sorted(evidences, key=lambda item: item.kind.value):
+        if evidence.kind is not EvidenceKind.TDX:
+            raise RuntimeError("evidence retention is limited to CPU-TDX components at launch")
+        if evidence.composite_jwt is not None:
+            raise RuntimeError("refusing to retain token-shaped evidence material (composite JWT)")
+        binding = (
+            evidence.channel_binding.canonical_bytes()
+            if evidence.channel_binding is not None
+            else None
+        )
+        components.append(
+            {
+                "kind": evidence.kind.value,
+                "miner_hotkey": evidence.miner_hotkey,
+                "report_data_version": evidence.report_data_version,
+                "quote_base64": _b64(evidence.quote),
+                "nonce_base64": _b64(evidence.nonce),
+                "channel_binding_base64": _b64(binding),
+                "ssh_host_key_base64": _b64(evidence.ssh_host_key),
+                "cert_chain_base64": [_b64(item) for item in evidence.cert_chain],
+            }
+        )
+    return json.dumps(
+        {
+            "schema": RETAINED_EVIDENCE_SCHEMA,
+            "evidence_digest": evidence_digest,
+            "components": components,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _evidence_digest(evidence: Evidence) -> str:

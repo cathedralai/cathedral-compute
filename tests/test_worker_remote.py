@@ -13,6 +13,7 @@ Covers:
 
 All networking is loopback-only (127.0.0.1, OS-assigned port). No hardware.
 """
+
 from __future__ import annotations
 
 import json
@@ -27,11 +28,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from cathedral.common import (
+    MAX_CPU_EVIDENCE_RESPONSE_BODY,
     ChannelBinding,
     ChannelBindingType,
     Evidence,
     EvidenceKind,
-    MAX_CPU_EVIDENCE_RESPONSE_BODY,
 )
 from cathedral.lanes.sat import (
     MAX_N_VARS,
@@ -45,10 +46,14 @@ from cathedral.remote import (
     MAX_RESPONSE_BODY,
     MAX_SAT_RESPONSE_BODY,
     RemoteError,
+)
+from cathedral.remote import (
     RemoteMiner as _RemoteMiner,
 )
 from cathedral.worker import (
     WorkerServer as _WorkerServer,
+)
+from cathedral.worker import (
     _solve_customer_sat_bounded,
 )
 
@@ -134,6 +139,7 @@ def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
 # Good round trips
 # ---------------------------------------------------------------------------
 
+
 def test_evidence_good_round_trip():
     nonce = os.urandom(32)
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
@@ -205,15 +211,17 @@ def test_default_worker_rejects_valid_hash_noncanonical_instance(monkeypatch):
         evidence_collector=_fake_evidence,
     ) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": item.challenge_id,
-            "assigned_hotkey": HOTKEY,
-            "instance": {
-                "n_vars": item.instance.n_vars,
-                "clauses": item.instance.clauses,
-            },
-            "seed": item.seed,
-        }).encode()
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {
+                    "n_vars": item.instance.n_vars,
+                    "clauses": item.instance.clauses,
+                },
+                "seed": item.seed,
+            }
+        ).encode()
         code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
     assert b"noncanonical" in body
@@ -281,6 +289,7 @@ def test_evidence_with_bearer_good_round_trip():
 # Hotkey / nonce / challenge_id verification
 # ---------------------------------------------------------------------------
 
+
 def test_evidence_wrong_hotkey_in_response_rejected():
     """Worker using wrong-hotkey collector; RemoteMiner must detect mismatch."""
     nonce = os.urandom(32)
@@ -322,13 +331,15 @@ def test_sat_wrong_challenge_id_response_rejected():
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
-            body = json.dumps({
-                "satisfiable": True,
-                "assignment": [1, -2, 3],
-                "work_units": 3.0,
-                "challenge_id": "wrong-id-000",
-                "assigned_hotkey": HOTKEY,
-            }).encode()
+            body = json.dumps(
+                {
+                    "satisfiable": True,
+                    "assignment": [1, -2, 3],
+                    "work_units": 3.0,
+                    "challenge_id": "wrong-id-000",
+                    "assigned_hotkey": HOTKEY,
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -352,12 +363,14 @@ def test_sat_wrong_challenge_id_request_rejected():
     item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": "badbadbadbad",  # wrong
-            "assigned_hotkey": HOTKEY,
-            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
-            "seed": item.seed,
-        }).encode()
+        payload = json.dumps(
+            {
+                "challenge_id": "badbadbadbad",  # wrong
+                "assigned_hotkey": HOTKEY,
+                "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+                "seed": item.seed,
+            }
+        ).encode()
         code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
     assert b"challenge_id" in body
@@ -366,6 +379,7 @@ def test_sat_wrong_challenge_id_request_rejected():
 # ---------------------------------------------------------------------------
 # Malformed / unknown / missing keys
 # ---------------------------------------------------------------------------
+
 
 def test_evidence_malformed_json_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
@@ -378,11 +392,13 @@ def test_evidence_malformed_json_rejected():
 def test_evidence_unknown_key_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "nonce_hex": os.urandom(32).hex(),
-            "assigned_hotkey": HOTKEY,
-            "extra_field": "surprise",  # unknown
-        }).encode()
+        payload = json.dumps(
+            {
+                "nonce_hex": os.urandom(32).hex(),
+                "assigned_hotkey": HOTKEY,
+                "extra_field": "surprise",  # unknown
+            }
+        ).encode()
         code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 400
     assert b"schema" in body.lower() or b"extra" in body.lower()
@@ -391,8 +407,10 @@ def test_evidence_unknown_key_rejected():
 def test_evidence_missing_key_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({"nonce_hex": os.urandom(32).hex()}).encode()  # missing assigned_hotkey
-        code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
+        payload = json.dumps(
+            {"nonce_hex": os.urandom(32).hex()}
+        ).encode()  # missing assigned_hotkey
+        code, _body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 400
 
 
@@ -400,26 +418,30 @@ def test_sat_work_unknown_key_rejected():
     item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": item.challenge_id,
-            "assigned_hotkey": HOTKEY,
-            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
-            "seed": item.seed,
-            "injected": "evil",  # unknown
-        }).encode()
-        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+                "seed": item.seed,
+                "injected": "evil",  # unknown
+            }
+        ).encode()
+        code, _body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
 
 
 def test_sat_work_missing_key_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": "someid",
-            "assigned_hotkey": HOTKEY,
-            # missing instance and seed
-        }).encode()
-        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+        payload = json.dumps(
+            {
+                "challenge_id": "someid",
+                "assigned_hotkey": HOTKEY,
+                # missing instance and seed
+            }
+        ).encode()
+        code, _body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
 
 
@@ -427,16 +449,18 @@ def test_sat_work_instance_unknown_key_rejected():
     item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": item.challenge_id,
-            "assigned_hotkey": HOTKEY,
-            "instance": {
-                "n_vars": item.instance.n_vars,
-                "clauses": item.instance.clauses,
-                "surprise": True,  # unknown instance key
-            },
-            "seed": item.seed,
-        }).encode()
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {
+                    "n_vars": item.instance.n_vars,
+                    "clauses": item.instance.clauses,
+                    "surprise": True,  # unknown instance key
+                },
+                "seed": item.seed,
+            }
+        ).encode()
         code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
 
@@ -454,12 +478,14 @@ def test_sat_work_instance_unknown_key_rejected():
 def test_sat_work_rejects_invalid_variable_and_literal_bounds(instance):
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "challenge_id": "0" * 64,
-            "assigned_hotkey": HOTKEY,
-            "instance": instance,
-            "seed": 0,
-        }).encode()
+        payload = json.dumps(
+            {
+                "challenge_id": "0" * 64,
+                "assigned_hotkey": HOTKEY,
+                "instance": instance,
+                "seed": 0,
+            }
+        ).encode()
         code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
 
@@ -474,10 +500,12 @@ def test_unknown_path_returns_404():
 def test_evidence_invalid_nonce_hex_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "nonce_hex": "not-hex!",
-            "assigned_hotkey": HOTKEY,
-        }).encode()
+        payload = json.dumps(
+            {
+                "nonce_hex": "not-hex!",
+                "assigned_hotkey": HOTKEY,
+            }
+        ).encode()
         code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 400
     assert b"hex" in body.lower()
@@ -493,9 +521,7 @@ def test_worker_rejects_non_integer_report_data_version(version):
         called = True
         raise AssertionError("invalid version reached collector")
 
-    with WorkerServer(
-        evidence_collector=must_not_collect, channel_binding=binding
-    ) as srv:
+    with WorkerServer(evidence_collector=must_not_collect, channel_binding=binding) as srv:
         _start_server(srv)
         payload = json.dumps(
             {
@@ -515,10 +541,12 @@ def test_worker_rejects_non_integer_report_data_version(version):
 def test_evidence_empty_hotkey_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "nonce_hex": os.urandom(32).hex(),
-            "assigned_hotkey": "",
-        }).encode()
+        payload = json.dumps(
+            {
+                "nonce_hex": os.urandom(32).hex(),
+                "assigned_hotkey": "",
+            }
+        ).encode()
         code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 400
 
@@ -527,16 +555,20 @@ def test_assigned_hotkey_mismatch_rejected_at_both_endpoints():
     item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
-        evidence = json.dumps({
-            "nonce_hex": os.urandom(32).hex(),
-            "assigned_hotkey": OTHER_HOTKEY,
-        }).encode()
-        sat = json.dumps({
-            "challenge_id": item.challenge_id,
-            "assigned_hotkey": OTHER_HOTKEY,
-            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
-            "seed": item.seed,
-        }).encode()
+        evidence = json.dumps(
+            {
+                "nonce_hex": os.urandom(32).hex(),
+                "assigned_hotkey": OTHER_HOTKEY,
+            }
+        ).encode()
+        sat = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": OTHER_HOTKEY,
+                "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+                "seed": item.seed,
+            }
+        ).encode()
         evidence_code, _ = _post_raw(f"{srv.base_url}/v1/evidence", evidence)
         sat_code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", sat)
     assert evidence_code == 403
@@ -574,14 +606,17 @@ def test_worker_rejects_absent_invalid_negative_and_oversized_lengths(headers, e
 # Oversized request / response
 # ---------------------------------------------------------------------------
 
+
 def test_oversized_request_rejected():
     """Body exceeding max_body → 413."""
     with WorkerServer(evidence_collector=_fake_evidence, max_body=64) as srv:
         _start_server(srv)
-        big_payload = json.dumps({
-            "nonce_hex": "aa" * 32,
-            "assigned_hotkey": "A" * 200,  # push it over 64 bytes
-        }).encode()
+        big_payload = json.dumps(
+            {
+                "nonce_hex": "aa" * 32,
+                "assigned_hotkey": "A" * 200,  # push it over 64 bytes
+            }
+        ).encode()
         assert len(big_payload) > 64
         code, body = _post_raw(f"{srv.base_url}/v1/evidence", big_payload)
     assert code == 413
@@ -599,13 +634,15 @@ def test_oversized_response_rejected():
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
             # Return a valid-looking but enormous response
-            big = json.dumps({
-                "kind": "tdx",
-                "quote_hex": "aa" * 70_000,  # ~140KB hex
-                "nonce_hex": "bb" * 32,
-                "assigned_hotkey": HOTKEY,
-                "cert_chain_hex": [],
-            }).encode()
+            big = json.dumps(
+                {
+                    "kind": "tdx",
+                    "quote_hex": "aa" * 70_000,  # ~140KB hex
+                    "nonce_hex": "bb" * 32,
+                    "assigned_hotkey": HOTKEY,
+                    "cert_chain_hex": [],
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(big)))
@@ -690,10 +727,12 @@ def test_worker_caps_generated_response_and_hides_collector_error():
 
     with WorkerServer(evidence_collector=failing_collector) as srv:
         _start_server(srv)
-        payload = json.dumps({
-            "nonce_hex": os.urandom(32).hex(),
-            "assigned_hotkey": HOTKEY,
-        }).encode()
+        payload = json.dumps(
+            {
+                "nonce_hex": os.urandom(32).hex(),
+                "assigned_hotkey": HOTKEY,
+            }
+        ).encode()
         code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 500
     assert secret.encode() not in body
@@ -703,14 +742,15 @@ def test_worker_caps_generated_response_and_hides_collector_error():
 # Busy (semaphore / 503)
 # ---------------------------------------------------------------------------
 
+
 def test_busy_returns_503():
     """When the server is processing one request, a second gets 503."""
     hold = threading.Event()
     unblock = threading.Event()
 
     def blocking_collector(nonce: bytes, hotkey: str) -> Evidence:
-        hold.set()           # signal: request is in flight
-        unblock.wait(5.0)    # hold the semaphore
+        hold.set()  # signal: request is in flight
+        unblock.wait(5.0)  # hold the semaphore
         return _fake_evidence(nonce, hotkey)
 
     with WorkerServer(evidence_collector=blocking_collector, max_concurrent=1) as srv:
@@ -747,6 +787,7 @@ def test_busy_returns_503():
 # Timeout / connection-failure isolation
 # ---------------------------------------------------------------------------
 
+
 def test_timeout_raises_remote_error():
     """RemoteMiner wraps socket timeout as RemoteError; other operations unaffected."""
     # Find a free port then close the socket so nothing is listening.
@@ -777,9 +818,7 @@ def test_read_timeout_is_typed_and_does_not_leak_details():
     server = HTTPServer(("127.0.0.1", 0), _SlowHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        remote = RemoteMiner(
-            f"http://127.0.0.1:{server.server_address[1]}", HOTKEY, timeout=0.02
-        )
+        remote = RemoteMiner(f"http://127.0.0.1:{server.server_address[1]}", HOTKEY, timeout=0.02)
         with pytest.raises(RemoteError) as caught:
             remote.fetch_evidence(os.urandom(32))
         assert str(caught.value) == "worker request timed out"
@@ -854,6 +893,7 @@ def test_one_failure_does_not_affect_next_request():
 # work_units never trusted
 # ---------------------------------------------------------------------------
 
+
 def test_work_units_not_trusted():
     """RemoteMiner discards server work_units and recomputes from the instance."""
     item = _make_sat_item()
@@ -867,13 +907,15 @@ def test_work_units_not_trusted():
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
-            body = json.dumps({
-                "satisfiable": True,
-                "assignment": [1, 2, 3],
-                "work_units": 1e300,  # forged / inflated
-                "challenge_id": item.challenge_id,
-                "assigned_hotkey": HOTKEY,
-            }).encode()
+            body = json.dumps(
+                {
+                    "satisfiable": True,
+                    "assignment": [1, 2, 3],
+                    "work_units": 1e300,  # forged / inflated
+                    "challenge_id": item.challenge_id,
+                    "assigned_hotkey": HOTKEY,
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -896,6 +938,7 @@ def test_work_units_not_trusted():
 # ---------------------------------------------------------------------------
 # Bearer token DoS filter
 # ---------------------------------------------------------------------------
+
 
 def test_bearer_token_missing_returns_401():
     item = _make_sat_item()
@@ -958,6 +1001,7 @@ def test_evidence_challenge_never_sends_or_requires_bearer_token():
 # Response schema violations (extra / missing keys in server response)
 # ---------------------------------------------------------------------------
 
+
 def test_extra_key_in_evidence_response_raises_remote_error():
     """If the server adds an unexpected key, RemoteMiner raises RemoteError."""
 
@@ -968,14 +1012,16 @@ def test_extra_key_in_evidence_response_raises_remote_error():
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(length))
-            body = json.dumps({
-                "kind": "tdx",
-                "quote_hex": "aa" * 4,
-                "nonce_hex": req["nonce_hex"],
-                "assigned_hotkey": req["assigned_hotkey"],
-                "cert_chain_hex": [],
-                "surprise_field": "evil",  # extra
-            }).encode()
+            body = json.dumps(
+                {
+                    "kind": "tdx",
+                    "quote_hex": "aa" * 4,
+                    "nonce_hex": req["nonce_hex"],
+                    "assigned_hotkey": req["assigned_hotkey"],
+                    "cert_chain_hex": [],
+                    "surprise_field": "evil",  # extra
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1005,11 +1051,13 @@ def test_missing_key_in_sat_response_raises_remote_error():
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
-            body = json.dumps({
-                "satisfiable": True,
-                "assignment": [1, 2, 3],
-                # missing: work_units, challenge_id, assigned_hotkey
-            }).encode()
+            body = json.dumps(
+                {
+                    "satisfiable": True,
+                    "assignment": [1, 2, 3],
+                    # missing: work_units, challenge_id, assigned_hotkey
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1037,13 +1085,15 @@ def test_malformed_assignment_response_is_rejected():
 
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
-            body = json.dumps({
-                "satisfiable": True,
-                "assignment": [1, -1, 3],
-                "work_units": 3.0,
-                "challenge_id": item.challenge_id,
-                "assigned_hotkey": HOTKEY,
-            }).encode()
+            body = json.dumps(
+                {
+                    "satisfiable": True,
+                    "assignment": [1, -1, 3],
+                    "work_units": 3.0,
+                    "challenge_id": item.challenge_id,
+                    "assigned_hotkey": HOTKEY,
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1062,6 +1112,7 @@ def test_malformed_assignment_response_is_rejected():
 # ---------------------------------------------------------------------------
 # Compatibility: returned certificate passes SatLane.verify()
 # ---------------------------------------------------------------------------
+
 
 def test_certificate_passes_sat_lane_verify():
     """Certificate from RemoteMiner is accepted by SatLane.verify()."""
@@ -1097,7 +1148,9 @@ def test_certificate_scores_correctly_in_lane():
     assert verified is not None
 
     score = lane.score(HOTKEY, [verified])
-    assert score == float(len(item.instance.clauses))
+    # sat_work_units_v1: a non-canonical (customer-shaped) item earns the
+    # fixed CUSTOMER_SAT_WORK_UNITS, never a clause-count claim.
+    assert score == 20.0
     # Other miner gets zero.
     assert lane.score(OTHER_HOTKEY, [verified]) == 0.0
 
