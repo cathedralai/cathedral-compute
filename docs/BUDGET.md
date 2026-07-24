@@ -77,13 +77,15 @@ Derived cardinality: fixed overhead (index + manifest + registry +
 report + verifier + vector + snapshot) plus `N x (receipt + work item +
 work result + envelope)` must fit the aggregate, giving
 `MAX_MANIFEST_RECEIPTS = 28` verified candidates and
-`MAX_MANIFEST_CANDIDATES = 1024` candidate rows (any outcome; candidate
-rows cost manifest bytes only and 1024 covers the SN39 metagraph with
-margin). The manifest grammar rejects a 29th receipt row or a 29th
-`verified` outcome outright, so an epoch the grammar accepts can never be
-starved by the aggregate cap; the cap only ever stops non-compliant
-input. Raising any number here is a reviewed contract change, never a
-config drift — and never a multi-gigabyte cap.
+`MAX_MANIFEST_CANDIDATES = 4096` candidate rows (any outcome; candidate
+rows cost manifest bytes only). These values are imported from the same
+frozen launch-limit module by the score producer and evidence grammar.
+Epoch completion refuses a 4,097th candidate or 29th positive score, and
+the exact frozen bytes are checked again before `Poster.post`, so an
+accepted producer report cannot later become unexportable. The manifest
+grammar independently rejects a 29th receipt row or `verified` outcome.
+Raising any number here is a reviewed contract change, never a config
+drift — and never a multi-gigabyte cap.
 
 ## Rollback
 

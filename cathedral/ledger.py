@@ -22,6 +22,10 @@ from cathedral.lanes.sat import (
     validate_sat_work_item,
 )
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+from cathedral.launch_limits import (
+    MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_VERIFIED_CANDIDATES,
+)
 from cathedral.lifecycle import (
     LifecycleReason,
     LifecycleSnapshot,
@@ -57,6 +61,43 @@ _GPU_POLICY_MODE_RE = re.compile(
     r"(?:@release=none@registry=none|"
     r"@release=[1-9][0-9]{0,18}@registry=sha256:[0-9a-f]{64})"
 )
+
+
+def _validate_launch_report_cardinality(body: bytes) -> None:
+    """Refuse a confidential report the public verifier cannot reproduce."""
+
+    try:
+        document = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise LedgerError("persisted score report is not valid JSON") from exc
+    if not isinstance(document, dict) or document.get("source") != "cathedral_confidential_tdx":
+        raise LedgerError("persisted score report is not a confidential score report")
+    scores = document.get("scores")
+    if not isinstance(scores, list):
+        raise LedgerError("persisted confidential score report has no scores list")
+    if len(scores) > MAX_LAUNCH_CANDIDATES:
+        raise LedgerError(
+            "confidential score report exceeds the shared launch candidate limit "
+            f"({len(scores)} > {MAX_LAUNCH_CANDIDATES})"
+        )
+    verified_count = 0
+    for row in scores:
+        if not isinstance(row, dict):
+            raise LedgerError("persisted confidential score report has an invalid score row")
+        value = row.get("score")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise LedgerError("persisted confidential score report has an invalid score")
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0 or number > 1.0:
+            raise LedgerError("persisted confidential score report has an invalid score")
+        if number > 0.0:
+            verified_count += 1
+    if verified_count > MAX_LAUNCH_VERIFIED_CANDIDATES:
+        raise LedgerError(
+            "confidential score report exceeds the shared launch verified-candidate "
+            f"limit ({verified_count} > {MAX_LAUNCH_VERIFIED_CANDIDATES}); "
+            "refusing publication before network I/O"
+        )
 
 
 def _epochs_table_sql(table_name: str) -> str:
@@ -2005,6 +2046,7 @@ class Ledger:
             if audience is not None:
                 report["network"], report["netuid"] = audience
             body = _canonical_json(report)
+            _validate_launch_report_cardinality(body)
             digest = hashlib.sha256(body).hexdigest()
             completion_time = datetime.now(UTC)
             if (
@@ -2098,6 +2140,11 @@ class Ledger:
             digest = hashlib.sha256(body).hexdigest()
             if digest != str(row["report_digest"]):
                 raise LedgerError("persisted report bytes do not match their frozen digest")
+            # Recheck the exact frozen bytes immediately before the network
+            # call. This protects completed epochs created by an older binary
+            # from publishing a report the current evidence grammar cannot
+            # export or independently verify.
+            _validate_launch_report_cardinality(body)
         acknowledgement = poster.post(body)
         if acknowledgement.get("status") != "accepted":
             raise LedgerError("publication acknowledgement status must be 'accepted'")

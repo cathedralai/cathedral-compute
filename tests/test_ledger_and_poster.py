@@ -3,19 +3,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import socket
 import sqlite3
 import threading
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Self
 from unittest.mock import patch
 
 import pytest
 
 from cathedral.ledger import _EPOCHS_MIGRATION_TEMP_PREFIX, Ledger, LedgerError
 from cathedral.poster import Poster, PosterError
-
 
 GPU_AUTHORITY = (
     "gpu-profile:tdx-h100-v1@profile=sha256:" + "a" * 64 + "@release=7@registry=sha256:" + "b" * 64
@@ -1105,7 +1104,7 @@ class FakeResponse:
             raise value
         return value
 
-    def __enter__(self) -> FakeResponse:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -1189,10 +1188,7 @@ class TestPoster:
 
     def test_retry_posts_same_bytes_without_mutation(self) -> None:
         poster = make_poster()
-        body = (
-            b'{"network":"finney","netuid":39,'
-            b'"scores":[{"miner_hotkey":"hk","score":1.0}]}'
-        )
+        body = b'{"network":"finney","netuid":39,"scores":[{"miner_hotkey":"hk","score":1.0}]}'
         seen: list[bytes] = []
 
         def open_request(request, *, timeout):
@@ -1219,14 +1215,12 @@ class TestPoster:
     def test_connect_and_read_timeout_fail_closed(self) -> None:
         poster = make_poster(connect_timeout=1, read_timeout=2, total_timeout=3)
         poster._opener.open = lambda *args, **kwargs: (_ for _ in ()).throw(
-            urllib.error.URLError(socket.timeout("connect timed out"))
+            urllib.error.URLError(TimeoutError("connect timed out"))
         )
         with pytest.raises(PosterError, match="timed out"):
             poster.post(VALID_REPORT)
 
-        poster._opener.open = lambda *args, **kwargs: FakeResponse(
-            [socket.timeout("read timed out")]
-        )
+        poster._opener.open = lambda *args, **kwargs: FakeResponse([TimeoutError("read timed out")])
         with pytest.raises(PosterError, match="timed out"):
             poster.post(VALID_REPORT)
 
@@ -1234,9 +1228,11 @@ class TestPoster:
         poster = make_poster(total_timeout=1)
         response = FakeResponse([b"{}", b""])
         poster._opener.open = lambda *args, **kwargs: response
-        with patch("cathedral.poster.time.monotonic", side_effect=[10.0, 10.1, 11.1]):
-            with pytest.raises(PosterError, match="total request deadline"):
-                poster.post(VALID_REPORT)
+        with (
+            patch("cathedral.poster.time.monotonic", side_effect=[10.0, 10.1, 11.1]),
+            pytest.raises(PosterError, match="total request deadline"),
+        ):
+            poster.post(VALID_REPORT)
 
     def test_bounded_response_and_json_object_required(self) -> None:
         poster = make_poster(response_cap_bytes=4)
@@ -1319,6 +1315,61 @@ def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
     assert ledger.post_and_mark_published(epoch_id, poster) == {"status": "accepted"}
     assert seen == [body]
     assert ledger.get_epoch(epoch_id)["status"] == "published"
+
+
+def test_complete_epoch_refuses_more_verified_miners_than_evidence_can_export() -> None:
+    from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
+
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    hotkeys = {f"verified-miner-{index}" for index in range(MAX_LAUNCH_VERIFIED_CANDIDATES + 1)}
+    for index, hotkey in enumerate(sorted(hotkeys)):
+        verified_work(ledger, epoch_id, f"challenge-{index}", hotkey, 1)
+        attest(ledger, epoch_id, hotkey)
+
+    with pytest.raises(LedgerError, match="shared launch verified-candidate limit"):
+        ledger.complete_epoch(
+            epoch_id,
+            hotkeys,
+            score_network="finney",
+            score_netuid=39,
+        )
+    assert ledger.get_epoch(epoch_id)["status"] == "running"
+
+
+def test_legacy_completed_over_cap_is_refused_before_publication_network() -> None:
+    from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
+
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(
+        epoch_id,
+        set(),
+        score_network="finney",
+        score_netuid=39,
+    )
+    document = json.loads(ledger.report_bytes(epoch_id))
+    document["scores"] = [
+        {"miner_hotkey": f"legacy-miner-{index}", "score": 1.0}
+        for index in range(MAX_LAUNCH_VERIFIED_CANDIDATES + 1)
+    ]
+    body = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ledger._connection.execute(
+        "UPDATE epochs SET report_body=?, report_digest=? WHERE epoch_id=?",
+        (body, hashlib.sha256(body).hexdigest(), epoch_id),
+    )
+    called = False
+
+    class NeverPoster:
+        def post(self, _report_body: bytes) -> dict:
+            nonlocal called
+            called = True
+            raise AssertionError("network must not be called")
+
+    with pytest.raises(LedgerError, match="shared launch verified-candidate limit"):
+        ledger.post_and_mark_published(epoch_id, NeverPoster())
+    assert called is False
+    assert ledger.get_epoch(epoch_id)["status"] == "complete"
 
 
 def test_retry_with_wrong_audience_never_opens_network_or_marks_published() -> None:

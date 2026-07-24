@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -698,6 +699,10 @@ _VALIDATED_SUPPLY_POLICY_FIELDS = frozenset(
     }
 )
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# The live subnet validator uses 1e-12 for row composition and frozen policy
+# constants. Keep looser 1e-9 only for aggregate mass/share comparisons where
+# repeated floating-point normalization is part of the wire path.
+_FIXED_POLICY_ABS_TOL = 1e-12
 
 # The validated_supply_v1 burn contract (docs/BUDGET.md): a FIXED 10% burn to
 # the configured burn destination. The floor is part of the versioned
@@ -776,9 +781,8 @@ def compare_with_vector(
     verified epoch — ``latest_epoch`` equal to the evidence source_epoch and
     ``latest_complete`` true, backed by the publisher's one-report-per-epoch
     ingest immutability. ``wire_report_sha256`` (the evidence manifest's
-    digest of the ingested wire report) is REQUIRED; when the signed block
-    also carries ``latest_body_sha256`` (the raw ingest body digest — see
-    docs/PROVENANCE.md for the subnet pin-advance) it must equal it. Same
+    digest of the ingested wire report) and the signed block's
+    ``latest_body_sha256`` are BOTH REQUIRED and must match exactly. Same
     proportions NEVER prove the same epoch on their own.
     """
     if result.mechanism_id != "validated_supply_v1" or result.mechanism_revision != 1:
@@ -823,7 +827,12 @@ def compare_with_vector(
         weight = components["weight"]
         base = components["base_component"]
         external = components["external_component"]
-        if not math.isclose(weight, base + external, rel_tol=0.0, abs_tol=abs_tol):
+        if not math.isclose(
+            weight,
+            base + external,
+            rel_tol=0.0,
+            abs_tol=_FIXED_POLICY_ABS_TOL,
+        ):
             return False, [
                 (
                     f"signed vector row for {hotkey!r} does not compose: "
@@ -878,7 +887,10 @@ def compare_with_vector(
     if isinstance(percentage, bool) or not isinstance(percentage, (int, float)):
         return False, ["signed vector forced_burn_percentage is not numeric"]
     if not math.isclose(
-        float(percentage), VALIDATED_SUPPLY_V1_BURN_PERCENTAGE, rel_tol=0.0, abs_tol=abs_tol
+        float(percentage),
+        VALIDATED_SUPPLY_V1_BURN_PERCENTAGE,
+        rel_tol=0.0,
+        abs_tol=_FIXED_POLICY_ABS_TOL,
     ):
         return False, [
             (
@@ -920,12 +932,23 @@ def compare_with_vector(
         tdx_allocation is None
         or gpu_allocation is None
         or not math.isclose(
-            tdx_allocation, VALIDATED_SUPPLY_V1_TDX_ALLOCATION, rel_tol=0.0, abs_tol=abs_tol
+            tdx_allocation,
+            VALIDATED_SUPPLY_V1_TDX_ALLOCATION,
+            rel_tol=0.0,
+            abs_tol=_FIXED_POLICY_ABS_TOL,
         )
         or not math.isclose(
-            gpu_allocation, VALIDATED_SUPPLY_V1_GPU_ALLOCATION, rel_tol=0.0, abs_tol=abs_tol
+            gpu_allocation,
+            VALIDATED_SUPPLY_V1_GPU_ALLOCATION,
+            rel_tol=0.0,
+            abs_tol=_FIXED_POLICY_ABS_TOL,
         )
-        or not math.isclose(tdx_allocation + gpu_allocation, 1.0, rel_tol=0.0, abs_tol=abs_tol)
+        or not math.isclose(
+            tdx_allocation + gpu_allocation,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=_FIXED_POLICY_ABS_TOL,
+        )
     ):
         return False, [
             (
@@ -1029,17 +1052,23 @@ def compare_with_vector(
                 "the verified epoch's ingest"
             )
         ]
-    body_digest_raw = external_status.get("latest_body_sha256")
-    if body_digest_raw is not None:
-        body_digest = _normalized_sha256_hex(body_digest_raw)
-        if body_digest is None or body_digest != manifest_wire_digest:
-            return False, [
-                (
-                    "signed vector external_scores.latest_body_sha256 does not "
-                    "match the evidence manifest's wire_report_sha256; the "
-                    "vector was built from a DIFFERENT ingested report body"
-                )
-            ]
+    body_digest = _normalized_sha256_hex(external_status.get("latest_body_sha256"))
+    if body_digest is None:
+        return False, [
+            (
+                "signed vector external_scores.latest_body_sha256 is missing "
+                "or malformed; exact authenticated report-body binding is "
+                "required"
+            )
+        ]
+    if not hmac.compare_digest(body_digest, manifest_wire_digest):
+        return False, [
+            (
+                "signed vector external_scores.latest_body_sha256 does not "
+                "match the evidence manifest's wire_report_sha256; the "
+                "vector was built from a DIFFERENT ingested report body"
+            )
+        ]
     if metadata.get("score_source") != CONFIDENTIAL_SCORE_SOURCE:
         return False, [f"signed vector score_source is not {CONFIDENTIAL_SCORE_SOURCE}"]
 
@@ -1148,18 +1177,19 @@ def replay_positive_miners(
     ``candidate_outcomes`` (the manifest's exhaustive per-candidate outcome
     map, hotkey -> verified|rejected|retired) is REQUIRED and gates the
     epoch-level claim: FULL asserts the WHOLE weight decision was
-    independently proven, and a ``rejected`` outcome is a Cathedral-signed
-    assertion with no independently replayable rejection evidence in the
-    launch artifact model. Positive replays still run and are individually
-    proven, but ANY active (non-retired) rejected candidate keeps the epoch
-    at receipts_only (NOT PROVEN) — a compromised Cathedral rejecting a
-    real miner must never be laundered into a FULL vector that inflates
-    everyone else. Malformed or inconsistent outcome evidence (unknown
-    outcome values, coverage drift against the anchored snapshot, a
-    ``verified`` outcome without a verified receipt or vice versa) is a
-    hard ProvenanceError, never a downgrade. A retired-only or otherwise
-    zero-replay epoch also stays receipts_only, with the pinned verifier
-    bytes still authenticated so fake pinned bytes surface here too.
+    independently proven. Every non-verified outcome is only a
+    Cathedral-signed assertion in the launch artifact model, including a
+    ``retired`` label for a hotkey that the independent anchored candidate
+    oracle still contains. Positive replays still run and are individually
+    proven, but ANY non-verified anchored candidate keeps the epoch at
+    receipts_only (NOT PROVEN). A departed hotkey is absent from the
+    independent candidate universe; relabelling it never proves absence.
+    Malformed or inconsistent outcome evidence (unknown outcome values,
+    coverage drift against the anchored snapshot, a ``verified`` outcome
+    without a verified receipt or vice versa) is a hard ProvenanceError,
+    never a downgrade. A zero-replay epoch also stays receipts_only, with
+    the pinned verifier bytes still authenticated so fake pinned bytes
+    surface here too.
     """
     from dataclasses import replace as dataclass_replace
 
@@ -1364,8 +1394,8 @@ def replay_positive_miners(
         upgraded.append(dataclass_replace(miner, raw_verified=True))
 
     result.miners = upgraded
-    rejected_candidates = sorted(
-        hotkey for hotkey, outcome in outcomes.items() if outcome == "rejected"
+    non_verified_candidates = sorted(
+        hotkey for hotkey, outcome in outcomes.items() if outcome != "verified"
     )
     if replayed_count == 0:
         # Nothing raw was replayed (all-rejected, retired-only, or empty).
@@ -1382,21 +1412,24 @@ def replay_positive_miners(
             )
         except ReplayError as exc:
             raise ProvenanceError(f"pinned verifier bytes failed authentication: {exc}") from exc
-    if rejected_candidates:
-        # A rejection is a Cathedral-signed assertion; the launch artifact
-        # model publishes no candidate-specific RAW rejection evidence an
-        # independent verifier could replay. Whatever positives replayed
-        # stay individually proven, but the EPOCH-level FULL claim is not:
-        # the result remains receipts_only (NOT PROVEN) — fail closed; a
-        # signed rejection alone never mints FULL.
-        shown = rejected_candidates[:8]
-        suffix = "" if len(rejected_candidates) <= 8 else f" (+{len(rejected_candidates) - 8} more)"
+    if non_verified_candidates:
+        # A rejected/retired label for an independently anchored candidate is
+        # a Cathedral-signed assertion. The launch artifact model publishes
+        # no candidate-specific raw negative evidence an independent verifier
+        # could replay. Whatever positives replayed stay individually proven,
+        # but the epoch-level FULL claim is not.
+        shown = non_verified_candidates[:8]
+        suffix = (
+            ""
+            if len(non_verified_candidates) <= 8
+            else f" (+{len(non_verified_candidates) - 8} more)"
+        )
         result.assurance_level = ASSURANCE_RECEIPTS_ONLY
         result.not_proven_reasons = (
             (
-                f"rejection of active candidate(s) {shown}{suffix} is asserted "
-                "by Cathedral's signed chain but not independently replayable "
-                "in the launch artifact model"
+                f"non-verified anchored candidate(s) {shown}{suffix} are "
+                "asserted by Cathedral's signed chain but not independently "
+                "replayable in the launch artifact model"
             ),
         )
         return result
@@ -1404,8 +1437,8 @@ def replay_positive_miners(
         result.assurance_level = ASSURANCE_RECEIPTS_ONLY
         result.not_proven_reasons = (
             (
-                "no positive raw replays: the epoch's active candidate set is "
-                "empty or retired-only, so nothing raw could be proven"
+                "no positive raw replays: the epoch's independently anchored "
+                "candidate set contains no replayable verified outcome"
             ),
         )
         return result

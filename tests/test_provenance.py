@@ -409,6 +409,7 @@ def _launch_vector(rows, *, source_epoch: int = 11, positive: bool | None = None
                 "latest_complete": True,
                 "latest_fresh": True,
                 "latest_report_sha256": "11" * 32,
+                "latest_body_sha256": WIRE_INGEST_DIGEST,
             },
         },
         "weights": [dict(row) for row in rows],
@@ -580,15 +581,15 @@ def test_zero_replays_never_mint_full_even_when_all_rejected(tmp_path):
     assert outcome.assurance_level == "receipts_only"
     assert any("not independently replayable" in reason for reason in outcome.not_proven_reasons)
 
-    # A retired-only epoch has nothing active to prove either: still
-    # receipts_only, never FULL, with the reason surfaced.
+    # A retired label cannot prove that an independently anchored candidate
+    # was absent. It remains a non-verified outcome and never mints FULL.
     with mock.patch("cathedral.replay.authenticate_verifier_bytes"):
         retired = replay_positive_miners(
             _verify(report, {}),
             **{**kwargs, "candidate_outcomes": {"zero-hotkey": "retired"}},
         )
     assert retired.assurance_level == "receipts_only"
-    assert any("no positive raw replays" in reason for reason in retired.not_proven_reasons)
+    assert any("zero-hotkey" in reason for reason in retired.not_proven_reasons)
 
 
 def test_full_requires_the_independent_candidate_oracle(tmp_path):
@@ -939,6 +940,29 @@ def test_vector_requires_the_signed_validated_supply_block():
     assert not agree and "does not match the burn_snapshot" in notes[0]
 
 
+def test_fixed_policy_tolerance_matches_the_live_subnet_validator():
+    """Values accepted by the old 1e-9 comparator but rejected by the live
+    validator's 1e-12 fixed-policy checks must fail here too."""
+    result = _synthetic_result({"alpha": 1.0})
+
+    row_drift = _launch_vector([_launch_row("alpha", 1.0)])
+    row_drift["weights"][0]["external_component"] = 0.9999999995
+    agree, notes = _compare(result, row_drift)
+    assert not agree and "does not compose" in notes[0]
+
+    burn_drift = _launch_vector([_launch_row("alpha", 1.0)])
+    burn_drift["burn_snapshot"]["forced_burn_percentage"] = 10.0000000005
+    agree, notes = _compare(result, burn_drift)
+    assert not agree and "fixed validated_supply_v1 floor" in notes[0]
+
+    allocation_drift = _launch_vector([_launch_row("alpha", 1.0)])
+    policy = allocation_drift["policy_metadata"]["validated_supply"]
+    policy["intel_tdx_allocation"] = 0.9000000005
+    policy["verified_gpu_allocation"] = 0.0999999995
+    agree, notes = _compare(result, allocation_drift)
+    assert not agree and "0.90 Intel TDX + 0.10 Verified GPU" in notes[0]
+
+
 def test_vector_requires_consistent_confidential_primary_mass():
     result = _synthetic_result({"alpha": 1.0})
     rows = [_launch_row("alpha", 1.0)]
@@ -1040,15 +1064,18 @@ def test_vector_binding_requires_the_manifest_ingest_digest():
     assert agree and notes == []
 
 
-def test_vector_body_digest_binding_is_enforced_when_present():
-    """The documented subnet pin-advance: when the signed block echoes the
-    raw ingest body digest, it MUST equal the manifest's wire digest."""
+def test_vector_body_digest_binding_is_mandatory_and_exact():
+    """The signed vector must commit to the exact authenticated ingest body."""
     result = _synthetic_result({"alpha": 1.0})
 
     bound = _launch_vector([_launch_row("alpha", 1.0)])
-    bound["policy_metadata"]["external_scores"]["latest_body_sha256"] = WIRE_INGEST_DIGEST
     agree, notes = _compare(result, bound)
     assert agree and notes == []
+
+    absent = _launch_vector([_launch_row("alpha", 1.0)])
+    absent["policy_metadata"]["external_scores"].pop("latest_body_sha256")
+    agree, notes = _compare(result, absent)
+    assert not agree and "latest_body_sha256 is missing" in notes[0]
 
     swapped = _launch_vector([_launch_row("alpha", 1.0)])
     swapped["policy_metadata"]["external_scores"]["latest_body_sha256"] = "ab" * 32
@@ -1199,9 +1226,8 @@ def test_mixed_positive_and_rejected_epoch_never_mints_full():
     assert any("not independently replayable" in r for r in outcome.not_proven_reasons)
 
 
-def test_retired_candidates_do_not_block_full():
-    """A retired candidate is out of the active set: positive-only among
-    active candidates still reaches FULL."""
+def test_retired_anchored_candidate_blocks_full():
+    """A retired label cannot erase an independently anchored candidate."""
     from unittest import mock
 
     from cathedral.provenance import replay_positive_miners
@@ -1210,7 +1236,8 @@ def test_retired_candidates_do_not_block_full():
     kwargs = _replay_kwargs(result, {"alpha-hotkey": "verified", "retired-hotkey": "retired"})
     with mock.patch("cathedral.replay.replay_evidence"):
         outcome = replay_positive_miners(result, **kwargs)
-    assert outcome.assurance_level == "full"
+    assert outcome.assurance_level == "receipts_only"
+    assert any("retired-hotkey" in reason for reason in outcome.not_proven_reasons)
 
 
 def test_malformed_or_inconsistent_outcomes_hard_fail():

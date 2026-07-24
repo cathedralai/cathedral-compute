@@ -76,8 +76,8 @@ pinned here yet (`docs/LAUNCH_CANDIDATE.md`, NOT PROVEN item 5).
 
 | Outcome | Meaning | Submission basis? |
 |---|---|---|
-| `PASS` + `assurance=full` | Every check above held, EVERY active candidate's outcome independently proven (all positives raw-replayed, no unproven rejection), oracle equality proven | Yes (authority mode) |
-| `NOT_PROVEN` (`receipts_only`) | Signed chain internally consistent; the epoch was not FULLY replayed: missing controlled package, missing oracle, a zero-positive epoch, or ANY active candidate carrying a `rejected` outcome — a rejection is a Cathedral-signed assertion and the artifact model publishes no independently replayable rejection evidence, so a mixed positive/rejected epoch is NOT PROVEN even when every positive replays | Never |
+| `PASS` + `assurance=full` | Every check above held, EVERY independently anchored candidate has a verified outcome and raw replay, oracle equality proven | Yes (authority mode) |
+| `NOT_PROVEN` (`receipts_only`) | Signed chain internally consistent; the epoch was not FULLY replayed: missing controlled package, missing oracle, a zero-positive epoch, or ANY independently anchored candidate carrying a non-verified outcome (`rejected` or `retired`) — those labels are Cathedral-signed assertions and the launch artifact model publishes no independently replayable negative evidence. A departed hotkey is absent from the independent anchored candidate universe; relabelling it does not prove absence. | Never |
 | `FAIL` | A signature, binding, bound, freshness, equivocation, replay, or malformed/inconsistent-evidence check failed (including outcome/receipt inconsistency and reservation conflicts) | Never — fail closed |
 
 Exit code 0 requires `PASS` at `assurance=full` (or the explicit
@@ -104,20 +104,12 @@ TDX, 0.10 Verified GPU, GPU not admitted, matching burn hotkey), the
 `confidential_primary` mass assertions, no burn-hotkey reuse as a miner,
 and the signed `external_scores` binding: `latest_epoch` equal to the
 verified `source_epoch` with `latest_complete=true`, backed by the
-publisher's one-report-per-epoch ingest immutability, checked against the
-manifest's `wire_report_sha256` presence.
-
-**Residual gap (subnet pin-advance required).** The subnet's signed
-`latest_report_sha256` digests its NORMALIZED ingest row, while the
-evidence manifest's `wire_report_sha256` digests the raw posted body —
-different byte domains, so byte-exact report binding cannot be checked
-today and the epoch binding above is the strongest signed link. The exact
-subnet change: store `sha256(raw ingest body)` at ingest and echo it as
-`external_scores.latest_body_sha256` in the signed vector metadata. The
-comparator ALREADY enforces equality with `wire_report_sha256` whenever
-that field is present, so the subnet change lands without a confidential
-release. Until then, same-epoch report substitution inside the publisher
-is NOT PROVEN by this comparison.
+publisher's one-report-per-epoch ingest immutability. Exact report identity
+is mandatory: the manifest's `wire_report_sha256` and the signed vector's
+`external_scores.latest_body_sha256` must both be canonical SHA-256 values
+and match exactly. `latest_report_sha256` remains the normalized semantic
+epoch identity; it is intentionally distinct from the raw authenticated
+body identity. Absence, malformation, or mismatch fails comparison.
 
 ## Logs
 

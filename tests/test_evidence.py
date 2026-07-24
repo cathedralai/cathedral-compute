@@ -1783,7 +1783,12 @@ VECTOR_SEED = bytes(range(128, 160))
 WIRE_BURN_HOTKEY = "burn-destination-hotkey"
 
 
-def _signed_wire_vector(rows: list[dict], *, source_epoch: int = 11) -> bytes:
+def _signed_wire_vector(
+    rows: list[dict],
+    *,
+    body_sha256: str,
+    source_epoch: int = 11,
+) -> bytes:
     """A publisher wire vector signed exactly as the thin validator (and
     _verify_wire_vector) expects — ed25519 over sorted compact JSON minus
     ``signature`` — carrying the REAL validated_supply_v1 launch shape:
@@ -1828,6 +1833,7 @@ def _signed_wire_vector(rows: list[dict], *, source_epoch: int = 11) -> bytes:
                 "latest_complete": True,
                 "latest_fresh": True,
                 "latest_report_sha256": "11" * 32,
+                "latest_body_sha256": body_sha256,
             },
         },
         "weights": [dict(row) for row in rows],
@@ -1858,6 +1864,10 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
     import cathedral.cli as cli_module
 
     evidence_dir, _summary = exported_evidence
+    store = EvidenceStore(evidence_dir)
+    index = json.loads((evidence_dir / "index.json").read_bytes())
+    manifest = parse_manifest(store.get_blob(index["latest"]["manifest"]))
+    body_sha256 = manifest["wire_report_sha256"]
     public_hex = (
         Ed25519PrivateKey.from_private_bytes(VECTOR_SEED)
         .public_key()
@@ -1867,7 +1877,12 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
     state_path = tmp_path / "verifier-state.json"
     audit_path = tmp_path / "audit-vector.json"
 
-    served = {"payload": _signed_wire_vector([_vector_row("unverified-hotkey", 1.0)])}
+    served = {
+        "payload": _signed_wire_vector(
+            [_vector_row("unverified-hotkey", 1.0)],
+            body_sha256=body_sha256,
+        )
+    }
     real_fetch = cli_module._bounded_https_fetch
 
     def fake_fetch(url: str, **kwargs):
@@ -1905,7 +1920,10 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
 
     # Control: the agreeing vector on the same chain is classified
     # NOT_PROVEN (receipts-only) and reserves fences exactly as before.
-    served["payload"] = _signed_wire_vector([_vector_row("public-hotkey", 1.0)])
+    served["payload"] = _signed_wire_vector(
+        [_vector_row("public-hotkey", 1.0)],
+        body_sha256=body_sha256,
+    )
     code = cli_main(arguments)
     output = capsys.readouterr().out
     events = [json.loads(line) for line in output.strip().splitlines()]

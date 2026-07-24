@@ -18,6 +18,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cathedral.launch_limits import MAX_LAUNCH_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptError, parse_receipt_json
 
@@ -27,7 +28,7 @@ REPORT_ID_DOMAIN = b"cathedral-score-class-id-v1\x00"
 CANDIDATE_SNAPSHOT_SCHEMA = "cathedral_candidate_snapshot_v1"
 _BLOCK_HASH_RE = re.compile(r"^(0x)?[0-9a-f]{64}$")
 MAX_REPORT_BYTES = 1_048_576
-MAX_REPORT_ENTRIES = 4096
+MAX_REPORT_ENTRIES = MAX_LAUNCH_CANDIDATES
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _DIGEST_RE = re.compile(r"(?:sha256|receipt-sha256):[0-9a-f]{64}")

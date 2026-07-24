@@ -121,6 +121,7 @@ def _real_subnet_vector(*, positive: bool = True) -> dict:
                 "latest_complete": True,
                 "latest_fresh": True,
                 "latest_report_sha256": "c1" * 32,
+                "latest_body_sha256": WIRE_INGEST_DIGEST,
                 "active_score_count": len(weights),
             },
         },
@@ -281,8 +282,8 @@ def test_burn_hotkey_reused_as_miner_is_rejected():
 
 def test_epoch_binding_rejects_historical_and_advanced_vectors():
     """Repair 3 at the cross-repo fixture level: identical proportions with
-    a different SIGNED ingest epoch never agree; the exact epoch does, and
-    the future latest_body_sha256 echo is enforced when present."""
+    a different SIGNED ingest epoch never agree; the exact epoch and exact
+    authenticated body digest are mandatory."""
     result = _result(MINERS)
 
     for other_epoch in (SOURCE_EPOCH - 1, SOURCE_EPOCH + 1):
@@ -300,9 +301,13 @@ def test_epoch_binding_rejects_historical_and_advanced_vectors():
     agree, notes = _compare(result, _signed(_real_subnet_vector()), wire_report_sha256=None)
     assert not agree and "no publisher ingest report digest" in notes[0]
 
-    # The documented subnet pin-advance field, once present, must match.
+    missing_body = _real_subnet_vector()
+    missing_body["policy_metadata"]["external_scores"].pop("latest_body_sha256")
+    agree, notes = _compare(result, _signed(missing_body))
+    assert not agree and "latest_body_sha256 is missing" in notes[0]
+
+    # The subnet's signed raw authenticated-body digest must match.
     echoed = _real_subnet_vector()
-    echoed["policy_metadata"]["external_scores"]["latest_body_sha256"] = WIRE_INGEST_DIGEST
     agree, notes = _compare(result, _signed(echoed))
     assert agree and notes == []
 

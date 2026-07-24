@@ -43,7 +43,10 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
    bytes independently authenticate (content digest + implementation
    digest), and even then the upgrade is WITHHELD because the artifact
    model does not publish exhaustive per-candidate raw rejection
-   evidence. Authority mode therefore fails closed on revocation epochs
+   evidence. A `retired` label for a hotkey still present in the
+   independently anchored candidate set is treated the same way; departure
+   is proven only by absence from that independent universe. Authority mode
+   therefore fails closed on revocation epochs
    (the chain retains the last vector; the thin/shadow default carries
    revocation to burn). Making the revoked state FULL requires an
    exhaustive candidate-set artifact with independently replayable

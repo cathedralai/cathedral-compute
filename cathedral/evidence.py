@@ -31,6 +31,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from cathedral.launch_limits import (
+    MAX_LAUNCH_CANDIDATES,
+    MAX_LAUNCH_VERIFIED_CANDIDATES,
+)
 from cathedral.policy_registry import (
     MAX_REGISTRY_BYTES,
     PolicyRegistryError,
@@ -42,9 +46,10 @@ from cathedral.policy_registry import (
 # envelope_digest. v1 never shipped to any public surface; v1 documents are
 # rejected with an explicit versioned error, not a generic shape failure.
 # v3 adds the exhaustive candidate-set binding: every enrolled candidate for
-# the epoch is accounted for as verified (with replayable evidence) or
-# rejected (explicit fail-closed outcome), so omission cannot inflate a
-# remaining miner and an all-rejected epoch is provable.
+# the epoch is accounted for as verified, rejected, or retired, so omission
+# cannot inflate a remaining miner. Only verified outcomes carry replayable
+# positive evidence in the launch model; any non-verified anchored candidate
+# keeps epoch-level FULL assurance NOT_PROVEN.
 MANIFEST_SCHEMA = "cathedral_evidence_manifest_v3"
 LEGACY_MANIFEST_SCHEMA_V2 = "cathedral_evidence_manifest_v2"
 LEGACY_MANIFEST_SCHEMA = "cathedral_evidence_manifest_v1"
@@ -103,15 +108,19 @@ PER_VERIFIED_CANDIDATE_BYTES = (
     + MAX_WORK_RESULT_ARTIFACT_BYTES
     + MAX_CONTROLLED_ENVELOPE_BYTES
 )
-# The supported candidate-set cardinality (any outcome). Candidate rows cost
-# manifest bytes only; 1024 covers the SN39 metagraph with margin and keeps
-# the worst-case manifest inside MAX_MANIFEST_ARTIFACT_BYTES.
-MAX_MANIFEST_CANDIDATES = 1024
-# The supported VERIFIED cardinality (receipt rows / controlled envelopes),
-# derived from the aggregate budget: 28 at the caps above.
-MAX_MANIFEST_RECEIPTS = (
+# The supported candidate-set cardinality is shared with the score producer.
+# Candidate rows cost manifest bytes only; the 2 MiB manifest cap covers the
+# complete 4,096-hotkey SN39 metagraph contract.
+MAX_MANIFEST_CANDIDATES = MAX_LAUNCH_CANDIDATES
+# The aggregate byte budget derives the maximum supported VERIFIED
+# cardinality. Keep the shared launch constant asserted against the derivation
+# so producer/exporter/verifier drift fails at import rather than publication.
+_DERIVED_MAX_MANIFEST_RECEIPTS = (
     VERIFY_AGGREGATE_BUDGET_BYTES - VERIFY_FIXED_OVERHEAD_BYTES
 ) // PER_VERIFIED_CANDIDATE_BYTES
+if _DERIVED_MAX_MANIFEST_RECEIPTS != MAX_LAUNCH_VERIFIED_CANDIDATES:
+    raise RuntimeError("launch verified-candidate limit does not match the evidence byte budget")
+MAX_MANIFEST_RECEIPTS = MAX_LAUNCH_VERIFIED_CANDIDATES
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DISCLOSURES = frozenset({"public", "controlled"})
 
