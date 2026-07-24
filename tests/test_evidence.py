@@ -1811,6 +1811,49 @@ def test_maximum_launch_manifest_fits_the_public_fetch_ceiling():
     assert len(parse_manifest(manifest)["candidate_set"]["candidates"]) == MAX_MANIFEST_CANDIDATES
 
 
+def test_manifest_builder_rejects_escape_amplification_before_publication():
+    """A semantic row bound must not let canonical JSON exceed the byte cap."""
+    from cathedral.evidence import MAX_MANIFEST_CANDIDATES
+
+    with pytest.raises(EvidenceError, match="candidate row is invalid"):
+        build_manifest(
+            network=NETWORK,
+            netuid=NETUID,
+            source_epoch=11,
+            epoch_id=1,
+            generated_at=None,
+            mechanism_id="validated_supply_v1",
+            mechanism_revision=1,
+            source_revision="abc1234",
+            registry_release=1,
+            registry_digest=SNAPSHOT.digest,
+            registry_blob="sha256:" + "1" * 64,
+            verifier_digest=VERIFIER_DIGEST,
+            verifier_binary_blob=None,
+            report_id="sha256:" + "2" * 64,
+            report_blob="sha256:" + "3" * 64,
+            report_signing_key_id="score-test-1",
+            receipts=[],
+            attestations=[],
+            candidate_set={
+                "source": "sn39_metagraph",
+                "network": NETWORK,
+                "netuid": NETUID,
+                "block": 100,
+                "block_hash": "ab" * 32,
+                "candidates": [
+                    {
+                        "hotkey": f"5{index:04x}",
+                        "outcome": "rejected",
+                        "reason": "😀" * 200,
+                    }
+                    for index in range(MAX_MANIFEST_CANDIDATES)
+                ],
+            },
+            wire_report_sha256="4" * 64,
+        )
+
+
 def test_cli_verify_artifact_accounting_three_per_receipt_plus_overhead(
     tmp_path: Path, exported_evidence, capsys, monkeypatch
 ):

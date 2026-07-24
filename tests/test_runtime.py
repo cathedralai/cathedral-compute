@@ -1066,18 +1066,9 @@ def test_policy_revocation_publishes_signed_positive_to_explicit_zero_without_ne
     assert zero.scores["miner"] == 0.0
     assert {outcome.status for outcome in zero.outcomes} == {"revoked"}
     assert len(factory.log["nonce:miner"]) == worker_calls
-    assert lifecycle == [
-        {
-            "event_id": lifecycle[0]["event_id"],
-            "evidence_expires_at": lifecycle[0]["evidence_expires_at"],
-            "generation": 1,
-            "hotkey": "miner",
-            "reason": "policy_revoked",
-            "revision": 3,
-            "snapshot_at": lifecycle[0]["snapshot_at"],
-            "state": "revoked",
-        }
-    ]
+    # Zero-score lifecycle rows stay in the durable ledger and the exhaustive
+    # evidence manifest, but are not duplicated into the 1 MiB score wire.
+    assert lifecycle == []
     assert poster.bodies == [
         ledger.report_bytes(positive.epoch_id),
         ledger.report_bytes(zero.epoch_id),

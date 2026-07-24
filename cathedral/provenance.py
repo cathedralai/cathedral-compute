@@ -48,10 +48,10 @@ from cathedral.policy_registry import (
     PolicyRegistryError,
     PolicyRegistrySnapshot,
     canonical_json,
-    parse_registry_json,
     verify_registry,
 )
 from cathedral.receipt import ReceiptError, parse_receipt_json, verify_receipt
+from cathedral.score_class import ScoreClassError, parse_score_report_json
 
 REPORT_SCHEMA = "cathedral_score_class_report_v2"
 RECEIPT_SCHEMA = "cathedral_assurance_receipt_v2"
@@ -281,11 +281,9 @@ def verify_report_structure(
     ``expected_previous_report_id`` exactly (including None for a chain head).
     """
     try:
-        document = parse_registry_json(report_bytes)  # strict parser, reused
-    except PolicyRegistryError as exc:
+        document = parse_score_report_json(report_bytes)
+    except ScoreClassError as exc:
         raise ProvenanceError(f"score report is not strict JSON: {exc}") from exc
-    if canonical_json(document) != report_bytes:
-        raise ProvenanceError("score report bytes are not canonical JSON")
     if frozenset(document) != _REPORT_KEYS:
         raise ProvenanceError("score report has missing or unknown fields")
     if document.get("schema") != REPORT_SCHEMA:

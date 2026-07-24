@@ -475,7 +475,10 @@ def build_manifest(
         "wire_report_sha256": wire_report_sha256,
     }
     validate_manifest(document)
-    return canonical_json(document)
+    encoded = canonical_json(document)
+    if len(encoded) > MAX_MANIFEST_ARTIFACT_BYTES:
+        raise EvidenceError("evidence manifest exceeds its artifact cap")
+    return encoded
 
 
 def validate_manifest(document: Mapping[str, Any]) -> None:
@@ -637,7 +640,9 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
             or not is_launch_hotkey(row["hotkey"])
             or row["outcome"] not in _CANDIDATE_OUTCOMES
             or not isinstance(row["reason"], str)
-            or len(row["reason"]) > 200
+            or not 1 <= len(row["reason"]) <= 200
+            or not row["reason"].isascii()
+            or any(ord(character) < 0x20 or ord(character) > 0x7E for character in row["reason"])
         ):
             raise EvidenceError("evidence manifest candidate row is invalid")
         if row["hotkey"] in seen_candidates:

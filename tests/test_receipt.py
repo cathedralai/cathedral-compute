@@ -1418,6 +1418,7 @@ def test_maximum_launch_epoch_is_publishable_and_score_class_exportable(
         f"5{index:04x}" + "x" * (MAX_LAUNCH_HOTKEY_BYTES - 5)
         for index in range(MAX_LAUNCH_CANDIDATES)
     ]
+    exemplar = None
     for index, hotkey in enumerate(hotkeys[:MAX_LAUNCH_VERIFIED_CANDIDATES]):
         challenge_id = f"{index:064x}"
         _snapshot_value, policy, claims, receipt = _issued_receipt(
@@ -1426,6 +1427,7 @@ def test_maximum_launch_epoch_is_publishable_and_score_class_exportable(
             challenge_id=challenge_id,
             work_units=1.0,
         )
+        exemplar = (policy, claims)
         ledger.issue_challenge(challenge_id, hotkey, epoch_id)
         ledger.resolve_challenge_with_receipt(
             challenge_id,
@@ -1437,6 +1439,23 @@ def test_maximum_launch_epoch_is_publishable_and_score_class_exportable(
             receipt_digest=receipt.receipt_digest,
             issued_at=ISSUED_TEXT,
         )
+        ledger.add_attestation(
+            epoch_id,
+            hotkey,
+            verdict="VERIFIED",
+            tee_type="TDX",
+            workload="CPU",
+            evidence_digest=claims.hardware.evidence_digest,
+            policy_mode="strict",
+        )
+        ledger.add_lifecycle_snapshot(
+            epoch_id,
+            _worker_lifecycle(policy, claims, hotkey),
+            snapshot_at=ISSUED_TEXT,
+        )
+    assert exemplar is not None
+    policy, claims = exemplar
+    for hotkey in hotkeys[MAX_LAUNCH_VERIFIED_CANDIDATES:]:
         ledger.add_attestation(
             epoch_id,
             hotkey,
@@ -1486,6 +1505,25 @@ def test_maximum_launch_epoch_is_publishable_and_score_class_exportable(
 
     assert 1024 * 1024 < len(report) <= MAX_LAUNCH_SCORE_REPORT_BYTES
     assert len(json.loads(report)["entries"]) == MAX_LAUNCH_CANDIDATES
+    assert len(ledger.report_bytes(epoch_id)) <= 1024 * 1024
+    from cathedral.provenance import verify_report_structure
+
+    verified = verify_report_structure(
+        report,
+        registry=registry,
+        expected_network="local",
+        expected_netuid=1,
+        expected_verifier_digest="sha256:" + "d" * 64,
+        report_signing_keys={
+            "score-test-1": (
+                Ed25519PrivateKey.from_private_bytes(RECEIPT_SEED_2)
+                .public_key()
+                .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            )
+        },
+        now=ISSUED,
+    )
+    assert len(verified["entries"]) == MAX_LAUNCH_CANDIDATES
     ledger.close()
 
 

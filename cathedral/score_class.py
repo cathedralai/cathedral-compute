@@ -44,6 +44,47 @@ class ScoreClassError(ValueError):
     """The ledger cannot produce a valid, provenance-complete score report."""
 
 
+def parse_score_report_json(data: bytes) -> dict[str, Any]:
+    """Parse one canonical score report under its own 2 MiB artifact cap.
+
+    Policy registries intentionally remain capped at 1 MiB.  Score reports
+    have a separate 2 MiB launch contract, so reusing the registry parser
+    makes a producer-valid maximal report impossible to verify.
+    """
+
+    if not isinstance(data, bytes) or not data or len(data) > MAX_REPORT_BYTES:
+        raise ScoreClassError("score report is empty or exceeds its artifact cap")
+
+    def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ScoreClassError(f"duplicate score report JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        document = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicates,
+            parse_float=lambda _value: (_ for _ in ()).throw(
+                ScoreClassError("floating-point score report JSON is not canonical")
+            ),
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ScoreClassError("non-finite score report JSON is not canonical")
+            ),
+        )
+    except ScoreClassError:
+        raise
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ScoreClassError("score report is not valid UTF-8 JSON") from exc
+    if not isinstance(document, dict):
+        raise ScoreClassError("score report must be a JSON object")
+    if canonical_json(document) != data:
+        raise ScoreClassError("score report bytes are not canonical JSON")
+    return document
+
+
 def canonical_json(value: Mapping[str, Any]) -> bytes:
     try:
         return json.dumps(

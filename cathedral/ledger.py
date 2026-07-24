@@ -2026,6 +2026,16 @@ class Ledger:
             scores = {
                 hotkey: (units / maximum if maximum > 0 else 0.0) for hotkey, units in gated.items()
             }
+            # The external-score wire already carries an explicit score for
+            # every candidate.  Lifecycle detail is useful only for rows that
+            # can earn in this report; duplicating it for thousands of
+            # zero-score candidates can make an otherwise supported maximal
+            # epoch exceed the subnet's hard 1 MiB intake limit.  The complete
+            # lifecycle ledger remains durable, while the public evidence
+            # manifest accounts for every anchored candidate separately.
+            earning_lifecycle_rows = [
+                row for row in lifecycle_rows if scores.get(str(row["hotkey"]), 0.0) > 0.0
+            ]
             report = {
                 "complete": True,
                 "epoch": epoch["source_epoch"],
@@ -2049,7 +2059,7 @@ class Ledger:
                             "snapshot_at": row["snapshot_at"],
                             "state": row["state"],
                         }
-                        for row in lifecycle_rows
+                        for row in earning_lifecycle_rows
                     ],
                 },
                 "scores": [
