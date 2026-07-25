@@ -1952,10 +1952,9 @@ def _signed_wire_vector(
         "policy_metadata": {
             "score_source": "confidential_primary:cathedral_confidential_tdx",
             "validated_supply": {
-                "contract_version": "v1",
+                "contract_version": "v2",
                 "intel_tdx_allocation": 0.90,
-                "verified_gpu_allocation": 0.10,
-                "verified_gpu_admitted": False,
+                "fixed_burn_allocation": 0.10,
                 "burn_hotkey": WIRE_BURN_HOTKEY,
             },
             "confidential_primary": {

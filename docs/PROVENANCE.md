@@ -99,8 +99,8 @@ external, positive supply summing to 1.0), `burn_snapshot == {burn_uid:
 null, burn_hotkey, forced_burn_percentage: 10.0}` (validators resolve the
 burn HOTKEY against the live metagraph; a pinned historical integer burn
 uid is rejected, never required), the signed
-`policy_metadata.validated_supply` launch block (contract v1, 0.90 Intel
-TDX, 0.10 Verified GPU, GPU not admitted, matching burn hotkey), the
+`policy_metadata.validated_supply` launch block (contract v2, 0.90 Intel
+TDX, fixed 0.10 burn, matching burn hotkey), the
 `confidential_primary` mass assertions, no burn-hotkey reuse as a miner,
 and the signed `external_scores` binding: `latest_epoch` equal to the
 verified `source_epoch` with `latest_complete=true`, backed by the

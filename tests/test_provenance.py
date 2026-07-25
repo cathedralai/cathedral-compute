@@ -385,10 +385,9 @@ def _launch_vector(rows, *, source_epoch: int = 11, positive: bool | None = None
         "policy_metadata": {
             "score_source": "confidential_primary:cathedral_confidential_tdx",
             "validated_supply": {
-                "contract_version": "v1",
+                "contract_version": "v2",
                 "intel_tdx_allocation": 0.90,
-                "verified_gpu_allocation": 0.10,
-                "verified_gpu_admitted": False,
+                "fixed_burn_allocation": 0.10,
                 "burn_hotkey": BURN_HOTKEY,
             },
             "confidential_primary": {
@@ -915,24 +914,19 @@ def test_vector_requires_the_signed_validated_supply_block():
     assert not agree and "fields mismatch" in notes[0]
 
     versioned = _launch_vector(rows)
-    versioned["policy_metadata"]["validated_supply"]["contract_version"] = "v2"
+    versioned["policy_metadata"]["validated_supply"]["contract_version"] = "v1"
     agree, notes = _compare(result, versioned)
     assert not agree and "unsupported" in notes[0]
 
     for field, value in (
         ("intel_tdx_allocation", 0.80),
-        ("verified_gpu_allocation", 0.20),
+        ("fixed_burn_allocation", 0.20),
         ("intel_tdx_allocation", "0.90"),
     ):
         drifted = _launch_vector(rows)
         drifted["policy_metadata"]["validated_supply"][field] = value
         agree, notes = _compare(result, drifted)
-        assert not agree and "0.90 Intel TDX + 0.10 Verified GPU" in notes[0]
-
-    admitted = _launch_vector(rows)
-    admitted["policy_metadata"]["validated_supply"]["verified_gpu_admitted"] = True
-    agree, notes = _compare(result, admitted)
-    assert not agree and "cannot admit the Verified GPU" in notes[0]
+        assert not agree and "0.90 Intel TDX + fixed 0.10 burn" in notes[0]
 
     mismatched = _launch_vector(rows)
     mismatched["policy_metadata"]["validated_supply"]["burn_hotkey"] = "other-destination"
@@ -958,9 +952,9 @@ def test_fixed_policy_tolerance_matches_the_live_subnet_validator():
     allocation_drift = _launch_vector([_launch_row("alpha", 1.0)])
     policy = allocation_drift["policy_metadata"]["validated_supply"]
     policy["intel_tdx_allocation"] = 0.9000000005
-    policy["verified_gpu_allocation"] = 0.0999999995
+    policy["fixed_burn_allocation"] = 0.0999999995
     agree, notes = _compare(result, allocation_drift)
-    assert not agree and "0.90 Intel TDX + 0.10 Verified GPU" in notes[0]
+    assert not agree and "0.90 Intel TDX + fixed 0.10 burn" in notes[0]
 
 
 def test_vector_requires_consistent_confidential_primary_mass():
