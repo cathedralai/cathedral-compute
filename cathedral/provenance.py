@@ -691,8 +691,7 @@ _VALIDATED_SUPPLY_POLICY_FIELDS = frozenset(
     {
         "contract_version",
         "intel_tdx_allocation",
-        "verified_gpu_allocation",
-        "verified_gpu_admitted",
+        "fixed_burn_allocation",
         "burn_hotkey",
     }
 )
@@ -709,8 +708,8 @@ _FIXED_POLICY_ABS_TOL = 1e-12
 VALIDATED_SUPPLY_V1_BURN_FRACTION = 0.10
 VALIDATED_SUPPLY_V1_BURN_PERCENTAGE = 10.0
 VALIDATED_SUPPLY_V1_TDX_ALLOCATION = 0.90
-VALIDATED_SUPPLY_V1_GPU_ALLOCATION = 0.10
-VALIDATED_SUPPLY_CONTRACT_VERSION = "v1"
+VALIDATED_SUPPLY_V1_FIXED_BURN_ALLOCATION = 0.10
+VALIDATED_SUPPLY_CONTRACT_VERSION = "v2"
 CONFIDENTIAL_SOURCE = "cathedral_confidential_tdx"
 CONFIDENTIAL_SCORE_SOURCE = "confidential_primary:cathedral_confidential_tdx"
 
@@ -768,8 +767,8 @@ def compare_with_vector(
         resolve the burn HOTKEY against the live metagraph, and a pinned
         historical integer burn uid is rejected, never required;
       * ``policy_metadata.validated_supply`` is the signed launch-locked
-        90/10 block (contract v1, 0.90 Intel TDX, 0.10 Verified GPU, GPU
-        not admitted, burn_hotkey matching the snapshot) and
+        90/10 block (contract v2, 0.90 Intel TDX, fixed 0.10 burn, with the
+        burn_hotkey matching the snapshot) and
         ``policy_metadata.confidential_primary`` must assert the epoch's
         confidential mass consistently;
       * the burn hotkey must never be reused as a paying miner hotkey.
@@ -921,14 +920,14 @@ def compare_with_vector(
         return False, [
             (
                 "signed vector validated_supply contract_version "
-                f"{supply_policy['contract_version']!r} is unsupported (v1 only)"
+                f"{supply_policy['contract_version']!r} is unsupported (v2 only)"
             )
         ]
     tdx_allocation = _policy_number(supply_policy["intel_tdx_allocation"])
-    gpu_allocation = _policy_number(supply_policy["verified_gpu_allocation"])
+    fixed_burn_allocation = _policy_number(supply_policy["fixed_burn_allocation"])
     if (
         tdx_allocation is None
-        or gpu_allocation is None
+        or fixed_burn_allocation is None
         or not math.isclose(
             tdx_allocation,
             VALIDATED_SUPPLY_V1_TDX_ALLOCATION,
@@ -936,13 +935,13 @@ def compare_with_vector(
             abs_tol=_FIXED_POLICY_ABS_TOL,
         )
         or not math.isclose(
-            gpu_allocation,
-            VALIDATED_SUPPLY_V1_GPU_ALLOCATION,
+            fixed_burn_allocation,
+            VALIDATED_SUPPLY_V1_FIXED_BURN_ALLOCATION,
             rel_tol=0.0,
             abs_tol=_FIXED_POLICY_ABS_TOL,
         )
         or not math.isclose(
-            tdx_allocation + gpu_allocation,
+            tdx_allocation + fixed_burn_allocation,
             1.0,
             rel_tol=0.0,
             abs_tol=_FIXED_POLICY_ABS_TOL,
@@ -951,11 +950,9 @@ def compare_with_vector(
         return False, [
             (
                 "signed vector validated_supply allocations must be exactly "
-                "0.90 Intel TDX + 0.10 Verified GPU"
+                "0.90 Intel TDX + fixed 0.10 burn"
             )
         ]
-    if supply_policy["verified_gpu_admitted"] is not False:
-        return False, ["signed vector validated_supply v1 cannot admit the Verified GPU class"]
     if supply_policy["burn_hotkey"] != burn_hotkey:
         return False, [
             (

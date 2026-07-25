@@ -9,9 +9,9 @@ publisher signs in validated_supply mode (read from the read-only worktree:
   * ``burn_snapshot = {burn_uid: null, burn_hotkey: <nonempty>,
     forced_burn_percentage: 10.0}`` — the validator resolves the burn HOTKEY
     against the current metagraph and rejects pinned historical UIDs;
-  * ``policy_metadata.validated_supply = {contract_version: "v1",
-    intel_tdx_allocation: 0.90, verified_gpu_allocation: 0.10,
-    verified_gpu_admitted: false, burn_hotkey}`` (exact field set);
+  * ``policy_metadata.validated_supply = {contract_version: "v2",
+    intel_tdx_allocation: 0.90, fixed_burn_allocation: 0.10,
+    burn_hotkey}`` (exact field set);
   * ``policy_metadata.confidential_primary`` asserting the epoch's
     confidential mass, and ``policy_metadata.external_scores`` carrying the
     signed ingest binding (``latest_epoch``, ``latest_report_sha256``,
@@ -93,10 +93,9 @@ def _real_subnet_vector(*, positive: bool = True) -> dict:
             "composer": "scaffold.weights",
             "score_source": "confidential_primary:cathedral_confidential_tdx",
             "validated_supply": {
-                "contract_version": "v1",
+                "contract_version": "v2",
                 "intel_tdx_allocation": 0.90,
-                "verified_gpu_allocation": 0.10,
-                "verified_gpu_admitted": False,
+                "fixed_burn_allocation": 0.10,
                 "burn_hotkey": BURN_HOTKEY,
             },
             "confidential_primary": {
@@ -232,7 +231,7 @@ def test_malformed_validated_supply_blocks_are_rejected():
             "fields mismatch",
         ),
         (
-            lambda v: v["policy_metadata"]["validated_supply"].update({"contract_version": "v2"}),
+            lambda v: v["policy_metadata"]["validated_supply"].update({"contract_version": "v1"}),
             "unsupported",
         ),
         (
@@ -240,12 +239,6 @@ def test_malformed_validated_supply_blocks_are_rejected():
                 {"intel_tdx_allocation": 0.85}
             ),
             "0.90 Intel TDX",
-        ),
-        (
-            lambda v: v["policy_metadata"]["validated_supply"].update(
-                {"verified_gpu_admitted": True}
-            ),
-            "cannot admit",
         ),
         (
             lambda v: v["policy_metadata"]["validated_supply"].update(
