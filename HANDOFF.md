@@ -1,5 +1,11 @@
 # Cathedral — Commissioning & Test Handoff
 
+> **Historical commissioning handoff.** This document preserves the original
+> SNP-first build plan and is not current onboarding guidance. New providers
+> must use [`MINING.md`](MINING.md); current TDX operators use
+> [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md). Do not provision hardware from
+> the cost or timing estimates below.
+
 Everything you need to (A) run the hardware-free testable core right now, and
 (B) commission a real Trusted Execution Environment box and build the first
 *real* attestation test on it. Read `docs/DESIGN.md` first for the why; this

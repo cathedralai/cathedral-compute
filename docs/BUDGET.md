@@ -5,9 +5,11 @@ ceilings every component enforces. These values are CONTRACTS: changing
 any of them requires a new reviewed mechanism or an explicit owner
 decision recorded in the decision log — never a config drift.
 
-> **Status honesty.** Enforcement below is implemented and locally
-> tested; live economic behavior on mainnet is NOT PROVEN until the
-> deploy gates in `docs/LAUNCH_CANDIDATE.md` pass.
+> **Status honesty.** Enforcement below is implemented and locally tested, and
+> the 90/10 shape has historical mainnet acceptance evidence. Economic
+> behavior on the final supported release and a clean outside reproduction
+> remain `NOT_PROVEN` until the current gates in
+> [`../BUILD_STATUS.md`](../BUILD_STATUS.md) pass.
 
 ## Burn controls (on-chain emission)
 
