@@ -804,12 +804,24 @@ def compare_with_vector(
     ``latest_body_sha256`` are BOTH REQUIRED and must match exactly. Same
     proportions NEVER prove the same epoch on their own.
     """
-    if result.mechanism_id != "validated_supply_v2" or result.mechanism_revision != 1:
+    # Validate the pair the CALLER asked to verify against the same registry
+    # that dispatch uses, rather than one hardcoded id. A literal here defeats
+    # the point of registering both ids: a validator legitimately pinned to the
+    # older id recomputes correctly and is then rejected at the comparison,
+    # which is the lockstep cutover that additive registration exists to avoid.
+    # Both ids share this contract because what differs between them is
+    # upstream, in how the units being compared were produced.
+    supported_revision = MECHANISM_REVISIONS.get(result.mechanism_id)
+    if supported_revision is None or result.mechanism_revision != supported_revision:
+        supported = ", ".join(
+            f"({name}, revision={revision})"
+            for name, revision in sorted(MECHANISM_REVISIONS.items())
+        )
         return False, [
             (
                 f"unsupported mechanism pair ({result.mechanism_id!r}, revision="
                 f"{result.mechanism_revision!r}): this comparison validates the "
-                "(validated_supply_v2, revision=1) vector contract only"
+                f"{supported} vector contract only"
             )
         ]
     vector_rows = signed_vector.get("weights")
