@@ -126,6 +126,21 @@ def _post_raw(url: str, body: bytes, *, bearer: str | None = TEST_BEARER) -> tup
         return exc.code, exc.read()
 
 
+def _stall_connection(port: int, declared_length: int = 4096) -> socket.socket:
+    """Open a connection whose headers promise a body that never arrives."""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+    conn.sendall(
+        b"POST /v1/evidence HTTP/1.1\r\nHost: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(declared_length).encode("ascii") + b"\r\n\r\n"
+    )
+    return conn
+
+
+def _status_of(response: bytes) -> int:
+    return int(response.split(b"\r\n", 1)[0].split(b" ")[1])
+
+
 def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
     request = b"POST /v1/evidence HTTP/1.0\r\nHost: localhost\r\n" + headers + b"\r\n" + body
     with socket.create_connection(("127.0.0.1", port), timeout=2) as conn:
@@ -753,7 +768,11 @@ def test_busy_returns_503():
         unblock.wait(5.0)  # hold the semaphore
         return _fake_evidence(nonce, hotkey)
 
-    with WorkerServer(evidence_collector=blocking_collector, max_concurrent=1) as srv:
+    with WorkerServer(
+        evidence_collector=blocking_collector,
+        max_concurrent=1,
+        max_challenge_concurrent=1,
+    ) as srv:
         _start_server(srv)
 
         nonce_hex = os.urandom(32).hex()
@@ -781,6 +800,186 @@ def test_busy_returns_503():
         unblock.set()
         t1.join(timeout=5.0)
         assert results[0][0] == 200
+
+
+# ---------------------------------------------------------------------------
+# Slot exhaustion by unauthenticated callers (issue #65)
+# ---------------------------------------------------------------------------
+
+
+def test_declared_but_unsent_bodies_cannot_block_the_challenge_path():
+    """Two stalled connections must not deny attestation to a real caller."""
+    payload = json.dumps(
+        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
+    with WorkerServer(
+        evidence_collector=_fake_evidence,
+        max_challenge_concurrent=1,
+        timeout=30.0,
+    ) as srv:
+        _start_server(srv)
+        stalled = [_stall_connection(srv.port) for _ in range(2)]
+        try:
+            # Let both connections finish their headers and park in the body
+            # read; that is the point at which the old code held the slot.
+            time.sleep(0.25)
+            started = time.monotonic()
+            code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
+            elapsed = time.monotonic() - started
+        finally:
+            for conn in stalled:
+                conn.close()
+    assert code == 200
+    assert elapsed < 5.0
+
+
+def test_body_is_validated_before_a_slot_is_taken():
+    """A saturated pool still answers framing errors, not 503."""
+    hold = threading.Event()
+    unblock = threading.Event()
+
+    def blocking_collector(nonce: bytes, hotkey: str) -> Evidence:
+        hold.set()
+        unblock.wait(5.0)
+        return _fake_evidence(nonce, hotkey)
+
+    with WorkerServer(
+        evidence_collector=blocking_collector,
+        max_challenge_concurrent=1,
+    ) as srv:
+        _start_server(srv)
+        url = f"{srv.base_url}/v1/evidence"
+        payload = json.dumps(
+            {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+        ).encode()
+        holder = threading.Thread(target=lambda: _post_raw(url, payload))
+        holder.start()
+        try:
+            assert hold.wait(5.0)
+            assert _raw_http_status(srv.port, b"") == 411
+            assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 400
+            assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 413
+            assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 400
+        finally:
+            unblock.set()
+            holder.join(timeout=5.0)
+
+
+def test_total_request_deadline_ends_a_trickled_body():
+    """A body slower than the body limit but faster than each recv still ends."""
+    stop = threading.Event()
+    with WorkerServer(evidence_collector=_fake_evidence, timeout=1.0) as srv:
+        _start_server(srv)
+        conn = _stall_connection(srv.port)
+        started = time.monotonic()
+
+        def trickle() -> None:
+            while not stop.wait(0.3):
+                try:
+                    conn.sendall(b" ")
+                except OSError:
+                    return
+
+        sender = threading.Thread(target=trickle, daemon=True)
+        sender.start()
+        try:
+            conn.settimeout(10.0)
+            response = conn.recv(4096)
+            elapsed = time.monotonic() - started
+        finally:
+            stop.set()
+            sender.join(timeout=5.0)
+            conn.close()
+    assert _status_of(response) == 400
+    # Without a total deadline this request never ends: 4096 bytes at one
+    # byte per 0.3s outlives any per-recv timeout.
+    assert elapsed < 5.0
+
+
+def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
+    """The response gets a deadline too, or stalling the read holds a slot."""
+
+    def big_collector(nonce: bytes, hotkey: str) -> Evidence:
+        return Evidence(
+            kind=EvidenceKind.TDX,
+            quote=b"q" * (512 * 1024),
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            cert_chain=[b"fakecert"],
+        )
+
+    payload = json.dumps(
+        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
+    with WorkerServer(
+        evidence_collector=big_collector,
+        max_challenge_concurrent=1,
+        timeout=1.0,
+    ) as srv:
+        _start_server(srv)
+        url = f"{srv.base_url}/v1/evidence"
+        stalled = socket.socket()
+        # A tiny receive buffer stops the response fitting in the socket, so
+        # the handler is genuinely blocked in send rather than already done.
+        stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        stalled.settimeout(10.0)
+        stalled.connect(("127.0.0.1", srv.port))
+        try:
+            stalled.sendall(
+                b"POST /v1/evidence HTTP/1.1\r\nHost: localhost\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
+                + payload
+            )
+            time.sleep(0.3)
+            # Whether the handler is still blocked in send at this instant
+            # depends on how the kernel sized and drained the socket buffers,
+            # so a 503 here is expected but not guaranteed and must not be
+            # asserted. The invariant that matters is the recovery below: a
+            # client that stops reading cannot hold the slot indefinitely.
+            # Without the response deadline the handler blocks forever and
+            # this loop never sees a 200.
+            code = 0
+            deadline = time.monotonic() + 8.0
+            while code != 200 and time.monotonic() < deadline:
+                code, _ = _post_raw(url, payload)
+            assert code == 200
+        finally:
+            stalled.close()
+
+
+def test_saturated_challenge_pool_does_not_starve_authenticated_work():
+    hold = threading.Event()
+    unblock = threading.Event()
+
+    def blocking_collector(nonce: bytes, hotkey: str) -> Evidence:
+        hold.set()
+        unblock.wait(5.0)
+        return _fake_evidence(nonce, hotkey)
+
+    item = _make_sat_item()
+    with WorkerServer(
+        evidence_collector=blocking_collector,
+        max_concurrent=1,
+        max_challenge_concurrent=1,
+    ) as srv:
+        _start_server(srv)
+        url = f"{srv.base_url}/v1/evidence"
+        payload = json.dumps(
+            {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+        ).encode()
+        holder = threading.Thread(target=lambda: _post_raw(url, payload))
+        holder.start()
+        try:
+            assert hold.wait(5.0)
+            # The challenge pool is full ...
+            assert _post_raw(url, payload)[0] == 503
+            # ... but work dispatch keeps its own slot.
+            cert = RemoteMiner(srv.base_url, HOTKEY, timeout=5).do_sat_work(item)
+            assert cert.challenge_id == item.challenge_id
+        finally:
+            unblock.set()
+            holder.join(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1210,6 +1409,7 @@ def test_remote_miner_rejects_invalid_limits(kwargs):
         {"max_body": 0},
         {"max_response_body": 0},
         {"max_concurrent": 0},
+        {"max_challenge_concurrent": 0},
     ],
 )
 def test_worker_server_rejects_invalid_limits(kwargs):

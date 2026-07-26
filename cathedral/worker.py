@@ -9,6 +9,7 @@ default.
 from __future__ import annotations
 
 import hmac
+import io
 import ipaddress
 import json
 import math
@@ -18,6 +19,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
@@ -46,7 +48,14 @@ from cathedral.lanes.sat_types import SatInstance
 
 MAX_REQUEST_BODY: int = 64 * 1024
 MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
-MAX_CONCURRENT: int = 1
+# Sized for the 4 vCPU guest the worker ships in. Authenticated work gets one
+# slot per vCPU because canonical SAT is CPU bound and customer SAT runs in a
+# child process, so the slots map onto real parallelism. The credential-free
+# challenge path gets its own smaller pool: a validator needs one quote per
+# miner per epoch plus room for a retry or a lifecycle refresh overlapping it,
+# and because the pool is separate, saturating it cannot consume a work slot.
+MAX_CONCURRENT: int = 4
+MAX_CHALLENGE_CONCURRENT: int = 2
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
@@ -167,8 +176,89 @@ def _evidence_fits_transport(evidence: Evidence) -> bool:
     )
 
 
+def _arm_remaining_budget(connection: socket.socket, deadline: float) -> None:
+    """Set the socket timeout to whatever is left before ``deadline``."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise TimeoutError("request deadline exceeded")
+    connection.settimeout(remaining)
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Bound a request by total wall clock rather than by each recv.
+
+    ``socket.settimeout`` limits one recv, not one request, so a caller that
+    dribbles a byte per timeout window keeps its connection alive forever.
+    Every read here is a single underlying ``read1``, so the remaining budget
+    is rechecked between recvs and the socket timeout is trimmed to what is
+    left. Reads past the deadline raise ``TimeoutError``, which the header
+    parser and ``_read_body`` already treat as a dead request.
+    """
+
+    def __init__(
+        self,
+        source: io.BufferedReader,
+        connection: socket.socket,
+        deadline: float,
+    ) -> None:
+        self._source = source
+        self._connection = connection
+        self._deadline = deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:  # noqa: ANN001 - writable buffer protocol
+        wanted = len(buffer)
+        if wanted == 0:
+            return 0
+        _arm_remaining_budget(self._connection, self._deadline)
+        chunk = self._source.read1(wanted)
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+    def close(self) -> None:
+        try:
+            self._source.close()
+        finally:
+            super().close()
+
+
+class _DeadlineWriter(io.BufferedIOBase):
+    """Give the response its own budget, starting at its first byte.
+
+    Replaces the unbuffered ``_SocketWriter`` the base handler installs. A
+    caller that stops reading its response would otherwise keep a worker slot
+    for as long as it likes, because ``sendall`` restarts the socket timeout
+    on every partial send. The budget starts here rather than being shared
+    with the request deadline so that a request which ran out of read budget
+    can still be told why.
+    """
+
+    def __init__(self, connection: socket.socket, budget: float) -> None:
+        self._connection = connection
+        self._budget = budget
+        self._deadline: float | None = None
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:  # noqa: ANN001 - readable buffer protocol
+        if self._deadline is None:
+            self._deadline = time.monotonic() + self._budget
+        view = memoryview(data)
+        total = len(view)
+        sent = 0
+        while sent < total:
+            _arm_remaining_budget(self._connection, self._deadline)
+            sent += self._connection.send(view[sent:])
+        return total
+
+
 def _make_handler(
     semaphore: threading.Semaphore,
+    challenge_semaphore: threading.Semaphore,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -182,6 +272,15 @@ def _make_handler(
         def setup(self) -> None:
             super().setup()
             self.connection.settimeout(request_timeout)
+            # One deadline covers headers and body, so the budget a caller
+            # spends stalling on headers is not also available for stalling on
+            # the body; the response then gets a budget of its own.
+            self.rfile = io.BufferedReader(
+                _DeadlineReader(
+                    self.rfile, self.connection, time.monotonic() + request_timeout
+                )
+            )
+            self.wfile = _DeadlineWriter(self.connection, request_timeout)
 
         def log_message(self, fmt: str, *args: object) -> None:
             pass
@@ -230,18 +329,32 @@ def _make_handler(
 
         def do_POST(self) -> None:
             path = self.path.partition("?")[0]
-            # Fresh evidence is deliberately credential-free.  The worker's
-            # concurrency and body limits protect this public challenge path;
-            # bearer credentials are sent only after the validator has
-            # verified the attested channel and are required for work.
-            if path != "/v1/evidence" and not self._check_auth():
+            # Fresh evidence is deliberately credential-free: the validator
+            # holds no bearer token for a worker it has not attested yet, and
+            # work credentials are issued only after the attested channel is
+            # verified.  What protects this public path is its own challenge
+            # pool plus the body limits enforced below, not the shared
+            # concurrency limit -- a caller that declares a body and never
+            # sends it would otherwise hold a slot for the full deadline.
+            credential_free = path == "/v1/evidence"
+            if not credential_free and not self._check_auth():
                 self._send_json(401, {"error": "unauthorized"})
                 return
-            if not semaphore.acquire(blocking=False):
-                self._send_json(503, {"error": "busy"})
-                return
             try:
-                self._handle_post()
+                # Read and size-check before taking a slot, so occupying one
+                # costs an attacker a complete, bounded request.
+                raw, error_code, error_message = self._read_body()
+                if raw is None:
+                    self._send_json(error_code, {"error": error_message})
+                    return
+                pool = challenge_semaphore if credential_free else semaphore
+                if not pool.acquire(blocking=False):
+                    self._send_json(503, {"error": "busy"})
+                    return
+                try:
+                    self._handle_post(raw)
+                finally:
+                    pool.release()
             except (socket.timeout, TimeoutError, OSError):
                 try:
                     self._send_json(400, {"error": "request failed"})
@@ -252,14 +365,8 @@ def _make_handler(
                     self._send_json(500, {"error": "internal error"})
                 except OSError:
                     pass
-            finally:
-                semaphore.release()
 
-        def _handle_post(self) -> None:
-            raw, error_code, error_message = self._read_body()
-            if raw is None:
-                self._send_json(error_code, {"error": error_message})
-                return
+        def _handle_post(self, raw: bytes) -> None:
             try:
                 body = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -484,6 +591,10 @@ class WorkerServer:
     an HTTPS terminator. Native TLS may bind a non-loopback address. SAT work is
     restricted to deterministic ``SatLane`` canonical backfill by default.
     Customer-submitted SAT is an explicit authenticated deployment mode.
+
+    The credential-free ``/v1/evidence`` challenge runs on its own pool so
+    that unauthenticated traffic cannot occupy the slots authenticated work
+    dispatch needs.
     """
 
     def __init__(
@@ -501,6 +612,7 @@ class WorkerServer:
         tls_context: ssl.SSLContext | None = None,
         max_body: int = MAX_REQUEST_BODY,
         max_concurrent: int = MAX_CONCURRENT,
+        max_challenge_concurrent: int = MAX_CHALLENGE_CONCURRENT,
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
@@ -534,6 +646,7 @@ class WorkerServer:
         for name, value in (
             ("max_body", max_body),
             ("max_concurrent", max_concurrent),
+            ("max_challenge_concurrent", max_challenge_concurrent),
             ("max_response_body", max_response_body),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -563,8 +676,10 @@ class WorkerServer:
             raise ValueError("TLS worker requires its configured channel binding")
 
         semaphore = threading.Semaphore(max_concurrent)
+        challenge_semaphore = threading.Semaphore(max_challenge_concurrent)
         handler = _make_handler(
             semaphore,
+            challenge_semaphore,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,

@@ -1950,4 +1950,24 @@ def _safe_error_category(exc: BaseException) -> str:
         and all(character.isalnum() or character == "_" for character in category)
     ):
         return category
+    # ``RemoteError`` carries the worker's status only in its message. Keep
+    # that status in the category so an operator can tell a worker refusing
+    # requests (503, what an attestation-denial attack looks like) from a
+    # miner producing bad evidence, which also lands as attestation_failed.
+    status = _worker_http_status(exc)
+    if status is not None:
+        return f"worker_http_{status}"
     return "attestation_error"
+
+
+_WORKER_HTTP_PREFIX = "worker returned HTTP "
+
+
+def _worker_http_status(exc: BaseException) -> str | None:
+    message = str(exc).strip()
+    if not message.startswith(_WORKER_HTTP_PREFIX):
+        return None
+    status = message[len(_WORKER_HTTP_PREFIX) :]
+    if len(status) != 3 or not status.isdecimal() or not status.isascii():
+        return None
+    return status

@@ -512,10 +512,7 @@ class Ledger:
     makes a ledger instance safe to call from multiple threads.
     """
 
-    def __init__(self, db_path: str | Path = ":memory:", *, window_size: int = 3) -> None:
-        if window_size < 0:
-            raise ValueError("window_size must be nonnegative")
-        self.window_size = window_size
+    def __init__(self, db_path: str | Path = ":memory:") -> None:
         self._lock = threading.RLock()
         self._closed = False
         if str(db_path) == ":memory:":
@@ -1331,9 +1328,8 @@ class Ledger:
         forever. This is a one-way, audited status transition only -- it never
         mutates ``report_body``/``report_digest``, and it never makes the
         abandoned work payable: ``mark_published`` only accepts a 'complete'
-        epoch, and the trailing score window in ``complete_epoch`` only reads
-        'published' epochs, so an 'abandoned' epoch is permanently excluded
-        from both.
+        epoch, and no later epoch's scores can ever read this one's work, so
+        an 'abandoned' epoch is permanently unpayable.
 
         Only a 'complete' epoch may transition; every other status (running,
         aborted, published, already abandoned) is an invalid transition and
@@ -1879,7 +1875,13 @@ class Ledger:
         score_network: str | None = None,
         score_netuid: int | None = None,
     ) -> dict[str, float]:
-        """Freeze scores and canonical report bytes in one durable transaction."""
+        """Freeze scores and canonical report bytes in one durable transaction.
+
+        Every score is ``this epoch's`` gated work over the epoch maximum. The
+        same gated units are the ones persisted in ``epoch_scores`` and later
+        exported as ``verified_work_units``, so the score vector and the
+        published evidence describe one set of numbers.
+        """
         stable_generated_at = _validated_generated_at(generated_at)
         audience: tuple[str, int] | None = None
         if score_network is not None or score_netuid is not None:
@@ -1929,22 +1931,6 @@ class Ledger:
                     (epoch_id, epoch_id),
                 )
             )
-            previous = cx.execute(
-                "SELECT epoch_id, source_epoch FROM epochs WHERE status = 'published' "
-                "ORDER BY source_epoch DESC LIMIT ?",
-                (self.window_size,),
-            ).fetchall()
-            previous_ids = [row["epoch_id"] for row in previous]
-            if previous_ids:
-                placeholders = ",".join("?" for _ in previous_ids)
-                universe.update(
-                    row["hotkey"]
-                    for row in cx.execute(
-                        f"SELECT DISTINCT hotkey FROM epoch_scores WHERE epoch_id IN ({placeholders})",
-                        previous_ids,
-                    )
-                )
-
             current_work = {hotkey: 0.0 for hotkey in universe}
             for row in cx.execute(
                 "SELECT hotkey, SUM(work_units) AS total FROM challenges "
@@ -1952,35 +1938,6 @@ class Ledger:
                 (epoch_id,),
             ):
                 current_work[row["hotkey"]] = float(row["total"])
-            totals = dict(current_work)
-            current_lanes: dict[str, tuple[str, ...]] = {}
-            for row in cx.execute(
-                "SELECT hotkey,workload,policy_mode FROM epoch_attestations "
-                "WHERE epoch_id = ? AND score_eligible = 1",
-                (epoch_id,),
-            ):
-                current_lanes[row["hotkey"]] = (
-                    ("GPU", row["policy_mode"]) if row["workload"] == "GPU" else ("CPU",)
-                )
-            if previous_ids:
-                placeholders = ",".join("?" for _ in previous_ids)
-                for row in cx.execute(
-                    "SELECT scores.hotkey,scores.work_units,attestations.workload,"
-                    "attestations.policy_mode FROM epoch_scores AS scores "
-                    "JOIN epoch_attestations AS attestations "
-                    "ON attestations.epoch_id=scores.epoch_id "
-                    "AND attestations.hotkey=scores.hotkey "
-                    f"WHERE scores.epoch_id IN ({placeholders}) "
-                    "AND attestations.score_eligible=1",
-                    previous_ids,
-                ):
-                    prior_lane = (
-                        ("GPU", row["policy_mode"]) if row["workload"] == "GPU" else ("CPU",)
-                    )
-                    if current_lanes.get(row["hotkey"]) == prior_lane:
-                        totals[row["hotkey"]] = totals.get(row["hotkey"], 0.0) + float(
-                            row["work_units"]
-                        )
 
             attested = {
                 row["hotkey"]
@@ -2013,12 +1970,15 @@ class Ledger:
             if lifecycle_rows:
                 universe.update(row["hotkey"] for row in lifecycle_rows)
                 current_work.update({hotkey: current_work.get(hotkey, 0.0) for hotkey in universe})
-                totals.update({hotkey: totals.get(hotkey, 0.0) for hotkey in universe})
                 attested &= lifecycle_eligible
+            # Scores derive from THIS epoch's receipt-verified work and nothing
+            # else. The published evidence bundle exports exactly these units,
+            # so the on-chain vector and any independent recomputation over the
+            # bundle produce identical shares by construction. A trailing sum
+            # over prior epochs used to feed the wire score while the bundle
+            # carried current-epoch units only, which made the payment
+            # unreconcilable against its own published evidence.
             gated = {
-                hotkey: units if hotkey in attested else 0.0 for hotkey, units in totals.items()
-            }
-            current_gated = {
                 hotkey: units if hotkey in attested else 0.0
                 for hotkey, units in current_work.items()
             }
@@ -2046,8 +2006,6 @@ class Ledger:
                     "attestation_policy_modes": policy_modes,
                     "policy_registry_release": epoch["policy_registry_release"],
                     "policy_registry_digest": epoch["policy_registry_digest"],
-                    "published_window_epochs": sorted(row["source_epoch"] for row in previous),
-                    "published_window_size": self.window_size,
                     "worker_lifecycle": [
                         {
                             "event_id": row["event_id"],
@@ -2086,10 +2044,7 @@ class Ledger:
             )
             cx.executemany(
                 "INSERT INTO epoch_scores(epoch_id, hotkey, work_units, score) VALUES (?, ?, ?, ?)",
-                [
-                    (epoch_id, hotkey, current_gated[hotkey], scores[hotkey])
-                    for hotkey in sorted(scores)
-                ],
+                [(epoch_id, hotkey, gated[hotkey], scores[hotkey]) for hotkey in sorted(scores)],
             )
             return scores
 

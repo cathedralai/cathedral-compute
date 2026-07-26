@@ -31,6 +31,8 @@ from cathedral.provenance import (
 )
 from cathedral.score_class import _sign_report
 from tests.test_receipt import (
+    ANCHOR_BLOCK,
+    ANCHOR_HASH,
     CHALLENGE_ID,
     ISSUED,
     ISSUED_TEXT,
@@ -104,7 +106,7 @@ def exported(tmp_path: Path):
 def test_happy_path_recomputes_the_single_verified_miner(exported):
     report, receipts = exported
     result = _verify(report, receipts)
-    assert result.mechanism_id == "validated_supply_v1"
+    assert result.mechanism_id == "validated_supply_v2"
     assert result.policy_release == 1
     assert result.verifier_digest == VERIFIER_DIGEST
     assert result.recomputed_hotkey_weights == {"public-hotkey": 1.0}
@@ -343,10 +345,155 @@ def test_chain_enforcement_rejects_a_broken_predecessor(exported):
     assert result.previous_report_id is None
 
 
+def _scored_epoch(
+    ledger: Ledger,
+    *,
+    source_epoch: int,
+    work: dict[str, float],
+    attested_without_work: tuple[str, ...] = (),
+    candidates: tuple[str, ...],
+) -> int:
+    """One completed epoch with real receipts, attestations, and lifecycle rows."""
+    registry = _snapshot()
+    epoch_id = ledger.begin_epoch(
+        source_epoch,
+        policy_registry_release=registry.release,
+        policy_registry_digest=registry.digest,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
+    )
+    for index, hotkey in enumerate(sorted(work) + sorted(attested_without_work)):
+        challenge = f"{source_epoch:02x}{index:02x}".ljust(64, "0")
+        units = work.get(hotkey)
+        _registry, policy, claims, receipt = _issued_receipt(
+            epoch_id=epoch_id,
+            source_epoch=source_epoch,
+            subject_hotkey=hotkey,
+            challenge_id=challenge,
+            work_units=units if units is not None else 0.0,
+        )
+        if units is not None:
+            ledger.issue_challenge(challenge, hotkey, epoch_id)
+            ledger.resolve_challenge_with_receipt(
+                challenge,
+                "verified",
+                units,
+                validator_derived=True,
+                receipt_id=receipt.receipt_id,
+                receipt_body=receipt.receipt_bytes,
+                receipt_digest=receipt.receipt_digest,
+                issued_at=ISSUED_TEXT,
+            )
+        ledger.add_attestation(
+            epoch_id,
+            hotkey,
+            verdict="VERIFIED",
+            tee_type="TDX",
+            workload="CPU",
+            evidence_digest=claims.hardware.evidence_digest,
+            policy_mode="strict",
+        )
+        ledger.add_lifecycle_snapshot(
+            epoch_id,
+            _worker_lifecycle(policy, claims, hotkey),
+            snapshot_at=ISSUED_TEXT,
+        )
+    ledger.complete_epoch(
+        epoch_id,
+        set(candidates),
+        generated_at=ISSUED_TEXT,
+        score_network="local",
+        score_netuid=1,
+    )
+    return epoch_id
+
+
+def _wire_shares(ledger: Ledger, epoch_id: int) -> dict[str, float]:
+    """The publisher's normalization of the frozen wire vector: score / sum."""
+    document = json.loads(ledger.report_bytes(epoch_id))
+    positive = {
+        row["miner_hotkey"]: float(row["score"]) for row in document["scores"] if row["score"] > 0
+    }
+    total = sum(positive.values())
+    return {hotkey: value / total for hotkey, value in positive.items()}
+
+
+def test_bundle_recomputation_matches_the_wire_vector_across_epoch_shapes(tmp_path: Path):
+    """Issue #64: the on-chain vector and the published bundle must agree.
+
+    Each epoch is exported and independently verified end to end, then the
+    mechanism's recomputation is compared against the publisher normalization
+    of the same epoch's wire vector. A trailing-window score would diverge on
+    every shape below except the steady state.
+    """
+    ledger = Ledger(tmp_path / "shapes.sqlite")
+    candidates = ("alpha-hotkey", "beta-hotkey")
+
+    def agreed(epoch_id: int) -> dict[str, float]:
+        report = _export_score_class(ledger, epoch_id)
+        result = _verify(report, _receipts_from_ledger(ledger, epoch_id))
+        wire = _wire_shares(ledger, epoch_id)
+        assert result.recomputed_hotkey_weights == pytest.approx(wire, rel=1e-12, abs=1e-12)
+        ledger.mark_published(epoch_id)
+        return wire
+
+    # Ramp-up: beta is an anchored candidate before it ever earns.
+    first = _scored_epoch(
+        ledger, source_epoch=11, work={"alpha-hotkey": 100.0}, candidates=candidates
+    )
+    assert agreed(first) == pytest.approx({"alpha-hotkey": 1.0})
+
+    # Ramp-up: beta joins and immediately out-earns the incumbent.
+    second = _scored_epoch(
+        ledger,
+        source_epoch=12,
+        work={"alpha-hotkey": 100.0, "beta-hotkey": 300.0},
+        candidates=candidates,
+    )
+    assert agreed(second) == pytest.approx({"alpha-hotkey": 0.25, "beta-hotkey": 0.75})
+
+    # Missed epoch: alpha does not attest at all.
+    third = _scored_epoch(
+        ledger, source_epoch=13, work={"beta-hotkey": 300.0}, candidates=candidates
+    )
+    assert agreed(third) == pytest.approx({"beta-hotkey": 1.0})
+
+    # Attested but idle: alpha holds a verified attestation and does no work.
+    fourth = _scored_epoch(
+        ledger,
+        source_epoch=14,
+        work={"beta-hotkey": 250.0},
+        attested_without_work=("alpha-hotkey",),
+        candidates=candidates,
+    )
+    assert agreed(fourth) == pytest.approx({"beta-hotkey": 1.0})
+    ledger.close()
+
+
 def test_mechanism_registry_is_versioned_and_frozen():
-    assert list(MECHANISMS) == ["validated_supply_v1"]
+    """Both ids stay registered during the v1 to v2 rollout.
+
+    v1 is retained so already-signed historical evidence keeps verifying under
+    this build and a validator still pinned to v1 is not cut off mid-rollout.
+    """
+    assert sorted(MECHANISMS) == ["validated_supply_v1", "validated_supply_v2"]
     assert MECHANISMS["validated_supply_v1"]([]) == {}
-    assert MECHANISM_REVISIONS == {"validated_supply_v1": 1}
+    assert MECHANISMS["validated_supply_v2"]([]) == {}
+    assert MECHANISM_REVISIONS == {
+        "validated_supply_v1": 1,
+        "validated_supply_v2": 1,
+    }
+
+
+def test_every_registered_mechanism_has_a_revision():
+    """Dispatch is on the (id, revision) pair, so the two tables must agree.
+
+    An id registered without a revision would fail dispatch at recomputation
+    time rather than at import, turning a rollout into an outage.
+    """
+    assert set(MECHANISMS) == set(MECHANISM_REVISIONS)
 
 
 def test_unsupported_mechanism_revision_fails_before_recomputation(exported):
@@ -364,7 +511,7 @@ WIRE_INGEST_DIGEST = "3e" * 32
 
 
 def _launch_vector(rows, *, source_epoch: int = 11, positive: bool | None = None) -> dict:
-    """The REAL validated_supply_v1 signed wire shape, mirroring the subnet
+    """The REAL validated_supply_v2 signed wire shape, mirroring the subnet
     publisher (scaffold/publisher/weights.py build_signed_vector): PRE-burn
     confidential_primary rows (base 0, weight == external, positive supply
     summing to 1.0), the burn resolved by HOTKEY (``burn_uid`` null, fixed
@@ -705,11 +852,11 @@ def test_vector_rows_are_validated_before_comparison(exported):
 
 
 # ---------------------------------------------------------------------------
-# Complete validated_supply_v1 signed-vector contract (Codex finding 1)
+# Complete validated_supply_v2 signed-vector contract (Codex finding 1)
 # ---------------------------------------------------------------------------
 
 
-def _synthetic_result(weights: dict[str, float], mechanism_id: str = "validated_supply_v1"):
+def _synthetic_result(weights: dict[str, float], mechanism_id: str = "validated_supply_v2"):
     """A recomputation result carrying only what compare_with_vector reads."""
     return ProvenanceResult(
         report_id="sha256:" + "0" * 64,
@@ -947,7 +1094,7 @@ def test_fixed_policy_tolerance_matches_the_live_subnet_validator():
     burn_drift = _launch_vector([_launch_row("alpha", 1.0)])
     burn_drift["burn_snapshot"]["forced_burn_percentage"] = 10.0000000005
     agree, notes = _compare(result, burn_drift)
-    assert not agree and "fixed validated_supply_v1 floor" in notes[0]
+    assert not agree and "fixed validated_supply_v2 floor" in notes[0]
 
     allocation_drift = _launch_vector([_launch_row("alpha", 1.0)])
     policy = allocation_drift["policy_metadata"]["validated_supply"]
@@ -1121,7 +1268,7 @@ def _replayable_result(positive: tuple[str, ...], zero: tuple[str, ...] = ()):
         policy_release=1,
         policy_digest="sha256:" + "1" * 64,
         verifier_digest=VERIFIER_DIGEST,
-        mechanism_id="validated_supply_v1",
+        mechanism_id="validated_supply_v2",
         source_epoch=11,
         generated_at=ISSUED_TEXT,
         valid_until="2026-07-11T12:30:00.000000Z",
