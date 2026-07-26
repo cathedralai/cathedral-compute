@@ -1,4 +1,4 @@
-"""Cross-repo validated_supply_v1 signed-vector contract (launch repairs 5+8).
+"""Cross-repo validated_supply_v2 signed-vector contract (launch repairs 5+8).
 
 The fixture below reproduces, field by field, the vector the REAL subnet
 publisher signs in validated_supply mode (read from the read-only worktree:
@@ -146,7 +146,7 @@ def _result(weights: dict[str, float]) -> ProvenanceResult:
         policy_release=1,
         policy_digest="sha256:" + "1" * 64,
         verifier_digest="sha256:" + "d" * 64,
-        mechanism_id="validated_supply_v1",
+        mechanism_id="validated_supply_v2",
         source_epoch=SOURCE_EPOCH,
         generated_at="2026-07-11T12:00:00.000000Z",
         valid_until="2026-07-11T12:30:00.000000Z",

@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import urllib.error
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Self
 from unittest.mock import patch
@@ -15,6 +16,7 @@ import pytest
 
 from cathedral.ledger import _EPOCHS_MIGRATION_TEMP_PREFIX, Ledger, LedgerError
 from cathedral.poster import Poster, PosterError
+from cathedral.provenance import MECHANISMS
 
 GPU_AUTHORITY = (
     "gpu-profile:tdx-h100-v1@profile=sha256:" + "a" * 64 + "@release=7@registry=sha256:" + "b" * 64
@@ -67,6 +69,29 @@ def report(ledger: Ledger, epoch_id: int) -> dict:
 
 def scores_by_hotkey(payload: dict) -> dict[str, float]:
     return {row["miner_hotkey"]: row["score"] for row in payload["scores"]}
+
+
+def frozen_work_units(ledger: Ledger, epoch_id: int) -> dict[str, float]:
+    """The units frozen in epoch_scores, which the evidence bundle exports.
+
+    ``score_class.py`` copies these verbatim into
+    ``metrics.verified_work_units``.
+    """
+    with ledger._lock:
+        return {
+            row["hotkey"]: float(row["work_units"])
+            for row in ledger._connection.execute(
+                "SELECT hotkey, work_units FROM epoch_scores WHERE epoch_id = ?",
+                (epoch_id,),
+            )
+        }
+
+
+def positive_shares(values: dict[str, float]) -> dict[str, float]:
+    """Normalize positive rows over their sum, as the publisher does."""
+    positive = {hotkey: value for hotkey, value in values.items() if value > 0}
+    total = sum(positive.values())
+    return {hotkey: value / total for hotkey, value in positive.items()}
 
 
 class TestEpochStateMachine:
@@ -376,8 +401,8 @@ class TestReportSnapshot:
         }
         assert all(0 <= value <= 1 for value in scores.values())
 
-    def test_only_published_previous_epochs_enter_trailing_window(self) -> None:
-        ledger = Ledger(window_size=3)
+    def test_published_history_never_enters_the_current_epoch_score(self) -> None:
+        ledger = Ledger()
         complete_and_publish(ledger, 1, {"old": 100}, {"old", "new"})
         complete_and_publish(ledger, 2, {"old": 100}, {"old", "new"})
         complete_and_publish(ledger, 3, {"old": 100}, {"old", "new"})
@@ -389,12 +414,74 @@ class TestReportSnapshot:
         attest(ledger, current, "new")
         scores = ledger.complete_epoch(current, {"old", "new"})
 
-        # Epoch 1 fell out; epochs 2-4 plus current are used.
-        assert scores == {"old": 1.0, "new": 300 / 1200}
-        assert report(ledger, current)["metadata"]["published_window_epochs"] == [2, 3, 4]
+        # 1300 published units of history buy "old" nothing: it did no work
+        # this epoch, so the epoch's only worker takes the whole vector.
+        assert scores == {"old": 0.0, "new": 1.0}
+        metadata = report(ledger, current)["metadata"]
+        assert "published_window_epochs" not in metadata
+        assert "published_window_size" not in metadata
+
+    def test_wire_vector_and_exported_units_agree_across_epoch_shapes(self) -> None:
+        """The wire vector and the bundle's units must normalize identically.
+
+        Each side is normalized the way production normalizes it: the
+        publisher divides the wire scores by their sum, and the pinned reward
+        mechanism divides the exported verified_work_units by theirs.
+        """
+        ledger = Ledger()
+        mechanism = MECHANISMS["validated_supply_v2"]
+
+        def agreed_shares(epoch_id: int) -> dict[str, float]:
+            units = frozen_work_units(ledger, epoch_id)
+            bundle = mechanism(
+                [
+                    (hotkey, Decimal(str(value)))
+                    for hotkey, value in sorted(units.items())
+                    if value > 0
+                ]
+            )
+            wire = positive_shares(scores_by_hotkey(report(ledger, epoch_id)))
+            assert wire == pytest.approx(bundle, rel=1e-12, abs=1e-12)
+            return wire
+
+        # (a) Ramp-up: "beta" is a candidate before it ever earns.
+        first = ledger.begin_epoch(1)
+        verified_work(ledger, first, "1-alpha", "alpha", 100)
+        attest(ledger, first, "alpha")
+        assert ledger.complete_epoch(first, {"alpha", "beta"}) == {"alpha": 1.0, "beta": 0.0}
+        assert agreed_shares(first) == pytest.approx({"alpha": 1.0})
+        ledger.mark_published(first)
+
+        second = ledger.begin_epoch(2)
+        verified_work(ledger, second, "2-alpha", "alpha", 100)
+        verified_work(ledger, second, "2-beta", "beta", 300)
+        attest(ledger, second, "alpha")
+        attest(ledger, second, "beta")
+        assert ledger.complete_epoch(second, {"alpha", "beta"}) == {
+            "alpha": pytest.approx(1 / 3),
+            "beta": 1.0,
+        }
+        assert agreed_shares(second) == pytest.approx({"alpha": 0.25, "beta": 0.75})
+        ledger.mark_published(second)
+
+        # (b) "alpha" misses the epoch: no attestation, no work.
+        third = ledger.begin_epoch(3)
+        verified_work(ledger, third, "3-beta", "beta", 300)
+        attest(ledger, third, "beta")
+        assert ledger.complete_epoch(third, {"alpha", "beta"}) == {"alpha": 0.0, "beta": 1.0}
+        assert agreed_shares(third) == pytest.approx({"beta": 1.0})
+        ledger.mark_published(third)
+
+        # (c) "alpha" attests but does zero work.
+        fourth = ledger.begin_epoch(4)
+        verified_work(ledger, fourth, "4-beta", "beta", 250)
+        attest(ledger, fourth, "alpha")
+        attest(ledger, fourth, "beta")
+        assert ledger.complete_epoch(fourth, {"alpha", "beta"}) == {"alpha": 0.0, "beta": 1.0}
+        assert agreed_shares(fourth) == pytest.approx({"beta": 1.0})
 
     def test_prior_cpu_score_cannot_leak_into_a_gpu_audit_epoch(self) -> None:
-        ledger = Ledger(window_size=3)
+        ledger = Ledger()
         complete_and_publish(ledger, 1, {"worker": 100}, {"worker"})
 
         gpu_epoch = ledger.begin_epoch(2)
@@ -411,7 +498,7 @@ class TestReportSnapshot:
         assert ledger.complete_epoch(gpu_epoch, {"worker"}) == {"worker": 0.0}
 
     def test_changed_signed_gpu_authority_cannot_inherit_prior_gpu_score(self) -> None:
-        ledger = Ledger(window_size=3)
+        ledger = Ledger()
         first = ledger.begin_epoch(1)
         verified_work(ledger, first, "gpu-work-1", "worker", 100)
         ledger.add_attestation(
@@ -473,7 +560,7 @@ class TestReportSnapshot:
                 == 0
             )
 
-    def test_unpublished_completed_epoch_cannot_leak_into_window(self) -> None:
+    def test_work_from_an_aborted_attempt_is_never_scored(self) -> None:
         ledger = Ledger()
         prior = ledger.begin_epoch(1)
         verified_work(ledger, prior, "prior", "hk", 100)
@@ -482,7 +569,8 @@ class TestReportSnapshot:
         with pytest.raises(LedgerError, match="publish it"):
             ledger.begin_epoch(2)
 
-        # An aborted attempt also contributes nothing when the same source epoch is retried.
+        # The aborted attempt's work contributes nothing when the same source
+        # epoch is retried, and neither does the published prior epoch's.
         ledger.mark_published(prior)
         attempt = ledger.begin_epoch(2)
         verified_work(ledger, attempt, "discarded", "other", 999)
@@ -492,7 +580,7 @@ class TestReportSnapshot:
         attest(ledger, retry, "hk")
         attest(ledger, retry, "other")
         scores = ledger.complete_epoch(retry, {"hk", "other"})
-        assert scores == {"hk": 1.0, "other": 0.0}
+        assert scores == {"hk": 0.0, "other": 0.0}
 
     def test_report_schema_and_exact_byte_idempotency(self) -> None:
         ledger = Ledger()
@@ -658,8 +746,8 @@ class TestAbandonCompletedEpoch:
         ledger.abandon_completed_epoch(epoch_id, "reason")
         assert ledger.begin_epoch(2)
 
-    def test_abandoned_epoch_scores_never_enter_the_trailing_window(self) -> None:
-        ledger = Ledger(window_size=3)
+    def test_abandoned_epoch_work_is_never_paid_by_a_later_epoch(self) -> None:
+        ledger = Ledger()
         epoch_id = ledger.begin_epoch(1)
         verified_work(ledger, epoch_id, "challenge", "hk", 1000)
         attest(ledger, epoch_id, "hk")
@@ -670,7 +758,7 @@ class TestAbandonCompletedEpoch:
         attest(ledger, next_epoch, "hk")
         scores = ledger.complete_epoch(next_epoch, {"hk"})
         # The abandoned epoch's 1000 verified work units contribute nothing:
-        # with no other published history, "hk" has zero prior credited work.
+        # scores read this epoch's work only, and this epoch has none.
         assert scores == {"hk": 0.0}
 
     def test_abandon_nonexistent_epoch_raises(self) -> None:

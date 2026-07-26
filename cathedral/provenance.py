@@ -191,18 +191,33 @@ def load_registry(
 # exactly what it recomputes. The signed evidence manifest carries the id.
 
 
-def _mechanism_validated_supply_v1(
+def _mechanism_validated_supply(
     positive: list[tuple[str, Decimal]],
 ) -> dict[str, float]:
-    """validated_supply_v1: verified miners share the external mass in
-    proportion to their receipt-verified work units.
+    """Verified miners share the external mass in proportion to their
+    receipt-verified work units.
 
-    This is byte-equivalent to the production pipeline (runtime score
-    normalization by max, then publisher normalization over the sum): the
-    max factor cancels, leaving units / sum(units). With equal units the
-    result is an equal split. The 10% forced-burn floor is NOT applied here;
-    it is applied at UID-mapping time from the signed vector's burn snapshot
-    and separately validated by the validated_supply_v1 vector contract.
+    The runtime scores one epoch's gated work units over that epoch's maximum
+    and exports those same units as ``verified_work_units``. The publisher
+    then normalizes the score vector over its sum, so the max factor cancels
+    and the wire shares are units / sum(units) over exactly the units this
+    function reads. That identity is what makes the published bundle
+    reproduce the on-chain allocation, and it holds only because scoring reads
+    no epoch but its own. With equal units the result is an equal split.
+
+    The 10% forced-burn floor is NOT applied here; it is applied at UID-mapping
+    time from the signed vector's burn snapshot and separately validated by the
+    vector contract.
+
+    This function is registered under both ids because the derivation it
+    performs is identical in v1 and v2. What changed between them is upstream,
+    in how ``Ledger.complete_epoch`` produces the units this reads: v1 summed a
+    trailing window of prior epochs into the score while exporting only
+    current-epoch units, so the published bundle could not reproduce the
+    on-chain allocation. v2 scores the current epoch alone, which restores the
+    identity above. The id is what pins that upstream difference, so historical
+    v1 evidence must keep verifying under v1 and must not be silently
+    reinterpreted as v2.
     """
     total = sum((units for _, units in positive), Decimal(0))
     if total <= 0:
@@ -210,8 +225,14 @@ def _mechanism_validated_supply_v1(
     return {hotkey: float(units / total) for hotkey, units in positive}
 
 
+# Both ids stay registered. v1 is retained so already-signed historical
+# evidence keeps verifying and replaying under this build, and so a validator
+# still pinned to v1 during a rollout is not cut off. New evidence is emitted
+# as v2; v1 is retired only once no live validator pins it and no historical
+# release needs reproducing.
 MECHANISMS: dict[str, Callable[[list[tuple[str, Decimal]]], dict[str, float]]] = {
-    "validated_supply_v1": _mechanism_validated_supply_v1,
+    "validated_supply_v1": _mechanism_validated_supply,
+    "validated_supply_v2": _mechanism_validated_supply,
 }
 
 # Production dispatch is on the exact (id, revision) PAIR: the manifest's
@@ -220,6 +241,7 @@ MECHANISMS: dict[str, Callable[[list[tuple[str, Decimal]]], dict[str, float]]] =
 # so an unsupported pair fails BEFORE any recomputation or fence reservation.
 MECHANISM_REVISIONS: dict[str, int] = {
     "validated_supply_v1": 1,
+    "validated_supply_v2": 1,
 }
 
 
@@ -411,7 +433,7 @@ def verify_and_recompute(
     expected_network: str,
     expected_netuid: int,
     expected_verifier_digest: str,
-    mechanism_id: str = "validated_supply_v1",
+    mechanism_id: str = "validated_supply_v2",
     mechanism_revision: int = 1,
     expected_previous_report_id: str | None = None,
     enforce_chain: bool = False,
@@ -701,14 +723,14 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # repeated floating-point normalization is part of the wire path.
 _FIXED_POLICY_ABS_TOL = 1e-12
 
-# The validated_supply_v1 burn contract (docs/BUDGET.md): a FIXED 10% burn to
+# The validated_supply_v2 burn contract (docs/BUDGET.md): a FIXED 10% burn to
 # the configured burn destination. The floor is part of the versioned
 # mechanism id; changing it requires a new mechanism version pinned
 # everywhere. The subnet validator enforces the same 10.0 exactly.
-VALIDATED_SUPPLY_V1_BURN_FRACTION = 0.10
-VALIDATED_SUPPLY_V1_BURN_PERCENTAGE = 10.0
-VALIDATED_SUPPLY_V1_TDX_ALLOCATION = 0.90
-VALIDATED_SUPPLY_V1_FIXED_BURN_ALLOCATION = 0.10
+VALIDATED_SUPPLY_V2_BURN_FRACTION = 0.10
+VALIDATED_SUPPLY_V2_BURN_PERCENTAGE = 10.0
+VALIDATED_SUPPLY_V2_TDX_ALLOCATION = 0.90
+VALIDATED_SUPPLY_V2_FIXED_BURN_ALLOCATION = 0.10
 VALIDATED_SUPPLY_CONTRACT_VERSION = "v2"
 CONFIDENTIAL_SOURCE = "cathedral_confidential_tdx"
 CONFIDENTIAL_SCORE_SOURCE = "confidential_primary:cathedral_confidential_tdx"
@@ -752,7 +774,7 @@ def compare_with_vector(
     wire_report_sha256: str | None = None,
     abs_tol: float = 1e-9,
 ) -> tuple[bool, list[str]]:
-    """Validate the signed vector's complete ``validated_supply_v1`` contract
+    """Validate the signed vector's complete ``validated_supply_v2`` contract
     against the REAL subnet wire shape and compare its confidential shares
     with the recomputation. Returns ``(agree, discrepancies)``.
 
@@ -782,12 +804,12 @@ def compare_with_vector(
     ``latest_body_sha256`` are BOTH REQUIRED and must match exactly. Same
     proportions NEVER prove the same epoch on their own.
     """
-    if result.mechanism_id != "validated_supply_v1" or result.mechanism_revision != 1:
+    if result.mechanism_id != "validated_supply_v2" or result.mechanism_revision != 1:
         return False, [
             (
                 f"unsupported mechanism pair ({result.mechanism_id!r}, revision="
                 f"{result.mechanism_revision!r}): this comparison validates the "
-                "(validated_supply_v1, revision=1) vector contract only"
+                "(validated_supply_v2, revision=1) vector contract only"
             )
         ]
     vector_rows = signed_vector.get("weights")
@@ -841,7 +863,7 @@ def compare_with_vector(
             return False, [
                 (
                     f"signed vector row for {hotkey!r} has base_component "
-                    f"{base!r}; under validated_supply_v1 the base share is "
+                    f"{base!r}; under validated_supply_v2 the base share is "
                     "exactly zero (confidential_primary rows only)"
                 )
             ]
@@ -858,7 +880,7 @@ def compare_with_vector(
         if external > 0.0:
             vector_ext[hotkey] = external
 
-    # The signed validated_supply_v1 burn snapshot: the REAL wire grammar.
+    # The signed validated_supply_v2 burn snapshot: the REAL wire grammar.
     burn_snapshot = signed_vector.get("burn_snapshot")
     if not isinstance(burn_snapshot, Mapping) or frozenset(burn_snapshot) != _BURN_SNAPSHOT_FIELDS:
         return False, [
@@ -870,7 +892,7 @@ def compare_with_vector(
     if burn_snapshot["burn_uid"] is not None:
         return False, [
             (
-                "signed vector burn_uid must be null: validated_supply_v1 "
+                "signed vector burn_uid must be null: validated_supply_v2 "
                 "resolves the burn destination by hotkey against the live "
                 "metagraph, and validators reject a pinned historical burn uid"
             )
@@ -885,28 +907,28 @@ def compare_with_vector(
         return False, ["signed vector forced_burn_percentage is not numeric"]
     if not math.isclose(
         float(percentage),
-        VALIDATED_SUPPLY_V1_BURN_PERCENTAGE,
+        VALIDATED_SUPPLY_V2_BURN_PERCENTAGE,
         rel_tol=0.0,
         abs_tol=_FIXED_POLICY_ABS_TOL,
     ):
         return False, [
             (
                 f"signed vector forced_burn_percentage {percentage!r} violates "
-                f"the fixed validated_supply_v1 floor "
-                f"{VALIDATED_SUPPLY_V1_BURN_PERCENTAGE:.1f} (signed for every "
+                f"the fixed validated_supply_v2 floor "
+                f"{VALIDATED_SUPPLY_V2_BURN_PERCENTAGE:.1f} (signed for every "
                 "epoch shape; a zero-supply epoch burns 100% because no "
                 "positive rows exist)"
             )
         ]
 
     # The signed launch-locked policy blocks, exactly as the subnet
-    # validator's validated_supply_v1 pin enforces them.
+    # validator's validated_supply_v2 pin enforces them.
     metadata = signed_vector.get("policy_metadata")
     if not isinstance(metadata, Mapping):
         return False, [
             (
                 "signed vector carries no policy_metadata; the "
-                "validated_supply_v1 contract requires the signed "
+                "validated_supply_v2 contract requires the signed "
                 "validated_supply, confidential_primary, and external_scores "
                 "policy blocks"
             )
@@ -930,13 +952,13 @@ def compare_with_vector(
         or fixed_burn_allocation is None
         or not math.isclose(
             tdx_allocation,
-            VALIDATED_SUPPLY_V1_TDX_ALLOCATION,
+            VALIDATED_SUPPLY_V2_TDX_ALLOCATION,
             rel_tol=0.0,
             abs_tol=_FIXED_POLICY_ABS_TOL,
         )
         or not math.isclose(
             fixed_burn_allocation,
-            VALIDATED_SUPPLY_V1_FIXED_BURN_ALLOCATION,
+            VALIDATED_SUPPLY_V2_FIXED_BURN_ALLOCATION,
             rel_tol=0.0,
             abs_tol=_FIXED_POLICY_ABS_TOL,
         )
@@ -967,7 +989,7 @@ def compare_with_vector(
         return False, [
             (
                 "signed vector policy_metadata.confidential_primary block is "
-                "missing; the validated_supply_v1 pin requires "
+                "missing; the validated_supply_v2 pin requires "
                 "confidential_primary evidence"
             )
         ]
@@ -1083,7 +1105,7 @@ def compare_with_vector(
         return False, [
             (
                 f"signed vector carries non-confidential base mass "
-                f"{total_base:.9f}; validated_supply_v1 pays only the "
+                f"{total_base:.9f}; validated_supply_v2 pays only the "
                 "verified confidential class plus the fixed burn"
             )
         ]

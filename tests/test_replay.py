@@ -390,7 +390,7 @@ def test_zero_positive_miners_never_full(tmp_path: Path):
         policy_release=1,
         policy_digest=SNAPSHOT.digest,
         verifier_digest="sha256:" + "d" * 64,
-        mechanism_id="validated_supply_v1",
+        mechanism_id="validated_supply_v2",
         source_epoch=11,
         generated_at="2026-07-24T00:00:00.000000Z",
         valid_until="2026-07-24T01:00:00.000000Z",

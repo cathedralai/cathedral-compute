@@ -304,7 +304,7 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
         source_epoch=11,
         epoch_id=1,
         generated_at=None,
-        mechanism_id="validated_supply_v1",
+        mechanism_id="validated_supply_v2",
         mechanism_revision=1,
         source_revision="abc1234",
         registry_release=1,
@@ -351,7 +351,7 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
         wire_report_sha256="6" * 64,
     )
     document = parse_manifest(manifest)
-    assert document["reward_mechanism"] == {"id": "validated_supply_v1", "revision": 1}
+    assert document["reward_mechanism"] == {"id": "validated_supply_v2", "revision": 1}
     assert document["attestations"][0]["disclosure"] == "controlled"
 
     mutated = json.loads(manifest)
@@ -492,7 +492,7 @@ def exported_evidence(tmp_path: Path, capsys):
             "--verifier-digest",
             VERIFIER_DIGEST,
             "--mechanism",
-            "validated_supply_v1",
+            "validated_supply_v2",
             "--source-revision",
             "abc1234",
             "--index-signing-key-id",
@@ -532,6 +532,10 @@ def _verify_cli_args(tmp_path: Path, evidence_dir: Path) -> list[str]:
         str(index_keys),
         "--verifier-digest",
         VERIFIER_DIGEST,
+        # Pinned explicitly: the CLI default still names the retired
+        # validated_supply_v1 id (see issue #64 follow-up).
+        "--mechanism",
+        "validated_supply_v2",
     ]
 
 
@@ -602,7 +606,7 @@ def test_cli_verify_fails_closed_on_index_tampering(tmp_path: Path, exported_evi
 def test_cli_verify_rejects_wrong_mechanism_pin(tmp_path: Path, exported_evidence, capsys):
     evidence_dir, _summary = exported_evidence
     code = cli_main(
-        _verify_cli_args(tmp_path, evidence_dir) + ["--mechanism", "validated_supply_v2"]
+        _verify_cli_args(tmp_path, evidence_dir) + ["--mechanism", "validated_supply_v99"]
     )
     capsys.readouterr()
     assert code == 1
@@ -928,7 +932,7 @@ def test_evidence_export_refuses_a_swapped_candidate_snapshot(
         "--verifier-digest",
         VERIFIER_DIGEST,
         "--mechanism",
-        "validated_supply_v1",
+        "validated_supply_v2",
         "--source-revision",
         "abc1234",
         "--index-signing-key-id",
@@ -1069,7 +1073,7 @@ def _export_evidence_args(
         "--verifier-digest",
         VERIFIER_DIGEST,
         "--mechanism",
-        "validated_supply_v1",
+        "validated_supply_v2",
         "--source-revision",
         "abc1234",
         "--index-signing-key-id",
@@ -1658,7 +1662,7 @@ def test_manifest_candidate_and_receipt_cardinality_boundaries():
             source_epoch=11,
             epoch_id=1,
             generated_at=None,
-            mechanism_id="validated_supply_v1",
+            mechanism_id="validated_supply_v2",
             mechanism_revision=1,
             source_revision="abc1234",
             registry_release=1,
@@ -1755,7 +1759,7 @@ def test_maximum_launch_manifest_fits_the_public_fetch_ceiling():
         source_epoch=11,
         epoch_id=1,
         generated_at=None,
-        mechanism_id="validated_supply_v1",
+        mechanism_id="validated_supply_v2",
         mechanism_revision=1,
         source_revision="a" * 64,
         registry_release=1,
@@ -1822,7 +1826,7 @@ def test_manifest_builder_rejects_escape_amplification_before_publication():
             source_epoch=11,
             epoch_id=1,
             generated_at=None,
-            mechanism_id="validated_supply_v1",
+            mechanism_id="validated_supply_v2",
             mechanism_revision=1,
             source_revision="abc1234",
             registry_release=1,
@@ -1934,7 +1938,7 @@ def _signed_wire_vector(
 ) -> bytes:
     """A publisher wire vector signed exactly as the thin validator (and
     _verify_wire_vector) expects — ed25519 over sorted compact JSON minus
-    ``signature`` — carrying the REAL validated_supply_v1 launch shape:
+    ``signature`` — carrying the REAL validated_supply_v2 launch shape:
     pre-burn confidential_primary rows, burn_uid null with the configured
     burn hotkey, fixed 10% burn, and the signed policy/ingest blocks."""
     positive = any(float(row.get("weight") or 0.0) > 0.0 for row in rows)
@@ -2331,7 +2335,7 @@ def test_manifest_carries_the_exact_frozen_mechanism_pair(tmp_path: Path, export
     the mechanism pair, and export refuses any unsupported revision."""
     evidence_dir, _summary = exported_evidence
     manifest = parse_manifest((evidence_dir / "epochs" / "11.json").read_bytes())
-    assert manifest["reward_mechanism"] == {"id": "validated_supply_v1", "revision": 1}
+    assert manifest["reward_mechanism"] == {"id": "validated_supply_v2", "revision": 1}
 
 
 def test_export_refuses_an_unsupported_mechanism_pair(tmp_path: Path, capsys):
