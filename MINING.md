@@ -241,6 +241,13 @@ The validator operator then checks:
 5. bounded work completes and its witness verifies; and
 6. the complete score report contains the correct explicit outcome.
 
+Production enrollment is additionally gated by a signed allowlist of
+approved coldkeys: the registry resolves your hotkey's owning coldkey and
+rejects the enrollment unless that coldkey has been approved, failing closed
+whenever the allowlist or the resolution is unavailable. See
+`docs/ENROLLMENT_ALLOWLIST.md` for the artifact format and operator
+workflow.
+
 ## 8. Know what success means
 
 Every gate must be current:

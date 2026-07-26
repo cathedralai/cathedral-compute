@@ -718,15 +718,27 @@ def test_json_provider_unreadable_file(tmp_path: Path) -> None:
 # Test 9: Production mode with file provider
 # ---------------------------------------------------------------------------
 
+class _AllowAllColdkeys:
+    """Stub approval gate: production mode now also requires a coldkey
+    allowlist (issue #56), and this test's subject is the registration file
+    provider, not approval."""
+
+    def is_allowed(self, coldkey: str) -> bool | None:
+        return True
+
+
 def test_production_mode_file_provider_allows_registered(tmp_path: Path) -> None:
     hk_file = tmp_path / "hotkeys.json"
-    hk_file.write_text(json.dumps([HOTKEY]))
+    # Extended snapshot: production enrollment resolves the owning coldkey
+    # from the same rotated file.
+    hk_file.write_text(json.dumps({"hotkeys": {HOTKEY: "5" + "K" * 47}}))
 
     provider = JsonHotkeyRegistrationProvider(str(hk_file), max_age_seconds=3600)
     app = RegistryApp(
         RegistryStore(str(tmp_path / "r.sqlite")),
         production_mode=True,
         registration_provider=provider,
+        coldkey_allowlist=_AllowAllColdkeys(),
     )
     status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="e0" * 16, endpoint_url="https://8.8.8.8:8090"))
     assert status == 200
