@@ -34,6 +34,7 @@ from cathedral.runtime import (
     SAT_WORK_POLICY_DIGEST,
     ConfidentialRuntime,
     MinerTarget,
+    MissingAuthError,
     RuntimeConfig,
     RuntimeError,
     _evidence_digest,
@@ -264,7 +265,11 @@ def _production_runtime(
     *,
     enrolled_token: str | None,
     monkeypatch,
+    extra_miners: tuple[tuple[str, str, str, str | None], ...] = (),
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
+    """A production runtime with one enrolled miner, plus any extra
+    (hotkey, endpoint, chip, token) miners. Tokens are served the way the CLI
+    serves them, from a static mapping, so an unprovisioned hotkey gets None."""
     registry = RegistryStore(str(tmp_path / "production-registry.sqlite"))
     registry.enroll("miner", "https://1.1.1.1:9001")
     ledger = Ledger(tmp_path / "production-ledger.sqlite")
@@ -272,6 +277,11 @@ def _production_runtime(
         "https://8.8.8.8:9000": MinerSpec("canary-chip"),
         "https://1.1.1.1:9001": MinerSpec("miner-chip"),
     }
+    tokens: dict[str, str | None] = {"miner": enrolled_token}
+    for hotkey, endpoint, chip, token in extra_miners:
+        registry.enroll(hotkey, endpoint)
+        specs[endpoint] = MinerSpec(chip)
+        tokens[hotkey] = token
     factory = FakeFactory(specs)
     policy = production_policy()
     monkeypatch.setattr(runtime_module, "verify", verifier)
@@ -280,7 +290,7 @@ def _production_runtime(
         registry,
         ledger,
         policy,
-        token_provider=lambda _hotkey: enrolled_token,
+        token_provider=tokens.get,
         policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
@@ -304,7 +314,9 @@ def test_production_missing_canary_token_fails_before_network_or_epoch(
         tmp_path, enrolled_token="miner-token", monkeypatch=monkeypatch
     )
     canary = MinerTarget("canary", "https://8.8.8.8:9000")
-    with pytest.raises(ValueError, match="bearer token"):
+    # Unlike a miner, the operator-run canary keeps its hard failure: the whole
+    # epoch aborts before any network activity or ledger row.
+    with pytest.raises(MissingAuthError, match="bearer token"):
         runtime.run_epoch(1, canary)
     assert factory.log == {}
     assert ledger.blocking_epoch() is None
@@ -464,18 +476,81 @@ def test_recovery_runtime_cannot_be_reused_for_admission(tmp_path: Path) -> None
         runtime.check_canary(MinerTarget("canary", "https://8.8.8.8", "token"))
 
 
-def test_production_missing_enrollment_token_fails_before_network_or_epoch(
+def test_production_missing_enrollment_token_fails_only_that_miner(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Enrollment is self-service, so a hotkey can be enrolled before an
+    operator provisions its token. That miner must fail alone; it must not
+    abort the epoch and stall every published weight."""
     runtime, ledger, factory = _production_runtime(
-        tmp_path, enrolled_token=None, monkeypatch=monkeypatch
+        tmp_path,
+        enrolled_token="miner-token",
+        monkeypatch=monkeypatch,
+        extra_miners=(("tokenless", "https://9.9.9.9:9002", "tokenless-chip", None),),
+    )
+    cancelled: list[str] = []
+    original_cancel = runtime.reattestor.cancel
+
+    def record_cancel(hotkey: str) -> bool:
+        cancelled.append(hotkey)
+        return original_cancel(hotkey)
+
+    monkeypatch.setattr(runtime.reattestor, "cancel", record_cancel)
+    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+
+    run = runtime.run_epoch(1, canary)
+
+    assert run.status == "complete"
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["tokenless"].status == "missing_auth"
+    assert outcomes["tokenless"].admitted is False
+    assert outcomes["miner"].status == "verified"
+    # The tokenless miner is never contacted, but the healthy one still is.
+    assert "nonce:tokenless" not in factory.log
+    assert "nonce:miner" in factory.log
+    # An explicit zero through complete_epoch's all_hotkeys universe, not an
+    # absent row that a downstream consumer has to infer.
+    assert run.scores["miner"] == 1.0
+    assert run.scores["tokenless"] == 0.0
+    assert outcomes["tokenless"].score == 0.0
+    frozen = json.loads(ledger.get_epoch(run.epoch_id)["report_body"])
+    assert {"miner_hotkey": "tokenless", "score": 0.0} in frozen["scores"]
+    # Nothing can authenticate to it this cycle, so its re-attestation is dropped.
+    assert "tokenless" in cancelled
+
+
+def test_production_malformed_enrollment_token_is_reported_as_missing_auth(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A malformed token is an auth fault, not a bad endpoint."""
+    runtime, _, _ = _production_runtime(
+        tmp_path,
+        enrolled_token="miner-token",
+        monkeypatch=monkeypatch,
+        extra_miners=(("malformed", "https://9.9.9.9:9002", "malformed-chip", "bad token"),),
     )
     canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
-    with pytest.raises(RuntimeError, match="authentication is required"):
-        runtime.run_epoch(1, canary)
-    assert factory.log == {}
-    assert ledger.blocking_epoch() is None
+
+    run = runtime.run_epoch(1, canary)
+
+    assert run.status == "complete"
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["malformed"].status == "missing_auth"
+    assert run.scores["malformed"] == 0.0
+
+
+def test_non_production_epoch_requires_no_tokens(tmp_path: Path) -> None:
+    """Outside production a target with no token attests and scores as usual."""
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, _, _ = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
+
+    run = runtime.run_epoch(1, CANARY)
+
+    assert run.status == "complete"
+    assert {outcome.status for outcome in run.outcomes} == {"verified"}
+    assert run.scores["miner"] == 1.0
 
 
 def test_production_authenticated_targets_complete(tmp_path: Path, monkeypatch) -> None:

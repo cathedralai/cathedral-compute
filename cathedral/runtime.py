@@ -71,6 +71,16 @@ class RuntimeError(Exception):
     """Raised when a confidential runtime invariant fails."""
 
 
+class MissingAuthError(ValueError):
+    """Raised when a target's bearer token is absent or malformed.
+
+    A ValueError subclass so every existing caller that treats a bad token as
+    input validation keeps working; the distinct type is what lets
+    ``_prepare_targets`` report a miner's missing auth as its own outcome
+    status instead of folding it into ``invalid_endpoint``.
+    """
+
+
 class MinerClient(Protocol):
     def collect_evidence(self, nonce: bytes) -> Evidence: ...
 
@@ -584,6 +594,12 @@ class ConfidentialRuntime:
         self._active_source_epoch = int(source_epoch)
         self._active_challenge_anchor = self._config_challenge_anchor()
         self._require_live_gpu_profile()
+        # The canary is operator-run and is the epoch's control: a missing or
+        # malformed canary token raises MissingAuthError here, before any
+        # network activity or ledger row, and hard-fails the whole epoch. Miner
+        # tokens are deliberately NOT checked up front; they degrade to a
+        # per-miner missing_auth outcome in _prepare_targets so one
+        # unprovisioned enrollment cannot stall every published weight.
         canary_target, canary_endpoint = self._validate_target(canary)
 
         lifecycle_measurements = self.policy.allowed_measurements
@@ -635,7 +651,6 @@ class ConfidentialRuntime:
                     self.token_provider(enrollment.hotkey),
                 )
             )
-        self._validate_required_auth((canary_target, *targets))
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
         outcomes = {**lifecycle_outcomes, **outcomes}
         if canary_endpoint in enrolled_endpoints:
@@ -826,6 +841,20 @@ class ConfidentialRuntime:
         for target in targets:
             try:
                 checked, endpoint = self._validate_target(target)
+            except MissingAuthError as exc:
+                # An unprovisioned or malformed token is one miner's problem, not
+                # the epoch's: enrollment is self-service, so any hotkey can enroll
+                # before an operator provisions its token. It gets its own status
+                # so the ledger and published transcripts do not misreport missing
+                # auth as a bad endpoint.
+                outcomes[target.hotkey] = MinerOutcome(
+                    target.hotkey, target.endpoint_url, "missing_auth", error=str(exc)
+                )
+                # Nothing can authenticate to this miner this cycle, so a pending
+                # re-attestation would only burn attempts against a request the
+                # miner must reject. Same reasoning as the lifecycle skip path.
+                self.reattestor.cancel(target.hotkey)
+                continue
             except (TypeError, ValueError, RuntimeError) as exc:
                 outcomes[target.hotkey] = MinerOutcome(
                     target.hotkey, target.endpoint_url, "invalid_endpoint", error=str(exc)
@@ -1636,17 +1665,6 @@ class ConfidentialRuntime:
         endpoint = _canonical_endpoint(target.endpoint_url, self.config)
         return target, endpoint
 
-    def _validate_required_auth(self, targets: tuple[MinerTarget, ...]) -> None:
-        if not self.config.production_mode:
-            return
-        for target in targets:
-            try:
-                _validate_bearer_token(target.bearer_token, required=True)
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"production bearer authentication is required for target {target.hotkey!r}"
-                ) from exc
-
 
 def _work_assurance(
     attested: Attested,
@@ -1799,7 +1817,7 @@ def _validate_bearer_token(token: str | None, *, required: bool) -> None:
         or len(token) > MAX_BEARER_TOKEN_LENGTH
         or any(ord(character) < 0x21 or ord(character) > 0x7E for character in token)
     ):
-        raise ValueError("bearer token must be a nonempty bounded ASCII value")
+        raise MissingAuthError("bearer token must be a nonempty bounded ASCII value")
 
 
 def _preflight_evidence_retention(directory: str | None) -> None:
