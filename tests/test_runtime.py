@@ -30,6 +30,7 @@ from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptIssuer, verify_receipt
+from cathedral.remote import RemoteError
 from cathedral.runtime import (
     SAT_WORK_POLICY_DIGEST,
     ConfidentialRuntime,
@@ -1025,6 +1026,47 @@ def test_invalid_miner_is_zero_while_peer_succeeds(tmp_path: Path) -> None:
         "bad": "attestation_failed",
         "good": "verified",
     }
+
+
+def test_worker_503_is_categorised_apart_from_a_broken_miner(tmp_path: Path) -> None:
+    """A worker refusing requests looks like denial, not like bad evidence."""
+    specs = default_specs(
+        **{
+            "9001": MinerSpec("refusing"),
+            "9002": MinerSpec("broken"),
+        }
+    )
+    runtime, _, _ = make_runtime(
+        tmp_path,
+        [("refused", "http://127.0.0.1:9001"), ("broken", "http://127.0.0.1:9002")],
+        specs,
+    )
+
+    failures = {
+        "refused": RemoteError("worker returned HTTP 503"),
+        "broken": RemoteError("evidence response has invalid quote or kind"),
+    }
+    inner = runtime.remote_factory
+
+    def failing_factory(endpoint: str, hotkey: str, **kwargs: object):
+        client = inner(endpoint, hotkey, **kwargs)
+        failure = failures.get(hotkey)
+        if failure is not None:
+
+            def refuse(_nonce: bytes) -> Evidence:
+                raise failure
+
+            client.collect_evidence = refuse
+        return client
+
+    runtime.remote_factory = failing_factory
+    run = runtime.run_epoch(1, CANARY)
+
+    categories = {outcome.hotkey: outcome.error_category for outcome in run.outcomes}
+    statuses = {outcome.hotkey: outcome.status for outcome in run.outcomes}
+    assert statuses["refused"] == statuses["broken"] == "attestation_failed"
+    assert categories["refused"] == "worker_http_503"
+    assert categories["broken"] == "attestation_error"
 
 
 def test_retries_use_fresh_evidence_nonce_and_same_sat_challenge(tmp_path: Path) -> None:
