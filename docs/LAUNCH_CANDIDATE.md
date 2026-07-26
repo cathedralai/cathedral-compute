@@ -1,5 +1,11 @@
 # SN39 launch-candidate status and evidence matrix (2026-07-24)
 
+> **Dated implementation checkpoint.** This matrix records what was known on
+> 2026-07-24 and is preserved for audit history. Some deployment facts changed
+> afterward. It is not the current onboarding or launch-status page. Use
+> [`../BUILD_STATUS.md`](../BUILD_STATUS.md), then verify the live signed
+> vector and evidence index directly.
+
 Claim under proof: **"SN39 mainnet: validated Intel TDX CPU compute."**
 Nothing broader. This file states exactly what is PROVEN locally, what is
 implemented-but-unproven, and what is NOT PROVEN, per launch item.

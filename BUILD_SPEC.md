@@ -1,5 +1,10 @@
 # BUILD_SPEC — Cathedral testable core
 
+> **Historical implementation brief.** The repository has moved beyond this
+> frozen, standard-library-only mock-core plan. This file is retained for
+> provenance and must not be used as the current architecture, dependency,
+> security, or task-ownership contract.
+
 This spec hands five modules to five implement agents. The interfaces
 (`cathedral/lanes/__init__.py`, `cathedral/lanes/sat_types.py`) and the pytest
 suite under `tests/` are **frozen contracts** — implementers satisfy them and

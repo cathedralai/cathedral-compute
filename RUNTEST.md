@@ -1,11 +1,10 @@
-# RUNTEST — Cathedral testable core
+# RUNTEST — Cathedral test suite
 
-Hardware-free, stdlib-only. The only third-party dependency is `pytest` (dev).
-No network, no TEE, no hardware: attestation is **mocked** behind the real
-`verify()` interface (see `cathedral/verify/mock.py` and `docs/DESIGN.md §6`).
-This service publishes a signed score stream. The existing Cathedral validator
-owns metagraph mapping and on-chain weight submission, so this core has no
-direct Bittensor SDK dependency.
+The default suite is hardware-free and uses test doubles behind the real
+`verify()` interface. The package has runtime dependencies declared in
+`pyproject.toml`; `pytest` and other tooling are installed through the `dev`
+extra. A green local suite proves software behavior, not live TDX hardware,
+deployment, current evidence freshness, miner eligibility, or chain state.
 
 ## 1. Create the venv and install
 
@@ -19,7 +18,8 @@ python3.11 -m venv .venv
 ```
 
 `-e '.[dev]'` puts `cathedral` on the path (so `scripts/` and console entry
-points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
+points import cleanly), installs the runtime dependencies declared in
+`pyproject.toml`, and pulls in the development tools.
 
 ## 2. Run the test suite
 

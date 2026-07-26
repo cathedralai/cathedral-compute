@@ -3,9 +3,11 @@
 How Intel TDX measurements are approved, pinned, verified, and rolled
 back for the claim **"SN39 mainnet: validated Intel TDX CPU compute."**
 
-> **Status honesty.** The policy machinery below is implemented and
-> adversarially tested locally. No production MRTD allowlist entry is
-> live proof until the deploy gates in `docs/LAUNCH_CANDIDATE.md` pass.
+> **Status honesty.** The policy machinery is implemented, adversarially tested,
+> and has been exercised in a historical live-hardware acceptance run. A
+> policy entry or old receipt is not proof of current eligibility. Verify the
+> current signed registry, freshness, revocation state, and supported release;
+> otherwise report `NOT_PROVEN`.
 
 ## Policy source of truth
 

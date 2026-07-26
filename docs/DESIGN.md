@@ -2,21 +2,22 @@
 
 **A confidential compute subnet that directs attested hardware at verifiable work.**
 
-Status: founding design for Cathedral's confidential-compute architecture. This
-document is design and direction. For what is currently live, see
-[`BUILD_STATUS.md`](../BUILD_STATUS.md): the proven path today is Intel TDX CPU
-workers with deterministic validator-dispatched audit work. Mainnet SN39 chain
-submission is live; testnet SN292 remains the non-paying dry-run integration
-lane. The products, lanes, and hardware classes below beyond that are planned
-direction, not current launch evidence.
+Status: founding design and roadmap for Cathedral's confidential-compute
+architecture. It is not a capability matrix or onboarding guide. For current
+evidence, see [`BUILD_STATUS.md`](../BUILD_STATUS.md). The narrow proven path is
+Intel TDX CPU with validator-dispatched bounded work, including a historical
+SN39 chain-acceptance test. Cathedral remains in mainnet live testing; SN292 is
+non-paying. GPU, SNP, rental, lane, and customer-CVM material below is planned
+direction unless the current status document explicitly promotes it.
 
 ---
 
 ## 1. Thesis
 
-Cathedral runs on Bittensor mainnet SN39. Its admission rule is hardware
-attestation and its currency is verified work. Mainnet chain submission is
-live; SN292 provides the corresponding non-paying integration path.
+Cathedral targets Bittensor mainnet SN39. Its admission rule is hardware
+attestation and its currency is verified work. Limited SN39 acceptance writes
+have succeeded; general launch remains a separate gate. SN292 provides the
+corresponding non-paying integration path.
 
 Two sentences hold the whole design:
 

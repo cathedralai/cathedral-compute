@@ -1,155 +1,159 @@
-# Cathedral
+# Cathedral Confidential
 
-**Confidential compute for Bittensor. Attestation is admission. Verified work is the score.**
+**Intel TDX evidence and verified-work scoring for Cathedral SN39.**
 
-Cathedral is a standalone confidential-compute mechanism. Independently
-operated Intel TDX machines prove, cryptographically, that they run inside a
-genuine Trusted Execution Environment. That attestation admits a worker. It
-never pays. Emissions come only from work the validator dispatches, verifies,
-and scores itself. Missing, stale, failed, or revoked work receives an explicit
-zero.
+This repository is the confidential-compute supply side of Cathedral:
 
-Cathedral owns its complete score vector. It does not share emissions with a
-second scoring mechanism.
+- a worker produces fresh, vendor-backed Intel TDX evidence;
+- Cathedral verifies the evidence, worker identity, and measured policy;
+- the validator dispatches bounded work and verifies the result;
+- a signed, complete score report gives every candidate either verified credit
+  or an explicit zero; and
+- an independent SN39 validator checks the report before deciding whether to
+  set weights.
 
-- **Production:** Bittensor mainnet SN39. The confidential validator is live and
-  submits the complete compute vector on chain.
-- **Testing:** Bittensor testnet SN292. It remains the non-paying integration
-  lane for proving worker setup, attestation, work, scoring, and UID mapping.
+Attestation is admission, not payment. Registration, uptime, a valid quote, or
+self-reported volume alone never earns weight.
 
-SN39 currently has one worker admitted by fresh Intel TDX evidence and
-validator-dispatched verified work. The launch mechanism assigns 90% to
-validated TDX supply and forces 10% to the burn destination. This is a narrow
-Intel TDX CPU launch claim, not a general confidential-compute or GPU claim.
-See [`BUILD_STATUS.md`](BUILD_STATUS.md) for the exact chain evidence and
-remaining assurance boundary.
+> **Status: mainnet live testing**
+>
+> Cathedral has recorded a historical SN39 submission containing positively
+> scored Intel TDX work. That is a limited chain-acceptance milestone, not a
+> claim that a miner is positive now or that the subnet is generally launched.
+> Miner onboarding remains operator-assisted, the final public validator
+> release has separate gates, and testnet SN292 remains non-paying.
 
-## Start Mining
+For current state, inspect the live
+[signed vector](https://api.cathedral.computer/v1/validator/weights/next) and
+[public evidence index](https://api.cathedral.computer/v1/evidence/index.json).
+A reachable endpoint or historical receipt does not prove current freshness or
+eligibility. Zero positive miners and a burn-only vector are valid fail-closed
+outcomes.
 
-The current miner path is an operator-assisted Intel TDX beta. Register on
-mainnet SN39 to compete for live emissions, or use testnet SN292 to prove the
-same setup without emissions. Follow **[Mining Cathedral](MINING.md)** for
-hardware requirements, hotkey registration, worker setup, a real-quote smoke
-test, enrollment, acceptance signals, and troubleshooting.
+## Choose your path
 
-```bash
-cathedral worker serve --help
-```
-
-## How It Works
-
-1. A worker enrolls a registered hotkey and an authenticated worker endpoint.
-2. Cathedral issues a fresh nonce and verifies the worker's Intel TDX quote:
-   measurement, TCB, platform policy, and hotkey binding.
-3. Attestation grants admission only. A worker with no verified work earns zero.
-4. Cathedral dispatches deterministic audit work, verifies delivery, and derives
-   the credit itself. Workers never declare their own score.
-5. Cathedral freezes and signs one complete compute vector per epoch, including
-   explicit zeros that revoke stale credit.
-6. A dedicated Cathedral validator verifies the signed vector, requires every
-   hotkey to map exactly once to the current metagraph, and submits weights.
-
-## What Is Proven Today
-
-- Real Intel TDX quote collection and external DCAP / Trust Authority
-  verification on live hardware, with fresh 8000-byte quotes.
-- Fresh-nonce, measurement, TCB, and platform policy enforced at admission.
-- Deterministic validator-dispatched audit work as the scored workload:
-  60-second epochs, 20 validator-derived work units, score 1.0.
-- Durable bounded satisfiable SAT jobs with idempotent submission, atomic
-  claim/lease/result transitions, authenticated channel-bound worker dispatch,
-  negotiated worker capability, fixed validator-derived credit, queue/storage
-  quotas, and resource-isolated noncanonical solves.
-- A signed, complete compute vector with explicit zeros for missing, failed,
-  stale, and revoked workers.
-- On testnet SN292, a dedicated Cathedral validator maps the proven worker
-  hotkey to UID 41 and computes UID 41 = 1.0 in a dry run.
-- On mainnet SN39, validator UID 30 submitted the validated-supply launch
-  vector in extrinsic
-  `0x4ef1307460f6bcdf3acc17dc7a1070f0918cf1080d74fb9409897353fe6cb371`
-  at block 8694350. The historical chain row contains exactly worker UID 163
-  and burn UID 204 in the mechanism's 90/10 split.
-- The positive worker's controlled raw Intel TDX evidence replays through the
-  pinned verifier. Whole-epoch FULL provenance remains `NOT_PROVEN` because
-  zero-scored candidates do not yet carry candidate-specific replayable
-  negative evidence.
-
-Mainnet chain broadcast is live. Testnet SN292 remains dry-run and does not pay
-token emissions.
-
-## Roadmap
-
-Current CPU workload foundation:
-
-- Bounded satisfiable SAT jobs route through the same verified CPU worker path as
-  canonical audit work. See [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md#customer-cpu-job-routing).
-
-Future product direction, not yet scored on chain:
-
-- General customer containers, long-running agents, inference, and evaluation
-  as scored workloads.
-- Confidential GPU workloads (NVIDIA H100/H200 in CC mode) now have a
-  fail-closed, hardware-free composite-attestation foundation. Live hardware
-  acceptance and scoring remain disabled; B200-class remains later work.
-- AMD SEV-SNP as a second CPU platform. Quote parsing and cryptographic
-  verification exist in-repo; runtime scoring is not yet enabled.
-
-## Hardware
-
-| Hardware | Status |
+| Role | Start here |
 |---|---|
-| Intel TDX CPU | Proven launch path |
-| AMD SEV-SNP CPU | Planned second platform (crypto exists, scoring not enabled) |
-| NVIDIA H100/H200 CC | Audit-only foundation; live acceptance pending |
-| NVIDIA B200-class | Planned |
+| Cathedral Computer customer | [Product and API documentation](https://cathedral.computer/docs/) |
+| Intel TDX compute provider | [Operator-assisted mining guide](MINING.md) |
+| SN39 validator | [Validator guide](https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md) |
+| Independent auditor | [Public provenance contract](docs/PROVENANCE.md) |
+| Protocol developer | [Design and current boundaries](docs/DESIGN.md) |
 
-Attestation grants admission. Emissions come from verified delivery. Validators
-never require SSH or remote root access to miner machines.
+## What is supported
 
-## Validating
+| Capability | Current status |
+|---|---|
+| Intel TDX CPU evidence collection and strict verification | Proven on live hardware |
+| Fresh challenge, worker, channel, measurement, and policy binding | Implemented |
+| Validator-dispatched bounded SAT work | Current scored-work path |
+| Complete signed score reports with explicit zero revocation | Implemented |
+| Public evidence index | Deployed; current vector/verifier contract comparison is `FAIL` pending v1/v2 convergence |
+| Mainnet SN39 | Live testing; historical chain acceptance exists |
+| Testnet SN292 | Non-paying integration lane |
+| Self-service miner enrollment | Not deployed |
+| Production HTTPS onboarding for arbitrary miners | Not yet self-service |
+| AMD SEV-SNP scoring | Not enabled |
+| NVIDIA confidential-GPU subnet scoring | Not admitted |
+| General customer containers or CVMs through this repository | Not live |
 
-The dedicated Cathedral validator consumes the signed compute vector. It
-verifies signature and freshness, requires a complete hotkey-to-UID mapping,
-rejects identity conflicts, and fails closed. It submits the resulting weight
-vector only when its hotkey is registered and chain broadcast is enabled.
+Cathedral Computer may expose separate GPU preview profiles. Those customer
+profiles do not imply that a GPU miner is admitted or rewarded by this subnet.
+
+## How scoring works
+
+1. Cathedral derives a fresh challenge from finalized SN39 chain state and the
+   candidate hotkey.
+2. The worker returns an Intel TDX quote bound to that challenge, hotkey, and
+   protected channel.
+3. The verifier checks vendor collateral, TCB status, measurement policy,
+   debug state, freshness, and binding.
+4. Cathedral dispatches bounded work only after admission.
+5. The validator verifies the returned witness and derives work units from the
+   task itself, never from a miner's claimed score.
+6. The producer freezes and signs a complete epoch report, including explicit
+   zero rows for missing, stale, failed, or revoked candidates.
+7. The SN39 validator verifies the report and independently maps public hotkeys
+   to UIDs before any chain decision.
+
+The current reward mechanism is versioned as `validated_supply_v1`. Its burn
+contract and class allocation are policy inputs verified by validators, not
+miner-controlled fields.
+
+## Trust boundary
+
+Attestation proves that vendor-backed evidence matched an approved measured
+environment and policy. It does not by itself prove application correctness,
+every output, or confidentiality outside the measured boundary. Cathedral
+separately verifies each supported workload result.
+
+Public provenance includes commitments, signed registries, receipts, reports,
+candidate sets, and digests. Raw TDX quotes are shared only through controlled
+disclosure because they can carry platform-identifying material. A validator
+without the controlled package can audit the public receipt chain, but must
+report that narrower result as `NOT_PROVEN`, not `FULL`.
+
+## Provider safety
+
+- Never share wallet seeds, coldkey or hotkey private keys, bearer tokens, TLS
+  private keys, cloud credentials, or SSH credentials.
+- A public beta issue may contain the public hotkey, preferred network,
+  current or intended Intel TDX hardware class, provider and broad region, and
+  an optional public contact handle—never an IP, instance identifier, or
+  credential.
+- Plain HTTP with `--development-allow-non-loopback` is a development
+  exception, not the production security boundary and not a mainnet onboarding
+  recipe.
+- Production evidence uses credential-free collection over HTTPS with the TLS
+  key terminating inside the measured environment; authenticated work follows
+  only after channel verification.
+- Positive weight and emissions are never guaranteed.
+
+Read [MINING.md](MINING.md) before exposing a worker.
+
+## Run the hardware-free suite
+
+Requires Python 3.11 or newer:
 
 ```bash
-cathedral runtime --help
-```
+git clone https://github.com/cathedralai/cathedralconfidential.git
+cd cathedralconfidential
 
-## Run Locally
-
-Hardware-free core. Requires Python 3.11+.
-
-```bash
-python -m venv .venv
+python3.11 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[dev]'
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The hardware-free suite exercises TDX policy verification, signed enrollment,
-authenticated workers, deterministic audit work, validator-derived accounting,
-complete score reports, and zero revocation. Attestation crypto is mocked behind
-the real `verify()` interface; the real Intel TDX path runs on hardware (see
-[`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md)).
+The default suite uses test doubles behind the real verifier interface. Passing
+it proves software behavior, not live Intel hardware, deployment, a current
+eligible miner, or an on-chain write.
 
 ## Documentation
 
-- [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical mainnet and testnet launch evidence
-- [`MINING.md`](MINING.md) - step-by-step miner onboarding
-- [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
-- [`docs/ASSURANCE.md`](docs/ASSURANCE.md) - four independent assurance claims
-- [`docs/POLICY_REGISTRY.md`](docs/POLICY_REGISTRY.md) - signed measurement policy and lifecycle
-- [`docs/RECEIPTS.md`](docs/RECEIPTS.md) - durable signed assurance receipts and offline verification
-- [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md) - continuous re-attestation, worker states, and retry behavior
-- [`docs/WORKLOAD_ADMISSION.md`](docs/WORKLOAD_ADMISSION.md) - immutable signed workload admission contract
-- [`docs/KEY_RELEASE.md`](docs/KEY_RELEASE.md) - attestation-gated encrypted data-key release contract
-- [`docs/GPU_ATTESTATION.md`](docs/GPU_ATTESTATION.md) - composite TDX plus confidential-GPU evidence and rollout gates
-- [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
-- [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
-- [`RUNTEST.md`](RUNTEST.md) - test commands
+### Current operator and assurance documents
 
-## License
+- [Build and evidence status](BUILD_STATUS.md)
+- [Mining and provider onboarding](MINING.md)
+- [Assurance claims](docs/ASSURANCE.md)
+- [Intel TDX launch path](docs/TDX_LAUNCH.md)
+- [Public and controlled provenance](docs/PROVENANCE.md)
+- [Policy registry](docs/POLICY_REGISTRY.md)
+- [Receipts](docs/RECEIPTS.md)
+- [Worker lifecycle](docs/LIFECYCLE.md)
+- [Workload admission](docs/WORKLOAD_ADMISSION.md)
 
-MIT
+### Design and future capability
+
+- [Architecture and roadmap](docs/DESIGN.md)
+- [GPU attestation foundation](docs/GPU_ATTESTATION.md)
+- [Key-release design](docs/KEY_RELEASE.md)
+
+Design documents describe intended capability, not deployed availability.
+Historical handoffs and dated launch-candidate records must not be used as
+current onboarding instructions.
+
+## Licensing
+
+See [LICENSE](LICENSE).

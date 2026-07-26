@@ -5,13 +5,26 @@ compute."** Nothing broader. This document describes how ANY third party
 reproduces a scoring decision from public, signed, content-addressed
 evidence — and exactly what each outcome means.
 
-> **Status honesty.** Everything below is implemented and adversarially
-> tested locally (see `docs/LAUNCH_CANDIDATE.md` for the exact matrix).
-> Locally green code is NOT live proof: the live evidence surface, key
-> bundle, and real-ELF replay remain NOT PROVEN until the deploy gates
-> pass independent review.
+> **Status honesty.** The public evidence surface is now deployed. That proves
+> availability, not freshness or `FULL` assurance. The complete immutable
+> public pin bundle, controlled positive package, real-ELF replay on the
+> supported release, and clean outside-operator reproduction remain launch
+> gates. Locally green code and a signed receipt chain are not substitutes.
 
-## One-command clean reproduction
+> **Current compatibility: `FAIL` (audited 2026-07-25).** The deployed signed
+> vector currently advertises contract v1 and `verified_gpu_allocation`, and
+> does not carry `external_scores.latest_body_sha256`. This verifier requires
+> the v2 `fixed_burn_allocation` contract and exact body binding. Therefore the
+> current public vector cannot pass this repository's end-to-end comparison.
+> Publisher, validator, verifier, and release pins must converge before
+> independent reproduction can be claimed.
+
+## Reproduction contract
+
+The command below becomes independently runnable only when the supported
+release notes replace every placeholder with immutable artifacts and digests.
+Until then it is the exact contract the release must satisfy, not a public
+one-command quick start.
 
 From a clean machine (fresh venv, no Cathedral infrastructure access):
 
@@ -40,8 +53,8 @@ cathedral provenance verify \
 
 Every pin (key digests, verifier implementation digest, source revision)
 comes from the release notes — never from anything the evidence surface
-serves. The key bundle does not exist until deploy; its digests cannot be
-pinned here yet (`docs/LAUNCH_CANDIDATE.md`, NOT PROVEN item 5).
+serves. If the release notes do not publish every required pin, stop with
+`NOT_PROVEN`; never copy a missing trust root from the service being verified.
 
 ## What FULL verifies
 
@@ -124,4 +137,5 @@ stable errno codes without filesystem paths or usernames.
 
 - `docs/MRTD.md` — measurement/TCB policy, approval, rollback.
 - `docs/BUDGET.md` — fixed spend and burn controls, security exceptions.
-- `docs/LAUNCH_CANDIDATE.md` — the authoritative PROVEN/NOT-PROVEN matrix.
+- `docs/LAUNCH_CANDIDATE.md` — dated 2026-07-24 implementation checkpoint.
+- `BUILD_STATUS.md` — current public status and historical acceptance boundary.

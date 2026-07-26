@@ -1,16 +1,41 @@
-# Build Status
+# Build and evidence status
 
-Last verified: 2026-07-24
+Evidence record last updated: 2026-07-24
 
-**Mainnet SN39 chain submission is live.** Testnet SN292 remains the non-paying
-dry-run integration lane.
+Documentation and public-surface audit: 2026-07-25
 
-## Working now
+> **Public phase: mainnet live testing.**
+>
+> This file records implementation evidence and historical acceptance tests. It
+> is not a live leaderboard and does not prove that a miner is currently
+> eligible. The first positive Intel TDX vector reached SN39 historically, but
+> the supported tagged validator release, outside reproduction, and
+> self-service provider path remain separate launch gates.
 
-- Confidential compute owns 100% of the score vector. There is no shared scorer,
-  reserved share, or second scoring mechanism.
-- The worker serves authenticated `POST /v1/evidence` and `POST /v1/sat-work`
-  endpoints and returns real Intel TDX hardware quotes (8000-byte quotes with
+Current state must be checked through the live
+[signed vector](https://api.cathedral.computer/v1/validator/weights/next) and
+[evidence index](https://api.cathedral.computer/v1/evidence/index.json), then
+verified for signature, freshness, policy, and provenance. A report with no
+positive entries must resolve fail-closed; it must not inherit this document's
+historical positive worker.
+
+**Current public contract comparison: `FAIL` (2026-07-25 audit).** The deployed
+vector advertises the v1 validated-supply shape, including
+`verified_gpu_allocation`, and omits `external_scores.latest_body_sha256`; the
+current verifier requires the v2 `fixed_burn_allocation` and exact body binding.
+The publisher, validator, verifier, and immutable release must converge before
+the public path can claim independent end-to-end reproduction.
+
+Testnet SN292 remains the non-paying dry-run integration lane.
+
+## Implemented and historically proven
+
+- Cathedral Confidential is the primary verified-supply score source under
+  `validated_supply_v1`. The validator independently enforces the versioned
+  burn contract; miners cannot choose the allocation.
+- The worker serves credential-free, bounded `POST /v1/evidence` collection
+  and authenticated `POST /v1/sat-work`. It returns real Intel TDX hardware
+  quotes (8000-byte quotes in the recorded hardware run, with
   `intel_verified=true` and `report_data_match=true`).
 - The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
   hotkey binding, runs deterministic validator-dispatched audit work, derives
@@ -18,17 +43,17 @@ dry-run integration lane.
 - On testnet SN292, a dedicated thin validator repeatedly accepted fresh signed
   vectors, mapped the proven worker hotkey to UID 41, and computed dry-run
   UID41 = 1.0.
-- On mainnet SN39, validator UID 30 submitted the current validated-supply
-  launch vector in extrinsic
+- On mainnet SN39, validator UID 30 submitted a historical validated-supply
+  acceptance vector in extrinsic
   `0x4ef1307460f6bcdf3acc17dc7a1070f0918cf1080d74fb9409897353fe6cb371`
   at block 8694350 (block hash
   `0x657b6b05db6a13dc4d215ed1fe7c7846522999aeebbbc193a8873522283c4016`).
   A historical chain query at that block returns exactly
   `[(163, 65535), (204, 7282)]` for validator UID 30: the admitted Intel TDX
   worker plus the fixed burn destination.
-- The launch policy is `validated_supply_v1`: 90% validated Intel TDX CPU
-  supply and 10% forced burn. Attestation alone still pays nothing; the
-  admitted worker has validator-dispatched verified work.
+- The recorded policy is `validated_supply_v1`: up to 90% for validated Intel
+  TDX CPU supply and exactly 10% forced burn. The recorded positive worker had
+  validator-dispatched verified work. Attestation alone still pays nothing.
 - Controlled positive-worker evidence replays through the pinned Intel TDX
   verifier. Whole-epoch FULL provenance remains `NOT_PROVEN`: zero-scored
   candidates have explicit zero rows but not candidate-specific replayable
@@ -119,7 +144,8 @@ automatically (in place, preserving all rows) the first time they are opened.
 
 ### Mainnet SN39
 
-Chain broadcast is live. The production validator:
+Mainnet broadcast has passed limited historical acceptance tests. The validator
+used for those tests:
 
 1. requires the signed `validated_supply_v1` policy;
 2. verifies the `finney` / netuid 39 envelope and freshness;
@@ -129,7 +155,9 @@ Chain broadcast is live. The production validator:
 The first monitored all-burn submission succeeded on 2026-07-13. The first
 monitored positive validated-supply submission above succeeded on 2026-07-24.
 The historical block and extrinsic are independently queryable from a Finney
-archive node.
+archive node. These facts prove that the mechanism reached chain at those
+points; they do not prove the current vector, a generally released validator,
+or future emissions.
 
 ### Testnet SN292
 
@@ -138,12 +166,12 @@ publication, and UID mapping, but does not submit weights or pay emissions.
 
 ## Remaining acceptance work
 
-1. Make the admitted miner stale or fail evidence and confirm its prior positive weight
-   is revoked to zero on chain.
+1. On the final tagged release, make a previously admitted miner stale or fail
+   evidence and confirm its prior positive weight is revoked to zero on chain.
 2. Obtain an independent outside-operator reproduction of the signed release,
    historical metagraph, exact extrinsic, public evidence recomputation, and
    controlled positive TDX replay.
 3. Publish candidate-specific replayable negative evidence before claiming
    whole-epoch FULL provenance.
-4. Replace the operator-assisted plain-HTTP worker path with production HTTPS
-   and self-service signed enrollment.
+4. Replace the operator-assisted beta deployment with a reproducible
+   production HTTPS/channel-bound package and self-service signed enrollment.
