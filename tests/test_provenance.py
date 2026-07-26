@@ -1416,3 +1416,80 @@ def test_malformed_or_inconsistent_outcomes_hard_fail():
         pytest.raises(ProvenanceError, match="inconsistent evidence"),
     ):
         replay_positive_miners(result, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Comparator honours the mechanism id the caller asked to verify (#399 CI catch)
+# ---------------------------------------------------------------------------
+
+
+def _result_with(mechanism_id: str, revision: int = 1):
+    """A minimal ProvenanceResult carrying only the mechanism pair.
+
+    compare_with_vector rejects on the pair before it reads anything else, so
+    the rest of the result is irrelevant to these cases.
+    """
+    from cathedral.provenance import ProvenanceResult
+
+    return ProvenanceResult(
+        report_id="sha256:" + "0" * 64,
+        previous_report_id=None,
+        signing_key_id="k",
+        policy_release=1,
+        policy_digest="sha256:" + "1" * 64,
+        verifier_digest="sha256:" + "2" * 64,
+        mechanism_id=mechanism_id,
+        source_epoch=1,
+        generated_at="2026-07-26T00:00:00.000000Z",
+        valid_until="2026-07-27T00:00:00.000000Z",
+        mechanism_revision=revision,
+    )
+
+
+@pytest.mark.parametrize("mechanism_id", ["validated_supply_v1", "validated_supply_v2"])
+def test_comparator_accepts_every_registered_mechanism(mechanism_id):
+    """Both registered ids must get past the pair gate.
+
+    A hardcoded id here rejects a validator that is legitimately pinned to the
+    older mechanism after it has already recomputed correctly, which is exactly
+    the lockstep cutover additive registration exists to prevent.
+    """
+    from cathedral.provenance import compare_with_vector
+
+    agree, discrepancies = compare_with_vector(_result_with(mechanism_id), {})
+    assert agree is False  # no weights list; but NOT for the mechanism pair
+    assert not any("unsupported mechanism pair" in d for d in discrepancies)
+
+
+def test_comparator_rejects_an_unregistered_mechanism():
+    from cathedral.provenance import compare_with_vector
+
+    agree, discrepancies = compare_with_vector(_result_with("validated_supply_v9"), {})
+    assert agree is False
+    assert any("unsupported mechanism pair" in d for d in discrepancies)
+
+
+def test_comparator_rejects_a_wrong_revision_of_a_registered_mechanism():
+    from cathedral.provenance import compare_with_vector
+
+    agree, discrepancies = compare_with_vector(
+        _result_with("validated_supply_v1", revision=2), {}
+    )
+    assert agree is False
+    assert any("unsupported mechanism pair" in d for d in discrepancies)
+
+
+def test_comparator_gate_tracks_the_dispatch_registry():
+    """The gate and dispatch must never drift apart.
+
+    If a future id is registered for dispatch but the comparator still names a
+    literal, recomputation succeeds and comparison rejects it, which reads as a
+    vector disagreement rather than a configuration error.
+    """
+    from cathedral.provenance import MECHANISM_REVISIONS, compare_with_vector
+
+    for mechanism_id, revision in MECHANISM_REVISIONS.items():
+        _, discrepancies = compare_with_vector(_result_with(mechanism_id, revision), {})
+        assert not any("unsupported mechanism pair" in d for d in discrepancies), (
+            f"{mechanism_id} is dispatchable but rejected at the comparison gate"
+        )
