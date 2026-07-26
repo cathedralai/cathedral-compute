@@ -15,6 +15,7 @@ import base64
 import binascii
 import ipaddress
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -32,6 +33,11 @@ from cathedral.assurance import (
     AssuranceClaims,
     assurance_from_dict,
     empty_assurance_claims,
+)
+from cathedral.coldkey_allowlist import (
+    DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
+    SignedColdkeyAllowlistProvider,
+    load_allowlist_keys,
 )
 from cathedral.common import Attested, is_globally_routable
 from cathedral.lifecycle import (
@@ -53,6 +59,8 @@ try:
 except Exception:  # pragma: no cover - exercised only when dependency import fails
     Keypair = None  # type: ignore[assignment]
 
+
+logger = logging.getLogger("cathedral.enroll")
 
 HOTKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,128}$")
 ENROLL_NONCE_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
@@ -94,9 +102,12 @@ class JsonHotkeyRegistrationProvider:
     policy — it substitutes a live subnet metagraph query with a rotated
     file to avoid a hard chain-connectivity dependency at launch.
 
-    Supports three formats, tried in this order:
+    Supports four formats, tried in this order:
     - JSON array: ``["hotkey1", "hotkey2", ...]``
     - JSON object: ``{"hotkeys": ["hotkey1", "hotkey2", ...]}``
+    - Extended JSON object: ``{"hotkeys": {"hotkey1": "coldkey1", ...}}``,
+      rotated by the same metagraph cron; the only format that also carries
+      the hotkey-to-coldkey ownership mapping for the coldkey allowlist gate.
     - Newline-delimited: one hotkey per line; blank lines and ``#`` comments ignored.
 
     Fail-closed rules (``is_registered`` returns ``None``):
@@ -109,6 +120,12 @@ class JsonHotkeyRegistrationProvider:
     existing ``RegistryApp`` fail-closed logic — callers must never treat
     ``None`` as "not registered" and must never treat it as "registered".
 
+    ``resolve_coldkey`` follows the same rules and additionally returns
+    ``None`` when the snapshot is one of the hotkeys-only formats: those
+    remain valid for registration gating, but cannot prove ownership, so
+    coldkey resolution fails closed until the rotation cron emits the
+    extended format.
+
     Typical update cycle: rotate the file from a cron job that re-fetches the
     metagraph; the max-age bound ensures a stuck cron is caught within one
     interval instead of silently admitting stale/deregistered hotkeys.
@@ -120,7 +137,13 @@ class JsonHotkeyRegistrationProvider:
         self.path = path
         self.max_age_seconds = max_age_seconds
 
-    def is_registered(self, hotkey: str) -> bool | None:
+    def load_snapshot(self) -> tuple[set[str], dict[str, str] | None] | None:
+        """Read and parse the snapshot, applying the freshness bound.
+
+        Returns ``(hotkeys, coldkey_by_hotkey)`` where the mapping is ``None``
+        for the hotkeys-only formats, or ``None`` overall when the file is
+        missing, unreadable, stale, or malformed (fail closed).
+        """
         try:
             stat_result = os.stat(self.path)
             age = time.time() - stat_result.st_mtime
@@ -130,13 +153,31 @@ class JsonHotkeyRegistrationProvider:
                 content = fh.read()
         except OSError:
             return None  # missing or unreadable file; fail closed
+        return self._parse(content)
 
-        hotkeys = self._parse(content)
-        if hotkeys is None:
-            return None  # malformed content; fail closed
+    def is_registered(self, hotkey: str) -> bool | None:
+        snapshot = self.load_snapshot()
+        if snapshot is None:
+            return None
+        hotkeys, _coldkeys = snapshot
         return hotkey in hotkeys
 
-    def _parse(self, content: str) -> set[str] | None:
+    def resolve_coldkey(self, hotkey: str) -> str | None:
+        """Return the coldkey owning *hotkey*, or None when unprovable.
+
+        None (fail closed) when the snapshot is missing/stale/malformed, when
+        it is a hotkeys-only format that carries no ownership data, or when
+        the hotkey has no entry in the mapping.
+        """
+        snapshot = self.load_snapshot()
+        if snapshot is None:
+            return None
+        _hotkeys, coldkeys = snapshot
+        if coldkeys is None:
+            return None  # hotkeys-only snapshot cannot prove ownership
+        return coldkeys.get(hotkey)
+
+    def _parse(self, content: str) -> tuple[set[str], dict[str, str] | None] | None:
         """Parse content as JSON array, JSON object, or newline-delimited list.
 
         Returns ``None`` on malformed/unrecognised JSON structure. Never raises.
@@ -152,20 +193,28 @@ class JsonHotkeyRegistrationProvider:
             data = _JSON_PARSE_FAILED
         if data is not _JSON_PARSE_FAILED:
             if isinstance(data, list) and all(isinstance(h, str) for h in data):
-                return set(data)
-            if (
-                isinstance(data, dict)
-                and isinstance(data.get("hotkeys"), list)
-                and all(isinstance(h, str) for h in data["hotkeys"])
-            ):
-                return set(data["hotkeys"])
+                return set(data), None
+            if isinstance(data, dict):
+                raw_hotkeys = data.get("hotkeys")
+                if isinstance(raw_hotkeys, list) and all(
+                    isinstance(h, str) for h in raw_hotkeys
+                ):
+                    return set(raw_hotkeys), None
+                if isinstance(raw_hotkeys, dict) and all(
+                    isinstance(h, str)
+                    and h
+                    and isinstance(c, str)
+                    and c
+                    for h, c in raw_hotkeys.items()
+                ):
+                    return set(raw_hotkeys), dict(raw_hotkeys)
             return None  # recognisable-as-JSON but wrong shape; fail closed
         # Not JSON at all: newline-delimited. Lines starting with '#' are comments.
         return {
             line.strip()
             for line in content.splitlines()
             if line.strip() and not line.strip().startswith("#")
-        }
+        }, None
 
 
 def now_iso() -> str:
@@ -1394,6 +1443,20 @@ class RegistryStore:
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
 
+    def remove_enrollment(self, hotkey: str) -> None:
+        """Retire *hotkey* and clear its published attestation verdict.
+
+        The worker lifecycle event ledger is append-only (delete triggers)
+        and its rows are foreign-key children of ``enrollments``, so a
+        physical enrollment-row delete is impossible by design. Terminal
+        retirement plus verdict removal is the strongest removal the schema
+        allows: the worker leaves the refresh set, the epoch target list,
+        and the public verified count, while the audit trail survives.
+        """
+        self.retire_lifecycle(hotkey, removed=True)
+        with self._lifecycle_lock, self._connect() as conn:
+            conn.execute("DELETE FROM attestations WHERE hotkey = ?", (hotkey,))
+
     def record_probe_failure(
         self,
         hotkey: str,
@@ -1760,6 +1823,7 @@ class RegistryApp:
         *,
         enroll_signature_ttl_seconds: int | None = None,
         registration_provider: object | None = None,
+        coldkey_allowlist: object | None = None,
         production_mode: bool = False,
         trusted_proxy: bool = False,
         hotkey_enroll_limit: int = DEFAULT_HOTKEY_ENROLL_LIMIT,
@@ -1778,6 +1842,13 @@ class RegistryApp:
         # Subnet registration gate — injectable so tests can pass stubs without
         # a live chain connection. See RegistrationProvider protocol above.
         self.registration_provider = registration_provider
+        # Approved-coldkey gate: any object exposing
+        # ``is_allowed(coldkey) -> bool | None`` (None fails closed), normally
+        # a SignedColdkeyAllowlistProvider. When None in production_mode, all
+        # enrollment is rejected; when None outside production_mode, the gate
+        # is inactive so tests and SN292 development flows keep the current
+        # open behavior.
+        self.coldkey_allowlist = coldkey_allowlist
         # When True, enrollments are rejected if registration cannot be
         # confirmed even when no provider is configured.
         self.production_mode = production_mode
@@ -1815,7 +1886,13 @@ class RegistryApp:
         else:
             ip = environ.get("REMOTE_ADDR", "")
         if not self.limiter.allow(ip or "unknown"):
-            return self._json(start_response, 429, {"error": "rate limit exceeded"})
+            return self._reject(
+                start_response,
+                429,
+                "rate limit exceeded",
+                hotkey=None,
+                reason="ip_rate_limited",
+            )
 
         payload = self._read_json(environ)
         hotkey = validate_hotkey(payload.get("hotkey"))
@@ -1840,13 +1917,24 @@ class RegistryApp:
         # bound survives restarts and is consistent across app instances that
         # share the same DB.  This prevents a miner controlling many valid
         # self-owned hotkeys from creating an unbounded probe queue.
+        #
+        # This stays ahead of the registration and allowlist gates. Those gates
+        # each read and verify an operator-controlled artifact (a snapshot stat
+        # plus read, an Ed25519 verify, and a canonical re-serialization of the
+        # allowlist), so a rejected request is not free. The in-memory IP
+        # limiter is per-process and per-address and cannot bound a distributed
+        # caller on its own; only this durable per-hotkey record can.
         if not self.store.check_and_record_hotkey_attempt(
             hotkey,
             limit=self.hotkey_enroll_limit,
             window_seconds=self.hotkey_enroll_window_seconds,
         ):
-            return self._json(
-                start_response, 429, {"error": "hotkey enrollment rate limit exceeded"}
+            return self._reject(
+                start_response,
+                429,
+                "hotkey enrollment rate limit exceeded",
+                hotkey=hotkey,
+                reason="hotkey_rate_limited",
             )
 
         # Subnet registration gate: fail closed when a provider is configured
@@ -1857,16 +1945,108 @@ class RegistryApp:
             except Exception:
                 registered = None
             if registered is not True:
-                return self._json(
-                    start_response, 403, {"error": "hotkey not registered on subnet"}
+                return self._reject(
+                    start_response,
+                    403,
+                    "hotkey not registered on subnet",
+                    hotkey=hotkey,
+                    reason="not_registered",
                 )
         elif self.production_mode:
-            return self._json(
-                start_response, 403, {"error": "registration provider not configured"}
+            return self._reject(
+                start_response,
+                403,
+                "registration provider not configured",
+                hotkey=hotkey,
+                reason="registration_provider_missing",
             )
 
+        # Approved-coldkey gate: active whenever an allowlist is configured,
+        # and unconditionally in production_mode (where an unset allowlist
+        # fails closed instead of open).
+        if self.coldkey_allowlist is not None or self.production_mode:
+            if self.coldkey_allowlist is None:
+                return self._reject(
+                    start_response,
+                    403,
+                    "enrollment allowlist not configured",
+                    hotkey=hotkey,
+                    reason="allowlist_missing",
+                )
+            coldkey = self._resolve_coldkey(hotkey)
+            if coldkey is None:
+                return self._reject(
+                    start_response,
+                    403,
+                    "hotkey coldkey could not be resolved",
+                    hotkey=hotkey,
+                    coldkey="unresolvable",
+                    reason="coldkey_unresolvable",
+                )
+            try:
+                allowed = self.coldkey_allowlist.is_allowed(coldkey)
+            except Exception:
+                allowed = None
+            if allowed is not True:
+                return self._reject(
+                    start_response,
+                    403,
+                    (
+                        "coldkey is not approved for enrollment"
+                        if allowed is False
+                        else "enrollment allowlist unavailable"
+                    ),
+                    hotkey=hotkey,
+                    coldkey=coldkey,
+                    reason=(
+                        "coldkey_not_allowlisted"
+                        if allowed is False
+                        else "allowlist_unavailable"
+                    ),
+                )
+
         self.store.enroll(hotkey, endpoint_url, nonce=nonce)
+        logger.info("enroll accepted hotkey=%s", hotkey)
         return self._json(start_response, 200, {"status": "enrolled"})
+
+    def _resolve_coldkey(self, hotkey: str) -> str | None:
+        """Resolve the coldkey owning *hotkey* via the registration provider.
+
+        Fails closed (None) when no provider is configured, the provider
+        cannot resolve coldkeys (hotkeys-only snapshot or no
+        ``resolve_coldkey`` at all), or resolution raises.
+        """
+        resolve = getattr(self.registration_provider, "resolve_coldkey", None)
+        if not callable(resolve):
+            return None
+        try:
+            coldkey = resolve(hotkey)
+        except Exception:
+            return None
+        if not isinstance(coldkey, str) or not coldkey:
+            return None
+        return coldkey
+
+    def _reject(
+        self,
+        start_response: Any,
+        status: int,
+        error: str,
+        *,
+        hotkey: str | None,
+        coldkey: str | None = None,
+        reason: str,
+    ) -> list[bytes]:
+        # Rejections carry only public identity material (hotkey, coldkey,
+        # reason); tokens, signatures, and endpoints stay out of the log.
+        logger.warning(
+            "enroll rejected status=%d reason=%s hotkey=%s coldkey=%s",
+            status,
+            reason,
+            hotkey or "-",
+            coldkey or "-",
+        )
+        return self._json(start_response, status, {"error": error})
 
     def _read_json(self, environ: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1932,13 +2112,77 @@ def main() -> None:
         metavar="N",
         help="reject the hotkey file when its mtime is older than N seconds (default: 3600)",
     )
+    parser.add_argument(
+        "--enroll-allowlist",
+        metavar="PATH",
+        help=(
+            "path to the signed approved-coldkey allowlist artifact "
+            "(docs/ENROLLMENT_ALLOWLIST.md). Mandatory when --production-mode "
+            "is set; enrollment fails closed without it."
+        ),
+    )
+    parser.add_argument(
+        "--enroll-allowlist-keys",
+        metavar="PATH",
+        help=(
+            "JSON object of key id to base64 32-byte Ed25519 public key "
+            "trusted to sign the allowlist. Required with --enroll-allowlist."
+        ),
+    )
+    parser.add_argument(
+        "--enroll-allowlist-keys-digest",
+        metavar="sha256:HEX",
+        help=(
+            "pin the allowlist key file to this sha256 digest. "
+            "Mandatory when --production-mode is set."
+        ),
+    )
+    parser.add_argument(
+        "--enroll-allowlist-digest",
+        metavar="sha256:HEX",
+        help=(
+            "optionally pin the allowlist artifact itself to this digest; "
+            "rotation then requires a restart with the new digest"
+        ),
+    )
+    parser.add_argument(
+        "--enroll-allowlist-max-age-seconds",
+        type=int,
+        default=DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
+        metavar="N",
+        help=(
+            "reject the allowlist when its generated_at is older than "
+            "N seconds (default: 86400)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.registration_max_age_seconds <= 0:
         parser.error("--registration-max-age-seconds must be a positive integer")
+    if args.enroll_allowlist_max_age_seconds <= 0:
+        parser.error("--enroll-allowlist-max-age-seconds must be a positive integer")
 
     if args.production_mode and not args.registered_hotkeys_file:
         parser.error("--production-mode requires --registered-hotkeys-file")
+    if args.production_mode and not args.enroll_allowlist:
+        parser.error("--production-mode requires --enroll-allowlist")
+    if args.production_mode and not args.enroll_allowlist_keys_digest:
+        parser.error("--production-mode requires --enroll-allowlist-keys-digest")
+    # The key digest pins the root of trust, not the document. Release
+    # monotonicity alone is in-process and resets on restart, so a superseded
+    # but still validly signed release could be replayed to re-admit a revoked
+    # coldkey. Pinning the artifact digest is what makes revocation durable.
+    if args.production_mode and not args.enroll_allowlist_digest:
+        parser.error("--production-mode requires --enroll-allowlist-digest")
+    if args.enroll_allowlist and not args.enroll_allowlist_keys:
+        parser.error("--enroll-allowlist requires --enroll-allowlist-keys")
+
+    # Structured stdlib logging: every enrollment rejection is recorded with
+    # hotkey, resolved coldkey, and reason (see RegistryApp._reject).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     provider: RegistrationProvider | None = None
     if args.registered_hotkeys_file:
@@ -1947,14 +2191,28 @@ def main() -> None:
             max_age_seconds=args.registration_max_age_seconds,
         )
 
+    allowlist: SignedColdkeyAllowlistProvider | None = None
+    if args.enroll_allowlist:
+        allowlist = SignedColdkeyAllowlistProvider(
+            args.enroll_allowlist,
+            load_allowlist_keys(
+                args.enroll_allowlist_keys,
+                production_mode=args.production_mode,
+                pinned_digest=args.enroll_allowlist_keys_digest,
+            ),
+            max_age_seconds=args.enroll_allowlist_max_age_seconds,
+            pinned_digest=args.enroll_allowlist_digest,
+        )
+
     app = RegistryApp(
         RegistryStore(args.db),
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,
+        coldkey_allowlist=allowlist,
     )
     with make_server(args.host, args.port, app) as server:
-        print(f"serving registry on http://{args.host}:{args.port}")
+        logger.info("serving registry on http://%s:%d", args.host, args.port)
         server.serve_forever()
 
 

@@ -39,7 +39,12 @@ from cathedral.assurance import AssuranceDimension
 from cathedral.attest import collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
-from cathedral.enroll import RegistryStore
+from cathedral.coldkey_allowlist import (
+    DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
+    load_allowlist_keys,
+    verify_allowlist,
+)
+from cathedral.enroll import JsonHotkeyRegistrationProvider, RegistryStore
 from cathedral.evidence import (
     MAX_CONTROLLED_ENVELOPE_BYTES,
     MAX_INDEX_ARTIFACT_BYTES,
@@ -3105,6 +3110,74 @@ def cmd_lifecycle_retire(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
+    """List enrollments whose coldkey is not on the signed allowlist.
+
+    With --remove, retire the flagged rows and clear their attestation
+    verdicts (docs/ENROLLMENT_ALLOWLIST.md). Never runs automatically:
+    reconciliation of pre-existing rows is an explicit operator action.
+    """
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    allowlist = verify_allowlist(
+        _read_bounded_registry_file(args.allowlist, "coldkey allowlist"),
+        load_allowlist_keys(
+            args.allowlist_keys,
+            pinned_digest=args.allowlist_keys_digest,
+        ),
+        max_age_seconds=args.allowlist_max_age_seconds,
+    )
+    registration = JsonHotkeyRegistrationProvider(
+        args.registered_hotkeys_file,
+        max_age_seconds=args.registration_max_age_seconds,
+    ).load_snapshot()
+    # A broken snapshot must abort loudly: treating every enrollment as
+    # unresolvable would flag (and with --remove retire) the whole board.
+    if registration is None:
+        raise ValueError("registration snapshot is missing, stale, or malformed")
+    _hotkeys, coldkey_map = registration
+    if coldkey_map is None:
+        raise ValueError(
+            "registration snapshot carries no coldkey mapping; rotate the "
+            "extended {'hotkeys': {hotkey: coldkey}} format first"
+        )
+    store = RegistryStore(args.registry_db)
+    checked = 0
+    flagged: list[dict[str, object]] = []
+    for enrollment in store.enrollments():
+        checked += 1
+        coldkey = coldkey_map.get(enrollment.hotkey)
+        if coldkey is not None and coldkey in allowlist.coldkeys:
+            continue
+        lifecycle = store.lifecycle_snapshot(enrollment.hotkey)
+        flagged.append(
+            {
+                "hotkey": enrollment.hotkey,
+                "coldkey": coldkey,
+                "status": "unresolvable" if coldkey is None else "not_allowlisted",
+                "lifecycle_state": lifecycle.state.value,
+            }
+        )
+    removed: list[str] = []
+    if args.remove:
+        for entry in flagged:
+            store.remove_enrollment(str(entry["hotkey"]))
+            removed.append(str(entry["hotkey"]))
+    print(
+        json.dumps(
+            {
+                "allowlist_release": allowlist.release,
+                "allowlist_digest": allowlist.digest,
+                "checked": checked,
+                "flagged": flagged,
+                "removed": removed,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 # --------------------------------------------------------------------------
 # argparse wiring
 # --------------------------------------------------------------------------
@@ -3278,6 +3351,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="finish directly in retired instead of leaving the worker retiring",
     )
     p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
+
+    p_enroll = sub.add_parser(
+        "enroll", help="reconcile the enrollment registry against approvals"
+    )
+    enroll_sub = p_enroll.add_subparsers(dest="enroll_command", required=True)
+    p_enroll_reconcile = enroll_sub.add_parser(
+        "reconcile",
+        help=(
+            "list (and with --remove retire) enrollments whose coldkey is "
+            "absent from the signed allowlist"
+        ),
+    )
+    p_enroll_reconcile.add_argument("--registry-db", required=True)
+    p_enroll_reconcile.add_argument(
+        "--allowlist", required=True, help="signed coldkey allowlist artifact"
+    )
+    p_enroll_reconcile.add_argument(
+        "--allowlist-keys",
+        required=True,
+        help="trusted allowlist signing keys (JSON object of id to base64 key)",
+    )
+    p_enroll_reconcile.add_argument(
+        "--allowlist-keys-digest",
+        required=True,
+        metavar="sha256:HEX",
+        help=(
+            "pin the key file to this sha256 digest. Required: reconcile is "
+            "the only enforcement for pre-existing rows and --remove is "
+            "destructive, so an unpinned key file would let a substituted key "
+            "both hide rogue rows and retire honest ones."
+        ),
+    )
+    p_enroll_reconcile.add_argument(
+        "--allowlist-max-age-seconds",
+        type=int,
+        default=DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
+        metavar="N",
+    )
+    p_enroll_reconcile.add_argument(
+        "--registered-hotkeys-file",
+        required=True,
+        help="extended registration snapshot carrying hotkey-to-coldkey mappings",
+    )
+    p_enroll_reconcile.add_argument(
+        "--registration-max-age-seconds", type=int, default=3600, metavar="N"
+    )
+    p_enroll_reconcile.add_argument(
+        "--remove",
+        action="store_true",
+        help="retire flagged enrollments and clear their attestation verdicts",
+    )
+    p_enroll_reconcile.set_defaults(func=cmd_enroll_reconcile)
 
     p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
