@@ -932,8 +932,14 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
                 + payload
             )
             time.sleep(0.3)
-            assert _post_raw(url, payload)[0] == 503
-            code = 503
+            # Whether the handler is still blocked in send at this instant
+            # depends on how the kernel sized and drained the socket buffers,
+            # so a 503 here is expected but not guaranteed and must not be
+            # asserted. The invariant that matters is the recovery below: a
+            # client that stops reading cannot hold the slot indefinitely.
+            # Without the response deadline the handler blocks forever and
+            # this loop never sees a 200.
+            code = 0
             deadline = time.monotonic() + 8.0
             while code != 200 and time.monotonic() < deadline:
                 code, _ = _post_raw(url, payload)
