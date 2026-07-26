@@ -76,9 +76,14 @@ profiles do not imply that a GPU miner is admitted or rewarded by this subnet.
 7. The SN39 validator verifies the report and independently maps public hotkeys
    to UIDs before any chain decision.
 
-The current reward mechanism is versioned as `validated_supply_v1`. Its burn
-contract and class allocation are policy inputs verified by validators, not
-miner-controlled fields.
+The reward mechanism is versioned, and both registered ids stay verifiable.
+New evidence is emitted as `validated_supply_v2`, which scores the current
+epoch's receipt-verified work alone and exports exactly those units, so the
+published bundle reproduces the on-chain allocation. `validated_supply_v1`
+remains registered so already-signed historical evidence keeps verifying; it
+summed a trailing window of prior epochs into the score while exporting
+current-epoch units only. The burn contract and class allocation are policy
+inputs verified by validators, not miner-controlled fields.
 
 ## Trust boundary
 
@@ -99,7 +104,7 @@ report that narrower result as `NOT_PROVEN`, not `FULL`.
   private keys, cloud credentials, or SSH credentials.
 - A public beta issue may contain the public hotkey, preferred network,
   current or intended Intel TDX hardware class, provider and broad region, and
-  an optional public contact handle—never an IP, instance identifier, or
+  an optional public contact handle, never an IP, instance identifier, or
   credential.
 - Plain HTTP with `--development-allow-non-loopback` is a development
   exception, not the production security boundary and not a mainnet onboarding
