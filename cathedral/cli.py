@@ -93,6 +93,14 @@ from cathedral.runtime import (
     RuntimeConfig,
 )
 from cathedral.score_class import export_score_class_report
+from cathedral.self_check import (
+    SELF_CHECK_HOTKEY,
+    file_allowlist,
+    normalize_measurements,
+    registry_allowlist,
+    render,
+    run_self_check,
+)
 from cathedral.worker import WorkerServer
 
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
@@ -1096,6 +1104,59 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             pass
     return 0
+
+
+def cmd_worker_self_check(args: argparse.Namespace) -> int:
+    """Answer the admission question on the miner's own machine, pre-enrollment.
+
+    Returns a verdict-specific exit code (see cathedral.self_check.EXIT_CODES)
+    rather than the usual 0, so an unattended provisioning script can branch on
+    the outcome without parsing text.
+    """
+
+    registry = getattr(args, "policy_registry", None)
+    allowlist_file = getattr(args, "allowlist_file", None)
+    supplied = getattr(args, "approved_measurement", None) or []
+    if sum(1 for source in (registry, allowlist_file, supplied) if source) > 1:
+        raise ValueError(
+            "pass only one of --policy-registry, --allowlist-file, or --approved-measurement"
+        )
+    if registry:
+        if not getattr(args, "trusted_keys", None):
+            raise ValueError("--policy-registry requires --trusted-keys")
+        approved, source = registry_allowlist(
+            _read_bounded_registry_file(registry, "policy registry"),
+            _load_registry_keys(args.trusted_keys),
+            max_age_seconds=args.max_age_seconds,
+        )
+    elif allowlist_file:
+        approved, source = file_allowlist(Path(allowlist_file))
+    elif supplied:
+        approved = normalize_measurements(supplied)
+        source = f"{len(approved)} measurement(s) supplied on the command line"
+    else:
+        # No built-in list. Reporting the measurement without classifying it is
+        # the honest outcome, so this is not an error.
+        approved, source = (), "none supplied"
+
+    quote = None
+    quote_file = getattr(args, "quote_file", None)
+    if quote_file:
+        quote = Path(quote_file).read_bytes()
+
+    verifier = getattr(args, "verifier", None)
+    result = run_self_check(
+        approved_measurements=approved,
+        allowlist_source=source,
+        hotkey=getattr(args, "hotkey", None) or SELF_CHECK_HOTKEY,
+        quote=quote,
+        verifier=[verifier] if verifier else None,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result.to_json(), sort_keys=True))
+    else:
+        print(render(result))
+    return result.exit_code
 
 
 def cmd_runtime_canary(args: argparse.Namespace) -> int:
@@ -3277,6 +3338,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="32-byte channel public-key digest as 64 lowercase hex characters",
     )
     p_serve.set_defaults(func=cmd_worker_serve)
+
+    p_self_check = worker_sub.add_parser(
+        "self-check",
+        help="report this machine's TDX measurement and whether it is approved",
+    )
+    p_self_check.add_argument(
+        "--hotkey",
+        help=f"public SS58 address to bind into the local quote (default {SELF_CHECK_HOTKEY!r})",
+    )
+    p_self_check.add_argument(
+        "--approved-measurement",
+        action="append",
+        help="approved measurement supplied by the operator; repeat for several",
+    )
+    p_self_check.add_argument(
+        "--allowlist-file",
+        help="operator-supplied approved list, one measurement per line",
+    )
+    p_self_check.add_argument(
+        "--policy-registry",
+        help="signed policy registry to read the approved list from; the only authority",
+    )
+    p_self_check.add_argument(
+        "--trusted-keys",
+        help="registry signing keys, required with --policy-registry",
+    )
+    p_self_check.add_argument("--max-age-seconds", type=int, default=86400)
+    p_self_check.add_argument(
+        "--verifier",
+        help="TDX verifier executable to evaluate TCB status against Intel collateral",
+    )
+    p_self_check.add_argument(
+        "--quote-file",
+        help="classify an already collected raw quote instead of collecting a fresh one",
+    )
+    p_self_check.add_argument("--json", action="store_true")
+    p_self_check.set_defaults(func=cmd_worker_self_check)
 
     p_policy = sub.add_parser("policy-registry", help="verify signed public measurement policy")
     policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)

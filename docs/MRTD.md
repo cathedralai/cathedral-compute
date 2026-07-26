@@ -27,6 +27,33 @@ Production runtimes require a strict signed CPU policy and a live
 registry refresher; a mid-epoch authority or policy change aborts the
 epoch. Compatibility mode never scores production work.
 
+## Learning your own measurement
+
+A prospective miner reads the same value the verifier will, on their own
+machine, before enrolling and without any Cathedral credential:
+
+```bash
+cathedral worker self-check
+```
+
+It collects a real quote through `cathedral.attest.collect_tdx` and derives the
+measurement with `cathedral.verify.tdx_quote.parse_tdx_quote`. That derivation
+and the production Go verifier's `measurementID` are pinned against each other
+by tests on both sides: a shared field-value vector, and one real production
+quote from which both derive the identical measurement and TCB SVN. Neither is
+a live-hardware demonstration, and no claim is made that a given machine's
+quote will verify or that its measurement will be approved; the command reports
+what the machine produces so a human can ask.
+
+There is no approved list in this repository, deliberately. The signed registry
+is the authority, so the self-check compares against a list supplied by the
+caller and reports without classifying when none is given.
+
+Where the machine came from is
+[the reproducible instance recipe](TDX_LAUNCH.md#reproducing-an-approved-miner-image);
+what to do with an unapproved value is "Getting a new measurement approved" in
+[MINING.md](../MINING.md).
+
 ## Approving a new measurement
 
 Use the auditable approval tool — never hand-edit the registry:

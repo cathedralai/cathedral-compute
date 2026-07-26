@@ -16,6 +16,88 @@ Treat it as live infrastructure. Initial probes should only request attestation
 evidence and inspect read-only capability state. Do not restart services, change
 config, or stop the VM as part of attestation development.
 
+## Reproducing an approved miner image
+
+This is the instance definition the currently approved miner runs. Everything
+in it is public and pinned, so anyone can launch the same shape. Read the
+limits below before you spend money: this recipe reproduces the *configuration*,
+which is necessary for an approved measurement, and it does not by itself
+guarantee one.
+
+```bash
+gcloud compute instances create cathedral-miner \
+  --project "$PROJECT_ID" \
+  --zone "$ZONE" \
+  --machine-type c3-standard-4 \
+  --image projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260717 \
+  --confidential-compute-type TDX \
+  --maintenance-policy TERMINATE \
+  --shielded-vtpm \
+  --shielded-integrity-monitoring \
+  --no-shielded-secure-boot
+```
+
+| Setting | Value | Why it is fixed |
+|---|---|---|
+| Image | `ubuntu-2404-noble-amd64-v20260717` | Public, pinned image reference. A different image boots a different guest and measures differently. |
+| Machine type | `c3-standard-4` | The TDX-capable shape the approved worker runs. The worker's fixed two-slot evidence and four-slot work pools are sized for 4 vCPU. |
+| Confidential type | `TDX` | Intel TDX is the only provider class the subnet currently admits. |
+| vTPM | enabled | Matches the approved instance. |
+| Secure Boot | disabled | Matches the approved instance. Enabling it changes the boot chain. |
+| Integrity monitoring | enabled | Matches the approved instance. |
+| Maintenance policy | `TERMINATE` | Confidential VMs cannot live migrate. |
+
+Then install the worker and check the machine before going any further:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3-venv
+
+git clone https://github.com/cathedralai/cathedralconfidential.git
+cd cathedralconfidential
+
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+
+sudo "$PWD/.venv/bin/cathedral" worker self-check
+```
+
+### What you control and what the host controls
+
+The Cathedral measurement is one SHA-256 over the TD identity fields:
+`TD_ATTRIBUTES`, `XFAM`, `MRTD`, `MRCONFIGID`, `MROWNER`, `MROWNERCONFIG`, and
+all four RTMRs. Those fields have two different owners.
+
+- **Guest side, yours.** The RTMRs accumulate what actually booted. Pinning the
+  image, leaving Secure Boot off, and not replacing the kernel keeps this half
+  stable. A kernel upgrade from `apt`, an edited kernel command line, or an
+  added boot disk can move it.
+- **Host side, the cloud provider's.** `MRTD` is the initial TD measurement,
+  produced by the host's TDX virtual firmware. The image reference does not pin
+  it. Google updates that firmware on its own schedule, and a VM that is fully
+  stopped and started can come back on a different version.
+
+This split is the most likely reason the active profile approves three
+measurements rather than one: the same pinned guest configuration, observed
+across more than one host firmware version.
+
+### What this recipe does not promise
+
+- **Not byte-reproducible.** Two operators running the identical command on
+  different days, or in different zones, can produce different measurements,
+  because the host half is not theirs to pin. Cathedral has not demonstrated
+  byte-for-byte reproducibility and this document does not claim it.
+- **Not an admission guarantee.** The recipe gets you a configuration that has
+  produced approved measurements. Whether *your* boot produced one is a
+  question only your own quote can answer, which is what `worker self-check`
+  is for. Run it before you register a hotkey or pay for anything further.
+- **Not stable across upgrades.** Running `apt-get upgrade` into a new kernel
+  after acceptance can move you off the approved list silently. Pin the kernel,
+  and re-run `worker self-check` after any change to the guest or any full stop
+  and start of the VM.
+
 ## Verifier Subprocess Controls
 
 The validator-side subprocess verifier is governed by five environment variables:
@@ -51,6 +133,72 @@ overflow, a descendant retaining a pipe, or normal parent completion kills and
 reaps any remaining process-group members.
 
 ## Interface
+
+The miner-side self-check is:
+
+```bash
+cathedral worker self-check
+cathedral worker self-check --json
+cathedral worker self-check --policy-registry registry.json --trusted-keys keys.json
+cathedral worker self-check --allowlist-file approved.txt
+cathedral worker self-check --approved-measurement tdx-measurement-sha256:<64-hex>
+cathedral worker self-check --quote-file /path/to/quote.bin
+cathedral worker self-check --verifier /path/to/cathedral-tdx-verifier
+```
+
+It collects one quote through the same `collect_tdx` path `worker serve` uses
+for `/v1/evidence`, derives the measurement with
+`cathedral.verify.tdx_quote.parse_tdx_quote` (the derivation this document's
+claims contract is pinned to), and classifies it against a supplied approved
+list. It needs no Cathedral credential and runs before enrollment.
+
+**There is no built-in approved list.** The signed policy registry is the only
+measurement authority and it changes independently of any release, so a
+constant compiled into the tool would eventually be confidently wrong. Run with
+`--policy-registry` for the authoritative answer, or with a list the operator
+gave you. With no list at all the command still reports the measurement and
+says the approval question was not asked, which is the honest outcome.
+
+TCB status is not in the quote. It is decided by Intel collateral, so the check
+reports it only when `--verifier` names a binary that evaluated it, and says
+`not checked locally` otherwise rather than guessing. A miner does not need
+that binary and does not need any Cathedral deployment path to mine; it is
+optional tooling, built from source as described later in this document. When a
+verifier does run, its `measurement` claim is compared against the local
+derivation and any disagreement is reported as a hard failure instead of a
+verdict, and its TCB status is discarded unless `intel_verified` and
+`report_data_match` are both exactly `true`.
+
+Exit codes, for unattended provisioning:
+
+| Code | Meaning |
+|---|---|
+| 0 | Measurement is on the supplied approved list |
+| 2 | The command itself failed (bad arguments, unreadable file) |
+| 3 | Measurement is not approved |
+| 4 | TCB is not current |
+| 5 | No TDX, or the quote could not be collected |
+| 6 | The verifier produced no usable claims |
+| 7 | The verifier and this build disagree about the measurement |
+| 8 | No approved list was supplied, so nothing was classified |
+
+### What the derivation guarantee covers
+
+The self-check and the production verifier are two implementations of one
+measurement definition, in different languages. Two things are pinned by tests:
+
+- they agree on a shared field-value vector (`tests/test_self_check.py` and the
+  Go `TestMeasurementMatchesPythonContractVector`); and
+- they agree on one real production quote, go-tdx-guest's
+  `tdx_prod_quote_SPR_E4.dat`, deriving the identical measurement and TCB SVN
+  from the same raw bytes. This is what covers field offsets rather than only
+  field values, because the synthetic vector shares the Python parser's layout
+  assumptions.
+
+**Not proven:** neither test is a demonstration on live TDX hardware. Nothing
+here establishes that a quote collected from any particular machine will
+verify, or that its measurement will be approved. That is the question the
+command exists to ask.
 
 The miner-side collector is:
 

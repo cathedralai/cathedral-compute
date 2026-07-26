@@ -25,12 +25,68 @@ The active profile is `cpu-tdx-sn39-v2`. It requires TCB status `UpToDate` and
 lists three approved measurements. Its window closes on 2026-10-22, after
 which a rollover publishes a successor profile under a new id.
 
-No reproducible image is published yet, so you cannot build a matching
-measurement yourself. A VM that boots to any other measurement returns
-`admit=N` every epoch, whatever else is configured correctly. Raise this in
-your beta request. The operator reviews the measurement and, if it is
-accepted, adds it in a signed policy release. Settle it before you pay for a
-machine.
+A VM that boots to any other measurement returns `admit=N` every epoch,
+whatever else is configured correctly. Two things stop that from being a
+surprise you discover after paying:
+
+1. **Build from the documented recipe.** The approved miner's exact instance
+   definition, with the pinned public image and machine type, is in
+   [the Intel TDX launch path](docs/TDX_LAUNCH.md#reproducing-an-approved-miner-image).
+   Part of the measurement comes from host-side firmware that no image pins, so
+   the recipe makes a match likely, not certain.
+2. **Check your own machine before enrolling.** `cathedral worker self-check`
+   reports the measurement your machine actually produces, and compares it
+   against the approved list once the operator gives you one. It needs no
+   Cathedral credential and works before registration and before enrollment.
+   Step 2 below runs it.
+
+Ask for the current approved list, or the signed policy registry itself, in
+your beta request. The three approved values are not published in this
+repository and no release of it can tell you what they are.
+
+If your measurement is not on the list, adding it is a human step with a real
+turnaround. See "Getting a new measurement approved" below, and settle it
+before you pay for a machine.
+
+## Getting a new measurement approved
+
+Adding a measurement is not automatic. It requires a new signed policy-registry
+release, which only an operator holding the registry signing key can publish.
+Until that release is installed, your worker scores zero every epoch.
+
+**What you send.** On your miner beta issue, publicly:
+
+- the measurement line printed by `cathedral worker self-check`;
+- the `tcb svn` value it printed;
+- the image reference, machine type, and zone you launched; and
+- whether you have changed anything in the guest since first boot.
+
+Ask in the same message for the current approved list, so your next self-check
+can answer the question instead of only reporting the measurement.
+
+Then, through the agreed private channel, the worker endpoint and TLS identity
+from step 7, because the operator captures the measurement from your running
+worker rather than trusting a value you typed.
+
+**What the operator does.** They run the auditable approval flow
+(`scripts/cathedral_measurement_approval.py approve`), which:
+
+1. fetches fresh evidence from your named endpoint and verifies it through the
+   pinned production verifier, so the candidate measurement is only eligible
+   after `intel_verified`, `report_data_match`, and an acceptable TCB status;
+2. records who approved which measurement from which evidence into an
+   append-only approval log; and
+3. emits the next monotonic signed registry release adding exactly that one
+   measurement.
+
+The tool does not deploy. A human reviews the emitted registry and installs it
+deliberately, as a separate step.
+
+**What this means for your schedule.** Your worker must already be deployed and
+reachable before your measurement can be approved, because the capture is live.
+Approval turnaround depends on operator availability, and there is no queue you
+can watch. Unknown measurements keep failing closed until the new release is
+installed.
 
 ## What a provider contributes
 
@@ -97,13 +153,17 @@ You need:
 - the ability to terminate TLS inside the measured VM; and
 - a stable public endpoint that can be restricted to the approved validator.
 
-Install the repository into an isolated environment:
+Install the repository into an isolated environment. A clean Ubuntu 24.04 cloud
+image ships Python 3.12 as `python3` and has no `python3.11`, so use `python3`:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git python3-venv
+
 git clone https://github.com/cathedralai/cathedralconfidential.git
 cd cathedralconfidential
 
-python3.11 -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
@@ -130,6 +190,50 @@ configfs-tsm: ready
 Do not continue if Intel TDX reports `no`. “Confidential VM” is not a
 vendor-independent hardware type; a machine may use a different TEE that the
 current subnet does not admit.
+
+Now answer the question that decides everything else. This collects one local
+quote and prints the measurement your machine actually produces:
+
+```bash
+sudo "$PWD/.venv/bin/cathedral" worker self-check
+```
+
+It takes no credential, contacts nothing, and can be run on a machine you have
+not registered or enrolled.
+
+On its own it will not tell you whether that measurement is approved, and it
+will not pretend to. Cathedral ships no built-in approved list: the signed
+policy registry is the only authority, and a list baked into a release would go
+stale without the release changing. To get a verdict, supply the list the
+operator gave you in your beta request:
+
+```bash
+# The authoritative form, if you were given the signed registry and its keys.
+sudo "$PWD/.venv/bin/cathedral" worker self-check \
+  --policy-registry /path/to/registry.json \
+  --trusted-keys /path/to/keys.json
+
+# Or the list as the operator sent it, one measurement per line.
+sudo "$PWD/.venv/bin/cathedral" worker self-check --allowlist-file approved.txt
+```
+
+Read the result before continuing:
+
+| Result | What it means |
+|---|---|
+| `Whether it is approved was not checked` | No list was supplied. Ask the operator for the approved list, or send them the printed measurement. |
+| `passes the measurement and TCB gates` | The attestation gate is satisfied. The gates in section 8 still apply. |
+| `your measurement is approved` | The measurement gate is satisfied against the list you supplied. TCB status was not evaluated locally. |
+| `your measurement is NOT approved` | Every epoch would score zero. Send the printed measurement to the operator and see "Getting a new measurement approved" above. |
+| `your platform TCB is not current` | Fix this before enrolling. The command prints the order to try. |
+| `cannot produce a TDX quote` | This machine can never be admitted as it is. Rebuild it from the recipe in [the launch path](docs/TDX_LAUNCH.md#reproducing-an-approved-miner-image). |
+
+`--json` prints the same verdict machine-readably, and the exit code encodes it
+(0 approved, 3 not approved, 4 stale TCB, 5 no TDX, 8 no list supplied), so an
+unattended build script can stop before it provisions anything else.
+
+Re-run it after any change to the guest and after any full stop and start of
+the VM. Both can move your measurement.
 
 ## 3. Register only after acceptance
 
@@ -345,7 +449,8 @@ Neither a provider nor Cathedral can promise a future token amount.
 | `401` on work | Worker and validator bearer credentials differ. Never applies to `/v1/evidence`, which is unauthenticated |
 | `503 busy` | The two-slot evidence pool or the four-slot work pool is full. Requests are rejected, not queued |
 | `assigned_hotkey mismatch` | Worker was started with a different public address |
-| `admit=N` | Most often a measurement that is not on the approved list. Otherwise quote crypto, TCB status, binding, identity, or the policy window |
+| `admit=N` | Most often a measurement that is not on the approved list. Run `cathedral worker self-check` to see which. Otherwise quote crypto, TCB status, binding, identity, or the policy window |
+| Measurement changed after a restart | A full stop and start can land the guest on different host firmware. Re-run `cathedral worker self-check` and, if it is no longer approved, follow "Getting a new measurement approved" |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |
 | `NOT_PROVEN` | A required artifact or independent verification input is absent |
 
