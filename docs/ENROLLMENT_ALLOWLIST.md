@@ -16,8 +16,9 @@ the durable owner identity: hotkeys rotate and one operator may run several.
 
 ## Extended registration snapshot
 
-`JsonHotkeyRegistrationProvider` accepts the existing hotkeys-only formats
-(JSON array, `{"hotkeys": [...]}`, newline-delimited) plus the extended form:
+Outside production mode, `JsonHotkeyRegistrationProvider` accepts the existing
+hotkeys-only formats (JSON array, `{"hotkeys": [...]}`, newline-delimited)
+plus the extended form:
 
 ```json
 {"hotkeys": {"<hotkey ss58>": "<coldkey ss58>", "...": "..."}}
@@ -27,6 +28,42 @@ Hotkeys-only snapshots keep working for the registration gate, but they carry
 no ownership data, so coldkey resolution fails closed until the rotation cron
 emits the extended format. The same mtime-based `max_age_seconds` staleness
 bound applies to every format.
+
+### Strict mode (production)
+
+`--production-mode` turns on strict verification and none of the lenient
+formats are accepted. The snapshot must be exactly this document:
+
+```json
+{
+  "schema": "cathedral_registration_snapshot_v2",
+  "network": "finney",
+  "netuid": 39,
+  "block": 8708117,
+  "block_is_finalized": true,
+  "generated_at": "2026-07-26T21:00:00Z",
+  "hotkeys": {"<hotkey ss58>": "<coldkey ss58>"}
+}
+```
+
+Every field is checked and every deviation fails closed with `None`, which the
+endpoint turns into a 403. In detail:
+
+| Check | Why it exists |
+|---|---|
+| `schema` is exactly `cathedral_registration_snapshot_v2` | A hotkeys-only or older document cannot prove ownership, and must not be read as "nobody is registered" |
+| `network` and `netuid` equal the service's own | A snapshot captured for SN292 must not admit hotkeys on SN39 |
+| `generated_at` is canonical UTC, not stale, not in the future | `touch` on a stale file would otherwise defeat the mtime bound |
+| `block_is_finalized` is `true` | A reorg can retract registrations captured at an unfinalized head |
+| `block` is a bounded positive integer, never lower than one already accepted | Replaying an older capture would re-admit deregistered hotkeys |
+| Regular non-symlink file, owned by uid 0, not group or world writable | A snapshot the service does not control is a snapshot an attacker can use to declare their own hotkey registered |
+| Same inode when opened as when checked | Closes the swap window between the stat and the read |
+| Bounded size and bounded hotkey count | The file is read on every request |
+
+`scripts/cathedral_enroll_allowlist.py snapshot` writes exactly this document.
+It reads the metagraph *at the finalized head* rather than the best head, and
+refuses to write at all if the installed bittensor build cannot report the
+finalized head, so it never claims a finality it cannot prove.
 
 ## Allowlist artifact format
 

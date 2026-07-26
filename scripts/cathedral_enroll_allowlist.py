@@ -47,15 +47,18 @@ from cathedral.coldkey_allowlist import (  # noqa: E402
     sign_allowlist,
     verify_allowlist,
 )
+from cathedral.enroll import (  # noqa: E402
+    MAX_SNAPSHOT_FILE_BYTES,
+    MAX_SNAPSHOT_HOTKEYS,
+    REGISTRATION_SNAPSHOT_SCHEMA,
+)
 from cathedral.policy_registry import canonical_json  # noqa: E402
 
 # Same bounds the verifier enforces, so a rejected artifact is caught here
 # rather than at the registry after an operator has already restarted it.
 _SS58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,128}$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-# The SN39 metagraph contract (cathedral/evidence.py) tops out at 4,096.
-MAX_SNAPSHOT_HOTKEYS = 4096
-MAX_SNAPSHOT_BYTES = 1024 * 1024
+MAX_SNAPSHOT_BYTES = MAX_SNAPSHOT_FILE_BYTES
 
 
 def _now() -> datetime:
@@ -312,8 +315,29 @@ def cmd_verify(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _finalized_block(subtensor: object) -> int:
+    """Return the finalized head block number, or fail.
+
+    The strict verifier only accepts a snapshot that declares a finalized
+    block, so this must never fall back to the best (unfinalized) head: a
+    reorg could otherwise retract the registrations the gate admitted on.
+    """
+    substrate = getattr(subtensor, "substrate", None)
+    finalized_head = getattr(substrate, "get_chain_finalised_head", None)
+    block_number = getattr(substrate, "get_block_number", None)
+    if not callable(finalized_head) or not callable(block_number):
+        raise SystemExit(
+            "this bittensor build cannot report the finalized head; refusing to "
+            "write a snapshot that claims finality it cannot prove"
+        )
+    number = block_number(finalized_head())
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        raise SystemExit("finalized head did not resolve to a block number")
+    return number
+
+
 def _capture_metagraph(network: str, netuid: int) -> tuple[int, list[tuple[str, str]]]:
-    """Read hotkey/coldkey pairs from the live metagraph.
+    """Read hotkey/coldkey pairs from the metagraph at the finalized head.
 
     Imported lazily: bittensor is a producer-host dependency, not a package
     dependency of this repo, and every other subcommand runs without it.
@@ -321,12 +345,16 @@ def _capture_metagraph(network: str, netuid: int) -> tuple[int, list[tuple[str, 
     import bittensor  # noqa: PLC0415
 
     subtensor = bittensor.Subtensor(network=network)
-    metagraph = subtensor.metagraph(netuid, lite=True)
+    block = _finalized_block(subtensor)
+    metagraph = subtensor.metagraph(netuid, lite=True, block=block)
     hotkeys = list(getattr(metagraph, "hotkeys", None) or [])
     coldkeys = list(getattr(metagraph, "coldkeys", None) or [])
     if len(hotkeys) != len(coldkeys):
         raise SystemExit("metagraph returned mismatched hotkey and coldkey lists")
-    return int(metagraph.block), list(zip(hotkeys, coldkeys))
+    captured = int(getattr(metagraph, "block", block))
+    if captured > block:
+        raise SystemExit("metagraph returned a block ahead of the finalized head")
+    return captured, list(zip(hotkeys, coldkeys))
 
 
 def build_snapshot_document(
@@ -339,14 +367,18 @@ def build_snapshot_document(
 ) -> dict[str, object]:
     """Build the extended registration snapshot the coldkey gate can read.
 
-    ``hotkeys`` is the mapping form documented in docs/ENROLLMENT_ALLOWLIST.md;
-    the surrounding fields are audit metadata that JsonHotkeyRegistrationProvider
-    ignores.
+    ``hotkeys`` is the mapping form documented in docs/ENROLLMENT_ALLOWLIST.md.
+    The surrounding fields are not decoration: the strict verifier in
+    cathedral/enroll.py checks every one of them, so a snapshot captured for
+    another subnet, another network, or an unfinalized block cannot be
+    rotated into place and silently admit the wrong hotkeys.
     """
     if not pairs:
         raise SystemExit("metagraph returned no neurons; refusing to write an empty snapshot")
     if len(pairs) > MAX_SNAPSHOT_HOTKEYS:
         raise SystemExit(f"metagraph returned more than {MAX_SNAPSHOT_HOTKEYS} hotkeys")
+    if isinstance(block, bool) or not isinstance(block, int) or block <= 0:
+        raise SystemExit("snapshot block must be a positive integer")
     mapping: dict[str, str] = {}
     for hotkey, coldkey in pairs:
         _checked_ss58(hotkey, "hotkey")
@@ -355,10 +387,11 @@ def build_snapshot_document(
             raise SystemExit(f"metagraph returned duplicate hotkey {hotkey}")
         mapping[hotkey] = coldkey
     return {
-        "schema": "cathedral_registration_snapshot_v1",
+        "schema": REGISTRATION_SNAPSHOT_SCHEMA,
         "network": network,
         "netuid": netuid,
         "block": block,
+        "block_is_finalized": True,
         "generated_at": generated_at or _iso(_now()),
         "hotkeys": dict(sorted(mapping.items())),
     }

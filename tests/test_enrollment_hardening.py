@@ -39,6 +39,8 @@ from substrateinterface import Keypair, KeypairType
 
 from cathedral.common import Attested, EvidenceKind, Policy, Tier, is_globally_routable
 from cathedral.enroll import (
+    DEFAULT_ENROLL_NETUID,
+    DEFAULT_ENROLL_NETWORK,
     IpRateLimiter,
     JsonHotkeyRegistrationProvider,
     RegistryApp,
@@ -86,15 +88,21 @@ def _signed_payload(
     hotkey: str = HOTKEY,
     nonce: str = "aa" * 16,
     timestamp: str | None = None,
-) -> dict[str, str]:
+    network: str = DEFAULT_ENROLL_NETWORK,
+    netuid: int = DEFAULT_ENROLL_NETUID,
+) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
-    message = canonical_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    message = canonical_enroll_payload(
+        hotkey, endpoint_url, nonce, ts, network=network, netuid=netuid
+    )
     sig = b64encode(keypair.sign(message)).decode("ascii")
     return {
         "hotkey": hotkey,
         "endpoint_url": endpoint_url,
         "nonce": nonce,
         "timestamp": ts,
+        "network": network,
+        "netuid": netuid,
         "signature_b64": sig,
     }
 
@@ -403,7 +411,10 @@ def test_registration_gate(tmp_path: Path) -> None:
     )
     status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="44" * 16))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled_pending_secret"
+    # The response must never read as "ready to be scored": worker token
+    # provisioning is still operator-assisted.
+    assert body["scored"] is False
 
     # production_mode=False (default) with no provider -> allow (backward compat)
     app = RegistryApp(RegistryStore(f"{base}/r6.sqlite"))
@@ -742,7 +753,10 @@ def test_production_mode_file_provider_allows_registered(tmp_path: Path) -> None
     )
     status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="e0" * 16, endpoint_url="https://8.8.8.8:8090"))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled_pending_secret"
+    # The response must never read as "ready to be scored": worker token
+    # provisioning is still operator-assisted.
+    assert body["scored"] is False
 
 
 def test_production_mode_file_provider_rejects_unregistered(tmp_path: Path) -> None:

@@ -28,9 +28,12 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import ssl
 import stat
 import sys
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -44,7 +47,17 @@ from cathedral.coldkey_allowlist import (
     load_allowlist_keys,
     verify_allowlist,
 )
-from cathedral.enroll import JsonHotkeyRegistrationProvider, RegistryStore
+from cathedral.enroll import (
+    DEFAULT_ENROLL_NETUID,
+    DEFAULT_ENROLL_NETWORK,
+    MAX_BODY,
+    JsonHotkeyRegistrationProvider,
+    RegistryStore,
+    canonical_enroll_payload,
+    now_iso,
+    validate_endpoint_url,
+    validate_hotkey,
+)
 from cathedral.evidence import (
     MAX_CONTROLLED_ENVELOPE_BYTES,
     MAX_INDEX_ARTIFACT_BYTES,
@@ -92,6 +105,7 @@ from cathedral.runtime import (
     MinerTarget,
     RuntimeConfig,
 )
+from cathedral.score_audience import validate_score_audience
 from cathedral.score_class import export_score_class_report
 from cathedral.worker import WorkerServer
 
@@ -3247,6 +3261,157 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enroll_backup(args: argparse.Namespace) -> int:
+    """Take a transaction-safe online copy of the registry database.
+
+    This is the only supported way to back up a registry that another process
+    is writing. ``cp`` of a live SQLite file copies pages mid transaction and
+    leaves the rollback journal behind, so the copy can be unrecoverable
+    exactly when it is needed. The backup API holds a read lock and copies
+    committed pages instead.
+    """
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db, busy_timeout_ms=args.sqlite_busy_timeout_ms)
+    pages = store.backup_to(args.out)
+    print(
+        json.dumps(
+            {
+                "source": args.registry_db,
+                "destination": args.out,
+                "pages": pages,
+                "journal_mode": store.journal_mode(),
+                "integrity_check": "ok",
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_enroll_journal_mode(args: argparse.Namespace) -> int:
+    """Switch the registry's journal mode after taking an online backup.
+
+    WAL lets a reader and the epoch writer overlap instead of serializing on
+    one file lock, which is what turns a contended enrollment from a failure
+    into a wait. The switch takes a brief exclusive lock, so it is an operator
+    action with a backup in front of it, never something a service does on
+    start. ``--backup-to`` is mandatory for that reason.
+    """
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db, busy_timeout_ms=args.sqlite_busy_timeout_ms)
+    pages = store.backup_to(args.backup_to)
+    before, after = store.set_journal_mode(args.mode)
+    print(
+        json.dumps(
+            {
+                "registry_db": args.registry_db,
+                "backup": args.backup_to,
+                "backup_pages": pages,
+                "journal_mode_before": before,
+                "journal_mode_after": after,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _wallet_hotkey_keypair(wallet_name: str, hotkey_name: str, wallet_path: str | None):
+    """Load the miner's hotkey keypair from the local wallet directory.
+
+    Imported lazily: bittensor_wallet is a miner-host dependency, not a
+    package dependency of this repo. The seed never appears in argv, in the
+    environment, or in any printed output; only the wallet *names* do, and the
+    signature this produces is public by construction.
+    """
+    from bittensor_wallet import Wallet  # noqa: PLC0415
+
+    kwargs = {"name": wallet_name, "hotkey": hotkey_name}
+    if wallet_path:
+        kwargs["path"] = wallet_path
+    wallet = Wallet(**kwargs)
+    return wallet.hotkey
+
+
+def cmd_enroll_submit(args: argparse.Namespace) -> int:
+    """Sign and submit one enrollment from the miner's own machine.
+
+    Everything secret stays on this host: the hotkey seed is read from the
+    local wallet directory by bittensor_wallet, is never accepted as an
+    argument or an environment variable, and is never printed. What leaves is
+    the public hotkey, the endpoint, a nonce, a timestamp, and a signature.
+    """
+    endpoint_url = validate_endpoint_url(args.endpoint_url, require_ip_literal=True)
+    network, netuid = validate_score_audience(args.network, args.netuid)
+    registry_url = args.registry_url.rstrip("/")
+    if not registry_url.startswith("https://"):
+        raise ValueError("--registry-url must be https")
+
+    keypair = (
+        args.keypair_factory(args.wallet_name, args.hotkey_name, args.wallet_path)
+        if getattr(args, "keypair_factory", None) is not None
+        else _wallet_hotkey_keypair(args.wallet_name, args.hotkey_name, args.wallet_path)
+    )
+    hotkey = validate_hotkey(keypair.ss58_address)
+    nonce = secrets.token_hex(32)
+    timestamp = now_iso()
+    message = canonical_enroll_payload(
+        hotkey, endpoint_url, nonce, timestamp, network=network, netuid=netuid
+    )
+    body = json.dumps(
+        {
+            "hotkey": hotkey,
+            "endpoint_url": endpoint_url,
+            "network": network,
+            "netuid": netuid,
+            "nonce": nonce,
+            "timestamp": timestamp,
+            "signature_b64": base64.b64encode(keypair.sign(message)).decode("ascii"),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    status, payload = args.transport(f"{registry_url}/v1/enroll", body, args.timeout_seconds)
+    print(json.dumps({"http_status": status, "response": payload}, sort_keys=True))
+    # Any non-200 is a real failure the miner must act on, and the documented
+    # status contract (MINING.md) maps each reason to its fix.
+    return 0 if status == 200 else 1
+
+
+ENROLL_SUBMIT_USER_AGENT = "cathedral-enroll-submit/1"
+
+
+def _post_json(url: str, body: bytes, timeout_seconds: float) -> tuple[int, object]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            # urllib's default "Python-urllib/3.x" is blocked outright by the
+            # CDN in front of the production registry, which would make every
+            # miner's first submit fail with an opaque 403 that has nothing to
+            # do with their enrollment. Send an identifiable agent instead.
+            "User-Agent": ENROLL_SUBMIT_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read(MAX_BODY)
+            return int(response.status), json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY)
+        try:
+            return int(exc.code), json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return int(exc.code), {"error": "non-JSON error response"}
+    except urllib.error.URLError as exc:
+        raise ValueError(f"enrollment registry unreachable: {exc.reason}") from exc
+
+
 # --------------------------------------------------------------------------
 # argparse wiring
 # --------------------------------------------------------------------------
@@ -3472,6 +3637,79 @@ def build_parser() -> argparse.ArgumentParser:
         help="retire flagged enrollments and clear their attestation verdicts",
     )
     p_enroll_reconcile.set_defaults(func=cmd_enroll_reconcile)
+
+    p_enroll_backup = enroll_sub.add_parser(
+        "backup",
+        help="take a transaction-safe online copy of the registry database",
+    )
+    p_enroll_backup.add_argument("--registry-db", required=True)
+    p_enroll_backup.add_argument(
+        "--out", required=True, help="destination path; must not already exist"
+    )
+    p_enroll_backup.add_argument(
+        "--sqlite-busy-timeout-ms", type=int, default=None, metavar="N"
+    )
+    p_enroll_backup.set_defaults(func=cmd_enroll_backup)
+
+    p_enroll_journal = enroll_sub.add_parser(
+        "journal-mode",
+        help="switch the registry journal mode after an online backup",
+    )
+    p_enroll_journal.add_argument("--registry-db", required=True)
+    p_enroll_journal.add_argument(
+        "--mode",
+        required=True,
+        choices=("wal", "delete"),
+        help="wal lets readers and the epoch writer overlap instead of blocking",
+    )
+    p_enroll_journal.add_argument(
+        "--backup-to",
+        required=True,
+        help=(
+            "mandatory pre-change online backup destination; the switch takes "
+            "a brief exclusive lock and is not trivially reversible under load"
+        ),
+    )
+    p_enroll_journal.add_argument(
+        "--sqlite-busy-timeout-ms", type=int, default=None, metavar="N"
+    )
+    p_enroll_journal.set_defaults(func=cmd_enroll_journal_mode)
+
+    p_enroll_submit = enroll_sub.add_parser(
+        "submit",
+        help="sign and submit this miner's enrollment from its own wallet",
+    )
+    p_enroll_submit.add_argument(
+        "--registry-url",
+        required=True,
+        metavar="https://HOST",
+        help="enrollment registry base URL",
+    )
+    p_enroll_submit.add_argument(
+        "--endpoint-url",
+        required=True,
+        metavar="https://IP:PORT",
+        help="this worker's public HTTPS endpoint; a public IP literal with a port",
+    )
+    p_enroll_submit.add_argument(
+        "--wallet-name", required=True, help="local wallet (coldkey) name"
+    )
+    p_enroll_submit.add_argument(
+        "--hotkey-name", required=True, help="local hotkey name inside that wallet"
+    )
+    p_enroll_submit.add_argument(
+        "--wallet-path",
+        default=None,
+        help="override the wallet directory (default: the bittensor_wallet default)",
+    )
+    p_enroll_submit.add_argument("--network", default=DEFAULT_ENROLL_NETWORK)
+    p_enroll_submit.add_argument("--netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+    p_enroll_submit.add_argument("--timeout-seconds", type=float, default=30.0)
+    # Seams for tests. Never exposed as flags: a seed must not be reachable
+    # from the command line at all.
+    p_enroll_submit.set_defaults(
+        func=cmd_enroll_submit, transport=_post_json, keypair_factory=None
+    )
 
     p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)

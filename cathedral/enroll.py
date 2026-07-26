@@ -13,20 +13,23 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hmac
+import importlib
 import ipaddress
 import json
 import logging
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
-from wsgiref.simple_server import make_server
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from cathedral.assurance import (
     ATTESTATION_ADMISSION_POLICY,
@@ -40,6 +43,7 @@ from cathedral.coldkey_allowlist import (
     load_allowlist_keys,
 )
 from cathedral.common import Attested, is_globally_routable
+from cathedral.score_audience import validate_score_audience
 from cathedral.lifecycle import (
     NETWORK_ELIGIBLE_STATES,
     TERMINAL_STATES,
@@ -54,10 +58,36 @@ from cathedral.lifecycle import (
     retry_delay_seconds,
 )
 
-try:
-    from substrateinterface import Keypair
-except Exception:  # pragma: no cover - exercised only when dependency import fails
-    Keypair = None  # type: ignore[assignment]
+# sr25519 verifier discovery.
+#
+# substrateinterface is the historical source of Keypair, but it is not
+# installed in the deployed producer venv, which ships bittensor_wallet
+# instead. Both expose the same verification contract
+# (``Keypair(ss58_address=...).verify(message, signature) -> bool``), so try
+# each in turn rather than hard-failing on one package name. Without this the
+# module-level import failure was silent and turned every single enrollment
+# into a 403 whose message ("sr25519 signature verifier unavailable") reads
+# like a caller error.
+SIGNATURE_VERIFIER_MODULES = ("substrateinterface", "bittensor_wallet")
+
+
+def load_keypair_class(
+    modules: tuple[str, ...] = SIGNATURE_VERIFIER_MODULES,
+) -> tuple[str | None, Any]:
+    """Return ``(module_name, Keypair)`` for the first importable verifier."""
+
+    for name in modules:
+        try:
+            module = importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - any import problem means "try the next one"
+            continue
+        candidate = getattr(module, "Keypair", None)
+        if candidate is not None and callable(candidate):
+            return name, candidate
+    return None, None
+
+
+KEYPAIR_SOURCE, Keypair = load_keypair_class()
 
 
 logger = logging.getLogger("cathedral.enroll")
@@ -74,6 +104,97 @@ REJECTED_HOSTS = {"localhost", "metadata.google.internal"}
 DEFAULT_HOTKEY_ENROLL_LIMIT = 20
 DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS = 3600
 _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
+
+# Domain separation for the enrollment signature preimage. A miner signature
+# is only ever valid for this protocol, on this network, for this subnet: the
+# same wallet signs for other Bittensor protocols, and a bare
+# hotkey/endpoint/nonce/timestamp document could be lifted from one of them
+# (or from testnet SN292) and replayed here.
+ENROLL_DOMAIN_TAG = "cathedral-enroll-v1"
+DEFAULT_ENROLL_NETWORK = "finney"
+DEFAULT_ENROLL_NETUID = 39
+
+# Enrollment is a write on a database the epoch loop also writes. Waiting is
+# correct up to a bound; hanging is not. Past the bound the caller gets a 503
+# with Retry-After and the epoch loop keeps its write window.
+#
+# The default is deliberately 5000, which is exactly what every RegistryStore
+# consumer already had: sqlite3.connect() defaults to timeout=5.0, which the
+# driver applies as sqlite3_busy_timeout(5000). RegistryStore is shared with
+# the epoch/evidence path (cathedral/runtime.py, prober.py, key_release.py),
+# so the default here must not change their lock behavior. The enrollment
+# service passes its own lower bound explicitly, because only it has a
+# reverse-proxy read timeout to stay under.
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_BUSY_TIMEOUT_ENV = "CATHEDRAL_ENROLL_SQLITE_BUSY_TIMEOUT_MS"
+ENROLL_BUSY_RETRY_AFTER_SECONDS = 15
+
+# The per-IP limiter is in-memory and its keys come from the network, so it
+# needs its own ceiling: an unbounded dict is a remote memory-growth primitive
+# once the endpoint is public.
+DEFAULT_IP_LIMITER_MAX_KEYS = 4096
+
+# Attempt rows are pruned per hotkey on every write, but a long-lived process
+# that never sees a given hotkey again would keep its rows forever. This
+# ceiling bounds the sweep so one request cannot pay for an unbounded delete.
+HOTKEY_ATTEMPT_SWEEP_INTERVAL_SECONDS = 900
+
+# Known-answer vector for the startup preflight. A verifier that cannot
+# confirm this signature, or that confirms a corrupted one, is not a working
+# sr25519 verifier and the service must not open a listener with it.
+_PREFLIGHT_ADDRESS = "5Cvzb5veKov4TMvd5JVgecHYSphjGU3Dh4N2MGPPCoUJ7cZV"
+_PREFLIGHT_MESSAGE = b"cathedral-enroll-verifier-preflight-v1"
+_PREFLIGHT_SIGNATURE_B64 = (
+    "ThgZ+GzZKIBrOALGgrh3pVkAi84HnQrjp7b6mq1aIWpGWW0DtEUFymbyQJhYpZRD"
+    "+OaS6UDE9VBPHcqSeRcDjw=="
+)
+
+REGISTRATION_SNAPSHOT_SCHEMA = "cathedral_registration_snapshot_v2"
+MAX_SNAPSHOT_BLOCK = 2**53
+MAX_SNAPSHOT_FILE_BYTES = 1024 * 1024
+# The SN39 metagraph contract (cathedral/evidence.py) tops out at 4,096.
+MAX_SNAPSHOT_HOTKEYS = 4096
+
+
+class SignatureVerifierUnavailable(RuntimeError):
+    """No usable sr25519 verifier is importable in this interpreter."""
+
+
+def preflight_signature_verifier(keypair_class: Any = None) -> str:
+    """Prove the sr25519 verifier works, or raise before a listener opens.
+
+    Returns the importable module the verifier came from. Checks both
+    directions of the known-answer vector: a real signature must verify and a
+    corrupted one must not. A stub that returns True for everything would
+    admit any signature from any key, so "importable" alone is not enough.
+    """
+
+    candidate = Keypair if keypair_class is None else keypair_class
+    if candidate is None:
+        raise SignatureVerifierUnavailable(
+            "no sr25519 verifier is importable; install one of "
+            + ", ".join(SIGNATURE_VERIFIER_MODULES)
+        )
+    signature = base64.b64decode(_PREFLIGHT_SIGNATURE_B64, validate=True)
+    corrupted = bytearray(signature)
+    corrupted[0] ^= 0x01
+    try:
+        verifier = candidate(ss58_address=_PREFLIGHT_ADDRESS)
+        accepted = verifier.verify(_PREFLIGHT_MESSAGE, signature)
+        rejected = candidate(ss58_address=_PREFLIGHT_ADDRESS).verify(
+            _PREFLIGHT_MESSAGE, bytes(corrupted)
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure here is fatal
+        raise SignatureVerifierUnavailable(
+            "sr25519 verifier failed its startup known-answer check"
+        ) from exc
+    if accepted is not True or rejected is not False:
+        raise SignatureVerifierUnavailable(
+            "sr25519 verifier failed its startup known-answer check"
+        )
+    if keypair_class is None:
+        return KEYPAIR_SOURCE or "unknown"
+    return getattr(candidate, "__module__", "unknown")
 
 
 class RegistrationProvider(Protocol):
@@ -129,13 +250,42 @@ class JsonHotkeyRegistrationProvider:
     Typical update cycle: rotate the file from a cron job that re-fetches the
     metagraph; the max-age bound ensures a stuck cron is caught within one
     interval instead of silently admitting stale/deregistered hotkeys.
+
+    With ``strict=True`` (the production posture) none of the lenient formats
+    are accepted. Only the ``cathedral_registration_snapshot_v2`` document is,
+    and it must declare this exact network and netuid, a canonical
+    ``generated_at`` that is neither stale nor in the future, and a finalized
+    block that never moves backwards; the file must additionally be a regular
+    non-symlink file owned by the expected uid and not group/world writable.
     """
 
-    def __init__(self, path: str, *, max_age_seconds: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_age_seconds: int,
+        strict: bool = False,
+        network: str | None = None,
+        netuid: int | None = None,
+        expected_uid: int | None = None,
+    ) -> None:
         if max_age_seconds <= 0:
             raise ValueError("max_age_seconds must be a positive integer")
+        if strict and (network is None or netuid is None):
+            raise ValueError("strict snapshot verification requires network and netuid")
         self.path = path
         self.max_age_seconds = max_age_seconds
+        # Strict mode is the production posture: only the signed-shape v2
+        # document is accepted, its declared audience must equal ours, its
+        # block must be finalized and must not go backwards, and the file
+        # itself must be root-controlled and not a symlink. Every deviation
+        # fails closed rather than degrading to a weaker check.
+        self.strict = strict
+        self.network = network
+        self.netuid = netuid
+        self.expected_uid = 0 if (strict and expected_uid is None) else expected_uid
+        self._lock = threading.Lock()
+        self._highest_block = 0
 
     def load_snapshot(self) -> tuple[set[str], dict[str, str] | None] | None:
         """Read and parse the snapshot, applying the freshness bound.
@@ -145,15 +295,124 @@ class JsonHotkeyRegistrationProvider:
         missing, unreadable, stale, or malformed (fail closed).
         """
         try:
-            stat_result = os.stat(self.path)
-            age = time.time() - stat_result.st_mtime
-            if age > self.max_age_seconds:
-                return None  # stale snapshot; fail closed
-            with open(self.path, "r", encoding="utf-8") as fh:
-                content = fh.read()
+            content = self._read_checked()
         except OSError:
             return None  # missing or unreadable file; fail closed
+        if content is None:
+            return None
+        if self.strict:
+            return self._parse_strict(content)
         return self._parse(content)
+
+    def _read_checked(self) -> str | None:
+        """Read the snapshot with the file hygiene the mode requires.
+
+        In strict mode the path must be a regular, non-symlink file owned by
+        *expected_uid* and not writable by group or other, and the descriptor
+        actually read must be the same inode that was checked. A snapshot the
+        service does not control is a snapshot an attacker can use to declare
+        their own hotkey registered.
+        """
+        if not self.strict:
+            stat_result = os.stat(self.path)
+            if time.time() - stat_result.st_mtime > self.max_age_seconds:
+                return None  # stale snapshot; fail closed
+            with open(self.path, "r", encoding="utf-8") as handle:
+                return handle.read()
+
+        before = os.lstat(self.path)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            logger.warning("registration snapshot is not a regular file")
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(self.path, flags)
+        try:
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                logger.warning("registration snapshot changed underneath the read")
+                return None
+            if not stat.S_ISREG(after.st_mode):
+                return None
+            if self.expected_uid is not None and after.st_uid != self.expected_uid:
+                logger.warning("registration snapshot is not owned by the expected user")
+                return None
+            if after.st_mode & 0o022:
+                logger.warning("registration snapshot is group or world writable")
+                return None
+            if time.time() - after.st_mtime > self.max_age_seconds:
+                return None  # stale snapshot; fail closed
+            raw = os.read(descriptor, MAX_SNAPSHOT_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw) > MAX_SNAPSHOT_FILE_BYTES:
+            logger.warning("registration snapshot exceeds the maximum size")
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def _parse_strict(self, content: str) -> tuple[set[str], dict[str, str]] | None:
+        """Parse and fully verify the v2 registration snapshot.
+
+        Fails closed on: wrong schema, wrong network or netuid, missing or
+        non-canonical ``generated_at``, a stale or future ``generated_at``, a
+        block that is not a bounded positive integer, a block that is not
+        declared finalized, a block lower than one already accepted by this
+        process, or a hotkeys shape that cannot prove ownership.
+        """
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(document, dict):
+            return None
+        if document.get("schema") != REGISTRATION_SNAPSHOT_SCHEMA:
+            logger.warning("registration snapshot schema is unsupported")
+            return None
+        if document.get("network") != self.network or document.get("netuid") != self.netuid:
+            logger.warning("registration snapshot declares a different network or netuid")
+            return None
+        generated_raw = document.get("generated_at")
+        if not isinstance(generated_raw, str):
+            return None
+        try:
+            generated = _parse_iso_utc(generated_raw)
+        except ValueError:
+            return None
+        now = datetime.now(UTC)
+        if generated > now + timedelta(minutes=5):
+            logger.warning("registration snapshot generated_at is in the future")
+            return None
+        if (now - generated).total_seconds() > self.max_age_seconds:
+            return None  # stale by its own declaration, not just by mtime
+        if document.get("block_is_finalized") is not True:
+            logger.warning("registration snapshot does not declare a finalized block")
+            return None
+        block = document.get("block")
+        if isinstance(block, bool) or not isinstance(block, int) or not 0 < block <= MAX_SNAPSHOT_BLOCK:
+            logger.warning("registration snapshot block is not a bounded positive integer")
+            return None
+        with self._lock:
+            if block < self._highest_block:
+                # An older capture replayed over a newer one would re-admit
+                # hotkeys that have since deregistered.
+                logger.warning("registration snapshot block moved backwards")
+                return None
+            self._highest_block = block
+        mapping = document.get("hotkeys")
+        if not isinstance(mapping, dict) or len(mapping) > MAX_SNAPSHOT_HOTKEYS:
+            return None
+        for hotkey, coldkey in mapping.items():
+            if (
+                not isinstance(hotkey, str)
+                or HOTKEY_RE.fullmatch(hotkey) is None
+                or not isinstance(coldkey, str)
+                or HOTKEY_RE.fullmatch(coldkey) is None
+            ):
+                logger.warning("registration snapshot contains a malformed key")
+                return None
+        return set(mapping), dict(mapping)
 
     def is_registered(self, hotkey: str) -> bool | None:
         snapshot = self.load_snapshot()
@@ -221,6 +480,17 @@ def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _is_sqlite_contention(exc: sqlite3.OperationalError) -> bool:
+    """True when the error is lock contention rather than a real fault.
+
+    SQLite reports both through OperationalError, and only contention is
+    safe to answer with "come back in a moment". A schema or disk error must
+    keep propagating.
+    """
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -272,20 +542,39 @@ def validate_enroll_timestamp(
     return timestamp
 
 
+# Longest legitimate endpoint: scheme (8) + a full 253-byte DNS name + port.
+MAX_ENDPOINT_URL_LENGTH = 300
+
+
 def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = False) -> str:
     """Validate an enrollment endpoint URL.
 
-    :param require_ip_literal: when True (production mode), the host must be
-        a public IP literal. This closes the DNS check/use (TOCTOU) gap for
-        launch without a pinned custom connector: a hostname resolved at
-        enrollment time could resolve to a different, non-global address by
-        the time the prober connects (DNS rebinding). An IP literal has no
-        such gap because there is nothing left to resolve. Non-production
-        callers may still enroll a hostname endpoint; see ``prober.py`` for
-        the matching probe-time gate.
+    A path, query, or fragment is rejected in every mode: the prober appends
+    its own path, so anything the miner puts there is either ignored (a silent
+    mismatch between what was enrolled and what is probed) or a smuggling
+    attempt. The endpoint is an origin, not a URL.
+
+    :param require_ip_literal: when True (production mode), the endpoint must
+        additionally be HTTPS, carry an explicit valid port, and name a public
+        IP literal in its canonical textual form. The IP-literal rule closes
+        the DNS check/use (TOCTOU) gap for launch without a pinned custom
+        connector: a hostname resolved at enrollment time could resolve to a
+        different, non-global address by the time the prober connects (DNS
+        rebinding). An IP literal has no such gap because there is nothing
+        left to resolve. Requiring the *canonical* form additionally rejects
+        the aliases (``0177.0.0.1``, ``2130706433``, a compressible IPv6
+        form) that make one address look like several. Non-production callers
+        may still enroll a hostname endpoint; see ``prober.py`` for the
+        matching probe-time gate.
     """
     if not isinstance(endpoint_url, str):
         raise ValueError("endpoint_url must be a string")
+    if not endpoint_url or len(endpoint_url) > MAX_ENDPOINT_URL_LENGTH:
+        raise ValueError("endpoint_url is empty or too long")
+    if endpoint_url.strip() != endpoint_url or any(
+        not 0x21 <= ord(character) <= 0x7E for character in endpoint_url
+    ):
+        raise ValueError("endpoint_url must be visible ASCII with no whitespace")
     parsed = urlparse(endpoint_url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("endpoint_url must use http or https")
@@ -293,12 +582,26 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
         raise ValueError("endpoint_url must include a host and no credentials")
     if parsed.fragment:
         raise ValueError("endpoint_url must not include a fragment")
+    if parsed.query:
+        raise ValueError("endpoint_url must not include a query string")
+    if parsed.path:
+        raise ValueError("endpoint_url must not include a path")
+    if parsed.params:
+        raise ValueError("endpoint_url must not include URL parameters")
     host = parsed.hostname
     if host is None:
         raise ValueError("endpoint_url must include a host")
     normalized_host = host.rstrip(".").lower()
     if "%" in normalized_host or normalized_host in REJECTED_HOSTS:
         raise ValueError("endpoint_url host is not allowed")
+    try:
+        # Reading .port validates the numeric range for us and raises on a
+        # non-numeric port; do it before anything else looks at the netloc.
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("endpoint_url port must be an integer from 1 to 65535") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("endpoint_url port must be an integer from 1 to 65535")
     try:
         ip = ipaddress.ip_address(normalized_host)
     except ValueError:
@@ -310,15 +613,47 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
     else:
         if not is_globally_routable(ip):
             raise ValueError("endpoint_url host must be a public address")
+        if require_ip_literal:
+            if str(ip) != normalized_host:
+                raise ValueError("endpoint_url host must be a canonical IP literal")
+            # IPv4-mapped and 6to4 forms are the same host spelled differently.
+            # One endpoint must have one spelling or the chip-rotation and
+            # duplicate-endpoint checks downstream compare strings that look
+            # distinct while pointing at the same machine.
+            if getattr(ip, "ipv4_mapped", None) is not None or getattr(ip, "sixtofour", None):
+                raise ValueError("endpoint_url host must not be an IPv4-in-IPv6 alias")
+    if require_ip_literal:
+        if parsed.scheme != "https":
+            raise ValueError("endpoint_url must use https in production mode")
+        if port is None:
+            raise ValueError("endpoint_url must carry an explicit port in production mode")
     return endpoint_url
 
 
-def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timestamp: str) -> bytes:
-    """Canonical bytes miners sign before calling /v1/enroll."""
+def canonical_enroll_payload(
+    hotkey: str,
+    endpoint_url: str,
+    nonce: str,
+    timestamp: str,
+    *,
+    network: str = DEFAULT_ENROLL_NETWORK,
+    netuid: int = DEFAULT_ENROLL_NETUID,
+    domain: str = ENROLL_DOMAIN_TAG,
+) -> bytes:
+    """Canonical bytes miners sign before calling /v1/enroll.
+
+    The domain tag, network, and netuid are inside the signed document, not
+    just alongside it. A signature produced for SN292 on testnet, or by some
+    other protocol that happens to sign a JSON object with these field names,
+    therefore cannot be replayed against SN39 on finney.
+    """
 
     payload = {
+        "domain": domain,
         "endpoint_url": endpoint_url,
         "hotkey": hotkey,
+        "netuid": netuid,
+        "network": network,
         "nonce": nonce,
         "timestamp": timestamp,
     }
@@ -327,7 +662,7 @@ def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timesta
 
 def verify_enroll_signature(hotkey: str, message: bytes, signature_b64: object) -> None:
     if Keypair is None:
-        raise ValueError("sr25519 signature verifier unavailable")
+        raise SignatureVerifierUnavailable("sr25519 signature verifier unavailable")
     if not isinstance(signature_b64, str):
         raise ValueError("signature_b64 is required")
     try:
@@ -367,8 +702,27 @@ class RegistryStore:
         *,
         verification_ttl_seconds: int | None = None,
         clock: Callable[[], datetime] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> None:
         self.path = path
+        if busy_timeout_ms is None:
+            busy_timeout_ms = _positive_int_from_env(
+                SQLITE_BUSY_TIMEOUT_ENV,
+                DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            )
+        if (
+            isinstance(busy_timeout_ms, bool)
+            or not isinstance(busy_timeout_ms, int)
+            or busy_timeout_ms <= 0
+        ):
+            raise ValueError("busy_timeout_ms must be positive")
+        # Every connection waits the same bounded time for the write lock.
+        # Left at the default this is identical to the previous implicit
+        # behavior; the enrollment service lowers it explicitly so a contended
+        # request becomes a 503 with Retry-After before the reverse proxy's
+        # own read timeout fires.
+        self.busy_timeout_ms = busy_timeout_ms
+        self._last_attempt_sweep = 0.0
         if verification_ttl_seconds is None:
             verification_ttl_seconds = _positive_int_from_env(
                 VERIFICATION_TTL_ENV,
@@ -398,10 +752,72 @@ class RegistryStore:
         return when
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        # timeout= covers the Python-level lock wait; busy_timeout covers the
+        # SQLite-level one. Set both to the same bound so neither can outlive
+        # the other and leave a request hanging.
+        conn = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000.0)
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def journal_mode(self) -> str:
+        with self._connect() as conn:
+            return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+    def backup_to(self, destination: str) -> int:
+        """Take a transaction-safe online copy and return its page count.
+
+        Uses SQLite's backup API, which holds a read lock and copies committed
+        pages. Copying the file with ``cp`` while another process is mid
+        transaction produces a torn image whose rollback journal is not
+        alongside it, so the copy can be unrecoverable exactly when it is
+        needed.
+        """
+        if os.path.exists(destination):
+            raise ValueError("backup destination already exists")
+        source = self._connect()
+        try:
+            target = sqlite3.connect(destination)
+            try:
+                source.backup(target)
+                pages = int(target.execute("PRAGMA page_count").fetchone()[0])
+                integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
+                if integrity.lower() != "ok":
+                    raise ValueError("backup failed its integrity check")
+            finally:
+                target.close()
+        finally:
+            source.close()
+        descriptor = os.open(destination, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return pages
+
+    def set_journal_mode(self, mode: str) -> tuple[str, str]:
+        """Switch the journal mode, returning ``(before, after)``.
+
+        WAL lets the enrollment reader/writer and the epoch writer overlap
+        instead of serializing on a single file lock. The switch itself takes
+        an exclusive lock briefly, which is why it is an operator action with
+        a backup in front of it and never something the service does on start.
+        """
+        normalized = mode.strip().lower()
+        if normalized not in {"delete", "wal", "truncate", "persist", "memory", "off"}:
+            raise ValueError("unsupported sqlite journal mode")
+        conn = self._connect()
+        try:
+            before = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            after = str(
+                conn.execute(f"PRAGMA journal_mode = {normalized}").fetchone()[0]
+            ).lower()
+        finally:
+            conn.close()
+        if after != normalized:
+            raise ValueError(f"sqlite refused the journal mode change (still {after})")
+        return before, after
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -1421,6 +1837,19 @@ class RegistryStore:
             datetime.now(UTC) - timedelta(seconds=window_seconds)
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self._connect() as conn:
+            # BEGIN IMMEDIATE makes count-then-insert one atomic decision.
+            # Read-then-write without it lets two concurrent requests both
+            # observe limit-1 rows and both insert, so the durable bound the
+            # docstring promises could be exceeded exactly under the load it
+            # exists to bound.
+            conn.execute("BEGIN IMMEDIATE")
+            # Prune this hotkey's expired rows inside the same transaction:
+            # rows outside the window can never affect a decision again, and
+            # a public endpoint would otherwise grow this table without limit.
+            conn.execute(
+                "DELETE FROM hotkey_enroll_attempts WHERE hotkey = ? AND attempted_at_iso < ?",
+                (hotkey, cutoff),
+            )
             count = conn.execute(
                 """
                 SELECT COUNT(*) FROM hotkey_enroll_attempts
@@ -1434,7 +1863,34 @@ class RegistryStore:
                 "INSERT INTO hotkey_enroll_attempts(hotkey, attempted_at_iso) VALUES (?, ?)",
                 (hotkey, ts),
             )
+        self._sweep_expired_attempts(window_seconds)
         return True
+
+    def _sweep_expired_attempts(self, window_seconds: int) -> None:
+        """Drop expired attempt rows for hotkeys that never came back.
+
+        Per-hotkey pruning only touches hotkeys that keep enrolling. A caller
+        that enrolls once from each of many hotkeys would leave rows behind
+        forever, so sweep the whole table on a timer. Rate-limited so one
+        request never pays for an unbounded delete.
+        """
+        now = time.monotonic()
+        if now - self._last_attempt_sweep < HOTKEY_ATTEMPT_SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_attempt_sweep = now
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=window_seconds)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM hotkey_enroll_attempts WHERE attempted_at_iso < ?",
+                    (cutoff,),
+                )
+        except sqlite3.OperationalError:
+            # Housekeeping must never fail an enrollment that already
+            # succeeded; the next sweep window retries.
+            logger.warning("hotkey attempt sweep skipped: registry busy")
 
     def enrollments(self) -> list[Enrollment]:
         with self._connect() as conn:
@@ -1798,21 +2254,61 @@ class RegistryStore:
 
 
 class IpRateLimiter:
-    def __init__(self, *, limit: int = 10, window_seconds: int = 60) -> None:
+    """Per-address request bound with a hard ceiling on tracked addresses.
+
+    The key space is chosen by the caller, so on a public endpoint an
+    unbounded dict is a remote memory-growth primitive: one request per source
+    address from a large botnet, or from a spoofed-source flood, is enough.
+    Expired buckets are dropped first; past *max_keys* the least recently used
+    bucket is evicted. Eviction only ever forgets history, so an attacker who
+    forces eviction buys themselves a fresh bucket, which is exactly what the
+    durable per-hotkey bound in the database exists to catch.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int = 10,
+        window_seconds: int = 60,
+        max_keys: int = DEFAULT_IP_LIMITER_MAX_KEYS,
+    ) -> None:
+        if limit <= 0 or window_seconds <= 0 or max_keys <= 0:
+            raise ValueError("limit, window_seconds, and max_keys must be positive")
         self.limit = limit
         self.window_seconds = window_seconds
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self.max_keys = max_keys
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
+        self._lock = threading.Lock()
 
     def allow(self, ip: str) -> bool:
         now = time.monotonic()
-        hits = self._hits[ip]
         cutoff = now - self.window_seconds
-        while hits and hits[0] < cutoff:
-            hits.popleft()
-        if len(hits) >= self.limit:
-            return False
-        hits.append(now)
-        return True
+        with self._lock:
+            self._evict(cutoff)
+            hits = self._hits.get(ip)
+            if hits is None:
+                hits = deque()
+                self._hits[ip] = hits
+            else:
+                self._hits.move_to_end(ip)
+            while hits and hits[0] < cutoff:
+                hits.popleft()
+            if len(hits) >= self.limit:
+                return False
+            hits.append(now)
+            return True
+
+    def tracked_keys(self) -> int:
+        with self._lock:
+            return len(self._hits)
+
+    def _evict(self, cutoff: float) -> None:
+        # Drop fully expired buckets from the LRU end first; they carry no
+        # decision value. Only then fall back to evicting live buckets.
+        for key in [key for key, hits in self._hits.items() if not hits or hits[-1] < cutoff]:
+            del self._hits[key]
+        while len(self._hits) >= self.max_keys:
+            self._hits.popitem(last=False)
 
 
 class RegistryApp:
@@ -1828,7 +2324,14 @@ class RegistryApp:
         trusted_proxy: bool = False,
         hotkey_enroll_limit: int = DEFAULT_HOTKEY_ENROLL_LIMIT,
         hotkey_enroll_window_seconds: int = DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS,
+        network: str = DEFAULT_ENROLL_NETWORK,
+        netuid: int = DEFAULT_ENROLL_NETUID,
     ) -> None:
+        # Refuse to exist without a working verifier. Constructing an app that
+        # cannot check a signature only defers the failure to every request,
+        # where it looks like the caller's fault.
+        preflight_signature_verifier()
+        self.network, self.netuid = validate_score_audience(network, netuid)
         self.store = store
         self.limiter = limiter if limiter is not None else IpRateLimiter()
         if enroll_signature_ttl_seconds is None:
@@ -1868,23 +2371,51 @@ class RegistryApp:
             if method == "GET" and path == "/v1/attested":
                 return self._json(start_response, 200, self.store.board())
             return self._json(start_response, 404, {"error": "not found"})
+        except sqlite3.OperationalError as exc:
+            # The epoch loop holds the registry's write lock for a bounded
+            # window every few minutes. Waiting past the busy timeout is a
+            # capacity answer, not a caller error: say so and give a concrete
+            # retry delay rather than hanging or corrupting anything.
+            if not _is_sqlite_contention(exc):
+                raise
+            logger.warning("enroll deferred: registry busy")
+            return self._json(
+                start_response,
+                503,
+                {"error": "registry busy, retry shortly"},
+                headers=[("Retry-After", str(ENROLL_BUSY_RETRY_AFTER_SECONDS))],
+            )
         except ValueError as exc:
             return self._json(start_response, 400, {"error": str(exc)})
         except json.JSONDecodeError:
             return self._json(start_response, 400, {"error": "invalid json"})
 
+    def _client_ip(self, environ: dict[str, Any]) -> str:
+        """Resolve the rate-limit key from the request.
+
+        Never trust X-Forwarded-For unless the app is explicitly configured to
+        run behind a trusted reverse proxy: a spoofed header lets any client
+        pick an arbitrary source IP and bypass the per-address rate limit.
+        Even then, the trusted proxy is configured to *overwrite* the header
+        with the peer address, so exactly one IP literal must be present. A
+        list, or anything that is not an IP literal, means the header reached
+        us unfiltered and is discarded in favour of REMOTE_ADDR.
+        """
+        remote = environ.get("REMOTE_ADDR", "")
+        if not self.trusted_proxy:
+            return remote
+        forwarded = environ.get("HTTP_X_FORWARDED_FOR")
+        if not isinstance(forwarded, str) or "," in forwarded:
+            return remote
+        candidate = forwarded.strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return remote
+        return candidate
+
     def _enroll(self, environ: dict[str, Any], start_response: Any) -> list[bytes]:
-        # Never trust X-Forwarded-For unless the app is explicitly configured to
-        # run behind a trusted reverse proxy.  A spoofed header lets any client
-        # pick an arbitrary source IP and bypass the per-address rate limit.
-        if self.trusted_proxy:
-            ip = (
-                environ.get("HTTP_X_FORWARDED_FOR", environ.get("REMOTE_ADDR", ""))
-                .split(",")[0]
-                .strip()
-            )
-        else:
-            ip = environ.get("REMOTE_ADDR", "")
+        ip = self._client_ip(environ)
         if not self.limiter.allow(ip or "unknown"):
             return self._reject(
                 start_response,
@@ -1907,11 +2438,44 @@ class RegistryApp:
             payload.get("timestamp"),
             max_age_seconds=self.enroll_signature_ttl_seconds,
         )
-        verify_enroll_signature(
-            hotkey,
-            canonical_enroll_payload(hotkey, endpoint_url, nonce, timestamp),
-            payload.get("signature_b64"),
+        # The audience is both an explicit request field and part of the
+        # signed preimage. The explicit field turns a testnet or wrong-subnet
+        # submission into a clear 403 instead of an opaque signature failure;
+        # the signed copy is what actually stops the replay.
+        network, netuid = validate_score_audience(
+            payload.get("network"), payload.get("netuid")
         )
+        if (network, netuid) != (self.network, self.netuid):
+            return self._reject(
+                start_response,
+                403,
+                "enrollment is for a different network or netuid",
+                hotkey=hotkey,
+                reason="wrong_audience",
+            )
+        try:
+            verify_enroll_signature(
+                hotkey,
+                canonical_enroll_payload(
+                    hotkey,
+                    endpoint_url,
+                    nonce,
+                    timestamp,
+                    network=network,
+                    netuid=netuid,
+                ),
+                payload.get("signature_b64"),
+            )
+        except ValueError:
+            # A signature that does not verify is an authentication failure,
+            # not a malformed request: the body parsed fine.
+            return self._reject(
+                start_response,
+                403,
+                "enrollment signature did not verify",
+                hotkey=hotkey,
+                reason="signature_invalid",
+            )
 
         # Per-hotkey durable enrollment rate limit. Backed by SQLite so the
         # bound survives restarts and is consistent across app instances that
@@ -2007,7 +2571,26 @@ class RegistryApp:
 
         self.store.enroll(hotkey, endpoint_url, nonce=nonce)
         logger.info("enroll accepted hotkey=%s", hotkey)
-        return self._json(start_response, 200, {"status": "enrolled"})
+        # Not "enrolled". Worker token provisioning is still operator-assisted
+        # (MINING.md step 7), so a bare success would tell a miner they are
+        # ready to be scored when the validator cannot yet dispatch work to
+        # them. Name the state that actually exists.
+        return self._json(
+            start_response,
+            200,
+            {
+                "status": "enrolled_pending_secret",
+                "hotkey": hotkey,
+                "network": self.network,
+                "netuid": self.netuid,
+                "scored": False,
+                "next_step": (
+                    "the operator must provision the worker bearer token before "
+                    "any work is dispatched; see MINING.md"
+                ),
+                "check_progress": "/v1/attested",
+            },
+        )
 
     def _resolve_coldkey(self, hotkey: str) -> str | None:
         """Resolve the coldkey owning *hotkey* via the registration provider.
@@ -2062,20 +2645,63 @@ class RegistryApp:
         return payload
 
     @staticmethod
-    def _json(start_response: Any, status: int, payload: dict[str, Any]) -> list[bytes]:
+    def _json(
+        start_response: Any,
+        status: int,
+        payload: dict[str, Any],
+        *,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> list[bytes]:
         reason = {
             200: "OK",
             400: "Bad Request",
             403: "Forbidden",
             404: "Not Found",
             429: "Too Many Requests",
+            503: "Service Unavailable",
         }.get(status, "OK")
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
         start_response(
             f"{status} {reason}",
-            [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(body))),
+                *(headers or []),
+            ],
         )
         return [body]
+
+
+class _QuietRequestHandler(WSGIRequestHandler):
+    """Bounded, non-echoing request handler for the loopback listener.
+
+    The default handler writes the raw request line to stderr, which puts
+    caller-controlled bytes straight into the journal. It also has no socket
+    timeout, and this is a deliberately single-process, single-threaded
+    server, so one client that opens a connection and stops writing would
+    stall every other enrollment. Neither is acceptable on a path that is
+    reachable, through the proxy, from the public internet.
+    """
+
+    timeout = 10
+    # HTTP/1.0 semantics: one request per connection, closed on completion.
+    # Nothing here needs keep-alive, and not having it removes a way to hold
+    # the single worker.
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        logger.info("http %s", format % args if args else format)
+
+    def address_string(self) -> str:
+        # Never reverse-resolve the peer: a DNS lookup per request is both a
+        # latency amplifier and an outbound side channel.
+        return self.client_address[0]
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except TimeoutError:
+            self.close_connection = True
 
 
 def main() -> None:
@@ -2155,12 +2781,62 @@ def main() -> None:
             "N seconds (default: 86400)"
         ),
     )
+    parser.add_argument(
+        "--network",
+        default=DEFAULT_ENROLL_NETWORK,
+        help="chain network this registry enrolls for (default: finney)",
+    )
+    parser.add_argument(
+        "--netuid",
+        type=int,
+        default=DEFAULT_ENROLL_NETUID,
+        help="subnet uid this registry enrolls for (default: 39)",
+    )
+    parser.add_argument(
+        "--sqlite-busy-timeout-ms",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "bounded wait for the registry write lock before answering 503 "
+            f"(default: {DEFAULT_SQLITE_BUSY_TIMEOUT_MS})"
+        ),
+    )
+    parser.add_argument(
+        "--development-allow-non-loopback",
+        action="store_true",
+        help=(
+            "bind a non-loopback address. Never use in production: the "
+            "service is designed to sit behind the reverse proxy that "
+            "terminates TLS and overwrites X-Forwarded-For"
+        ),
+    )
     args = parser.parse_args()
 
     if args.registration_max_age_seconds <= 0:
         parser.error("--registration-max-age-seconds must be a positive integer")
     if args.enroll_allowlist_max_age_seconds <= 0:
         parser.error("--enroll-allowlist-max-age-seconds must be a positive integer")
+    if args.sqlite_busy_timeout_ms is not None and args.sqlite_busy_timeout_ms <= 0:
+        parser.error("--sqlite-busy-timeout-ms must be a positive integer")
+    try:
+        network, netuid = validate_score_audience(args.network, args.netuid)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    # A public write endpoint must not own its own exposure. Binding loopback
+    # keeps the rate limits, request bounds, and TLS in the reverse proxy
+    # where they can be configured and audited independently.
+    if not args.development_allow_non_loopback:
+        try:
+            bind_ip = ipaddress.ip_address(args.host)
+        except ValueError:
+            parser.error("--host must be a loopback IP literal")
+        if not bind_ip.is_loopback:
+            parser.error(
+                "--host must be a loopback address; pass "
+                "--development-allow-non-loopback to override"
+            )
 
     if args.production_mode and not args.registered_hotkeys_file:
         parser.error("--production-mode requires --registered-hotkeys-file")
@@ -2184,11 +2860,25 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # Startup preflight. Without a working sr25519 verifier every enrollment
+    # would return 403 with a message that reads like the miner's mistake.
+    # Refusing to open the listener is the honest failure: it is loud, it is
+    # visible in `systemctl status`, and it cannot be mistaken for policy.
+    try:
+        verifier_source = preflight_signature_verifier()
+    except SignatureVerifierUnavailable as exc:
+        parser.exit(2, f"refusing to serve: {exc}\n")
+    logger.info("sr25519 verifier ready source=%s", verifier_source)
+
     provider: RegistrationProvider | None = None
     if args.registered_hotkeys_file:
         provider = JsonHotkeyRegistrationProvider(
             args.registered_hotkeys_file,
             max_age_seconds=args.registration_max_age_seconds,
+            # Production mode accepts only the fully verified v2 snapshot.
+            strict=args.production_mode,
+            network=network,
+            netuid=netuid,
         )
 
     allowlist: SignedColdkeyAllowlistProvider | None = None
@@ -2205,14 +2895,22 @@ def main() -> None:
         )
 
     app = RegistryApp(
-        RegistryStore(args.db),
+        RegistryStore(args.db, busy_timeout_ms=args.sqlite_busy_timeout_ms),
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,
         coldkey_allowlist=allowlist,
+        network=network,
+        netuid=netuid,
     )
-    with make_server(args.host, args.port, app) as server:
-        logger.info("serving registry on http://%s:%d", args.host, args.port)
+    with make_server(args.host, args.port, app, handler_class=_QuietRequestHandler) as server:
+        logger.info(
+            "serving registry on http://%s:%d network=%s netuid=%d",
+            args.host,
+            args.port,
+            network,
+            netuid,
+        )
         server.serve_forever()
 
 

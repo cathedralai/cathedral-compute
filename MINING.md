@@ -53,7 +53,8 @@ self-reported volume alone.
 
 - Intel TDX CPU is the only active provider hardware class.
 - AMD SEV-SNP and NVIDIA confidential-GPU scoring are not enabled.
-- Enrollment and secret exchange are operator-assisted.
+- Enrollment is operator-assisted. A gated self-service endpoint exists but
+  is not announced or open; contact the operator for a beta slot.
 - A supported mainnet worker must use the reviewed HTTPS and channel-binding
   design. The development plain-HTTP flag is not a production path.
 - Cathedral may have no available beta slot or no positive work in an epoch.
@@ -279,20 +280,96 @@ channel claim.
 Run the accepted command under a restricted supervisor such as systemd. Do not
 leave a long-lived worker attached to an ordinary SSH session.
 
-## 7. Complete private enrollment
+## 7. Submit your enrollment
 
-Through the agreed private channel, provide only the accepted enrollment
-fields:
+Enrollment is a signed request from your own machine. Your coldkey must
+already be on the approved allowlist (`docs/ENROLLMENT_ALLOWLIST.md`); ask for
+that in the beta request from step 1, before you get here.
+
+Run the submit command on the host that holds your wallet:
+
+```bash
+cathedral enroll submit \
+  --registry-url https://api.cathedral.computer \
+  --endpoint-url "https://<public-ip>:8443" \
+  --wallet-name <wallet-name> \
+  --hotkey-name <hotkey-name> \
+  --network finney \
+  --netuid 39
+```
+
+The command reads your hotkey from the local wallet directory, signs the
+enrollment, and posts it. Nothing secret leaves the machine and nothing
+secret is accepted on the command line: there is no seed, mnemonic, or
+private-key flag, so a seed cannot end up in `ps` output, your shell history,
+or a log. What is sent is your public hotkey, the endpoint, a nonce, a
+timestamp, and the signature.
+
+`--endpoint-url` must be an HTTPS origin naming a public IP literal with an
+explicit port, and nothing else: no hostname, no path, no query, no fragment.
+Hostnames are rejected because the address could change between the moment you
+enroll and the moment the validator connects.
+
+### What you are signing
+
+The signature covers this exact document, serialized as compact JSON with
+sorted keys and no whitespace:
+
+<!-- enroll-preimage-example -->
+```json
+{
+  "domain": "cathedral-enroll-v1",
+  "endpoint_url": "https://34.61.154.15:8443",
+  "hotkey": "5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK",
+  "netuid": 39,
+  "network": "finney",
+  "nonce": "9f2c41b8e7a05d3641f8b2ce90a7d5138c6e4b02af9317d5e64c8b0a72d1f3e6",
+  "timestamp": "2026-07-26T21:00:00Z"
+}
+```
+
+The `domain`, `network`, and `netuid` fields are inside the signature, not
+just beside it. That is what stops a signature you produced for testnet SN292,
+or for some other protocol, from being replayed as an SN39 enrollment. A test
+in this repository rebuilds the document above from the registry's own code on
+every run, so this example cannot drift from what the server verifies.
+
+### Status contract
+
+The endpoint answers with one of these. Nothing else is a valid outcome.
+
+| HTTP | `status` or `error` | What it means | What to do |
+|---|---|---|---|
+| 200 | `enrolled_pending_secret` | The signature, registration, and coldkey approval all passed. Your endpoint is recorded. | Nothing yet. See below. |
+| 400 | validation message | The request was malformed: bad field, bad endpoint shape, replayed nonce, expired timestamp, oversized body | Fix the named field and resubmit with a fresh nonce |
+| 403 | `enrollment signature did not verify` | The signature does not match the document above | Check your wallet, network, and netuid, then resubmit |
+| 403 | `enrollment is for a different network or netuid` | You submitted an SN292 or wrong-subnet enrollment | Resubmit with the right audience |
+| 403 | `hotkey not registered on subnet` | Your hotkey is not in the current registration snapshot | Confirm your registration, then retry in a few minutes |
+| 403 | `coldkey is not approved for enrollment` | Your owning coldkey is not on the allowlist | Ask in your beta request; this is an operator decision |
+| 403 | `enrollment allowlist unavailable` / `hotkey coldkey could not be resolved` | An operator-side artifact is stale or unavailable. Never your fault | Retry later; report if it persists |
+| 429 | rate limit exceeded | Too many attempts from your address or hotkey | Back off; the hotkey window is one hour |
+| 503 | `registry busy, retry shortly` | The registry was mid write when your request landed | Retry after the `Retry-After` seconds |
+
+**`enrolled_pending_secret` does not mean you are being scored.** It is
+deliberately not called `enrolled`. Worker bearer-token provisioning is still
+operator-assisted, and until the operator has provisioned yours, the validator
+cannot dispatch work to you. The response says `"scored": false` for that
+reason.
+
+After a 200, provide the worker bearer token through the agreed private
+channel:
 
 ```text
-network:  mainnet SN39 or testnet SN292
 hotkey:   <registered public SS58 address>
-endpoint: https://<accepted worker endpoint>
 token:    <unique worker bearer token>
 ```
 
 Rotate the token immediately if it appears in a screenshot, shared shell
-history, public message, or unprotected log.
+history, public message, or unprotected log. Never send a seed, a private key,
+or a TLS private key through any channel.
+
+Watch `GET /v1/attested` for your hotkey to appear with a verified status.
+That, not the enrollment response, is the signal that attestation succeeded.
 
 The validator operator then checks:
 
@@ -303,12 +380,11 @@ The validator operator then checks:
 5. bounded work completes and its witness verifies; and
 6. the complete score report contains the correct explicit outcome.
 
-Production enrollment is additionally gated by a signed allowlist of
-approved coldkeys: the registry resolves your hotkey's owning coldkey and
-rejects the enrollment unless that coldkey has been approved, failing closed
-whenever the allowlist or the resolution is unavailable. See
-`docs/ENROLLMENT_ALLOWLIST.md` for the artifact format and operator
-workflow.
+Production enrollment is gated by a signed allowlist of approved coldkeys: the
+registry resolves your hotkey's owning coldkey and rejects the enrollment
+unless that coldkey has been approved, failing closed whenever the allowlist
+or the resolution is unavailable. See `docs/ENROLLMENT_ALLOWLIST.md` for the
+artifact format and operator workflow.
 
 ## 8. Know what success means
 
