@@ -43,6 +43,8 @@ from cathedral.coldkey_allowlist import (
     verify_allowlist,
 )
 from cathedral.enroll import (
+    DEFAULT_ENROLL_NETUID,
+    DEFAULT_ENROLL_NETWORK,
     JsonHotkeyRegistrationProvider,
     RegistryApp,
     RegistryStore,
@@ -80,15 +82,21 @@ def _signed_payload(
     hotkey: str = HOTKEY,
     nonce: str = "aa" * 16,
     timestamp: str | None = None,
-) -> dict[str, str]:
+    network: str = DEFAULT_ENROLL_NETWORK,
+    netuid: int = DEFAULT_ENROLL_NETUID,
+) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
-    message = canonical_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    message = canonical_enroll_payload(
+        hotkey, endpoint_url, nonce, ts, network=network, netuid=netuid
+    )
     sig = b64encode(keypair.sign(message)).decode("ascii")
     return {
         "hotkey": hotkey,
         "endpoint_url": endpoint_url,
         "nonce": nonce,
         "timestamp": ts,
+        "network": network,
+        "netuid": netuid,
         "signature_b64": sig,
     }
 
@@ -195,7 +203,10 @@ def test_allowlisted_coldkey_enrolls(tmp_path: Path) -> None:
     )
     status, body = _call(app, _signed_payload(nonce="10" * 16))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled_pending_secret"
+    # The response must never read as "ready to be scored": worker token
+    # provisioning is still operator-assisted.
+    assert body["scored"] is False
     assert [e.hotkey for e in app.store.enrollments()] == [HOTKEY]
 
 
@@ -381,7 +392,10 @@ def test_non_production_without_allowlist_keeps_current_behavior(tmp_path: Path)
         app, _signed_payload("https://miner.example.com:8090", nonce="41" * 16)
     )
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled_pending_secret"
+    # The response must never read as "ready to be scored": worker token
+    # provisioning is still operator-assisted.
+    assert body["scored"] is False
 
 
 def test_non_production_with_allowlist_activates_gate(tmp_path: Path) -> None:

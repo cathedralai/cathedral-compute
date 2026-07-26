@@ -61,12 +61,19 @@ is closed by absence, not by policy. Pick a path before starting.
 | | Path A: keep the private channel | Path B: self-service enrollment goes live |
 |---|---|---|
 | What the allowlist does | Governance record plus the drift check that `enroll reconcile` runs against the hand-maintained registry | The enforcing gate on every `POST /v1/enroll` |
-| Steps | 1 to 6 | 1 to 7 |
+| Steps | 1 to 6 | 1 to 8 |
 | New attack surface | none | a public write endpoint |
 | Note | manual `RegistryStore.enroll` bypasses the gate entirely, so the allowlist is only as good as the discipline of running step 6 | the gate is authoritative from the first start |
 
-Path A is the smaller move and is consistent with what MINING.md promises
-miners today. Path B is a launch decision, not an ops change.
+Path A is the smaller move. Path B is a launch decision, not an ops change:
+it publishes a write endpoint and changes what MINING.md promises miners.
+
+Under Path B the whole request path must hold from the first start, not
+eventually. Steps 7 and 8 exist because it does not: the deployed venv has no
+`substrateinterface`, so the enrollment signature verifier was silently
+absent and every request would have returned 403; and the registry database
+is shared with the epoch loop in rollback-journal mode, so enrollment writes
+would have collided with it. Both are fixed before the listener opens.
 
 ## Parameter choices
 
@@ -300,13 +307,102 @@ workers.
 **Rollback:** removal is terminal lifecycle retirement, not row deletion, and
 the lifecycle ledger is append-only. Recovery is re-enrollment of the hotkey
 (private channel today, `POST /v1/enroll` under Path B) followed by a fresh
-attestation on the next epoch. Back up the DB first if in any doubt:
-`sudo cp -a /var/lib/cathedral-confidential-sn39/registry.sqlite{,.pre-reconcile-$(date -u +%Y%m%dT%H%M%SZ).bak}`.
+attestation on the next epoch. Back up the database first:
 
-## Step 7 (Path B only): turn the gate on
+```bash
+sudo "$VENV/bin/cathedral" enroll backup \
+  --registry-db /var/lib/cathedral-confidential-sn39/registry.sqlite \
+  --out /var/backups/cathedral/registry.pre-reconcile-$(date -u +%Y%m%dT%H%M%SZ).sqlite
+```
+
+Never `cp` this file. The epoch loop writes it every five minutes, so a plain
+copy can capture pages from a transaction that was still open, with the
+rollback journal left behind at the source. The result is a file that looks
+like a backup and is unrecoverable exactly when it is needed. `enroll backup`
+uses SQLite's online backup API, which holds a read lock and copies only
+committed pages, then runs an integrity check on the copy and refuses to
+overwrite an existing destination.
+
+## Step 7 (Path B only): settle the SQLite concurrency posture
+
+The enrollment service and the epoch loop write the same `registry.sqlite`.
+In the default rollback-journal mode those two writers serialize on a single
+file lock, so an enrollment POST landing inside an epoch write window waits
+and then fails. WAL lets a reader and a writer overlap, which turns most of
+those collisions into nothing at all. Do this before the service exists, not
+after miners are pointing at it.
+
+The migration takes a brief exclusive lock, so stop the epoch loop for it.
+Nothing else is touched: the validator, the scorer, and the canaries keep
+running.
+
+```bash
+sudo systemctl stop cathedral-confidential-epoch-sn39.service
+
+sudo install -d -m 0700 -o root -g root /var/backups/cathedral
+sudo "$VENV/bin/cathedral" enroll journal-mode \
+  --registry-db /var/lib/cathedral-confidential-sn39/registry.sqlite \
+  --mode wal \
+  --backup-to /var/backups/cathedral/registry.pre-wal-$(date -u +%Y%m%dT%H%M%SZ).sqlite
+
+sudo systemctl start cathedral-confidential-epoch-sn39.service
+```
+
+`journal-mode` refuses to run without `--backup-to` and takes the online
+backup before it touches anything. It prints `journal_mode_before` and
+`journal_mode_after`; both must appear and `after` must be `wal`.
+
+Then wait for one epoch (the interval is 300 seconds) and confirm the loop is
+writing again and still producing attested evidence before going further.
+
+```bash
+sudo systemctl status cathedral-confidential-epoch-sn39.service --no-pager
+sudo journalctl -u cathedral-confidential-epoch-sn39.service --since '-10min' --no-pager | tail -20
+```
+
+**Rollback:** stop the epoch loop, run the same command with `--mode delete`,
+start the loop. If the database itself is in doubt, stop the loop and restore
+the backup file over `registry.sqlite`.
+
+The service additionally sets an explicit `busy_timeout` of 4000 ms
+(`--sqlite-busy-timeout-ms`), comfortably under the proxy's 10 s
+`proxy_read_timeout`. A request that cannot get the lock inside it returns
+`503` with `Retry-After`, which is a bounded, honest answer; it never hangs
+and never leaves a partial write.
+
+This bound is passed on the enrollment service's command line and nowhere
+else, on purpose. `RegistryStore` is shared with the epoch/evidence path
+(`cathedral/runtime.py`, `prober.py`, `key_release.py`), and its default lock
+wait stays at the 5000 ms those callers have always had. Only the process
+that sits behind a reverse proxy needs a shorter one.
+
+## Step 8 (Path B only): create the confined service
 
 There is no existing invocation to amend. Enabling the gate means creating the
-service, with the flags present from its first start.
+service, with every flag present from its first start.
+
+### Choosing the confinement shape
+
+SQLite must create `-wal` and `-shm` siblings next to the database, so any
+identity that writes `registry.sqlite` also needs to create files in
+`/var/lib/cathedral-confidential-sn39`. That directory is `0700 root:root` and
+holds the ledger, the retained evidence, and the policy history.
+
+A dedicated `cathedral-enroll` user would therefore need either an ACL on that
+directory (this host has no `setfacl`, and `acl` is not installed) or group
+permissions on the directory itself, which would newly expose `ledger.sqlite`
+and the rest of the directory to that group. Re-permissioning a live database
+the epoch loop writes every five minutes, to narrow access to one file, is a
+worse trade than it looks.
+
+So the confinement is done in systemd instead. The service runs as root but
+with **an empty capability bounding set**, which means it loses
+`CAP_DAC_OVERRIDE` and gets no privileged file access at all; it reaches
+`registry.sqlite` only because root owns it. Everything else in the directory
+is explicitly withdrawn: the ledger and policy state are read-only, and the
+evidence, snapshot, and policy-history subtrees plus the allowlist signing
+seed are made invisible. The result is narrower than the group approach and
+changes nothing on disk.
 
 `/etc/systemd/system/cathedral-enroll-sn39.service`
 
@@ -319,45 +415,180 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/opt/cathedral-sn39/venvs/9540de4409bfda74dd9827cb7c969ad4e2243543/bin/python \
+Group=root
+ExecStart=/opt/cathedral-sn39/venvs/enroll-path-b/bin/python \
   -m cathedral.enroll \
   --db /var/lib/cathedral-confidential-sn39/registry.sqlite \
   --host 127.0.0.1 --port 8090 \
   --trusted-proxy \
   --production-mode \
+  --network finney --netuid 39 \
   --registered-hotkeys-file /var/lib/cathedral-confidential-sn39/registered-hotkeys.json \
   --registration-max-age-seconds 3600 \
-  --enroll-allowlist /etc/cathedral/enroll-allowlist-sn39.json \
+  --enroll-allowlist /etc/cathedral/enroll-allowlist-sn39.r1.json \
   --enroll-allowlist-keys /etc/cathedral/enroll-allowlist-keys-sn39.json \
   --enroll-allowlist-keys-digest sha256:<KEYS_DIGEST> \
   --enroll-allowlist-digest sha256:<ARTIFACT_DIGEST> \
-  --enroll-allowlist-max-age-seconds 2592000
+  --enroll-allowlist-max-age-seconds 2592000 \
+  --sqlite-busy-timeout-ms 4000
 Restart=on-failure
 RestartSec=5
+UMask=0077
+
+# Confinement. The service needs one database, three read-only artifacts, and
+# one loopback socket. Nothing else, and no outbound network at all.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/cathedral-confidential-sn39
+ReadOnlyPaths=/etc/cathedral /opt/cathedral-sn39 \
+  /var/lib/cathedral-confidential-sn39/ledger.sqlite \
+  /var/lib/cathedral-confidential-sn39/policy-state.sqlite
+InaccessiblePaths=/etc/cathedral/enroll-allowlist-signing-sn39.key \
+  /var/lib/cathedral-confidential-sn39/retained-evidence \
+  /var/lib/cathedral-confidential-sn39/candidate-snapshots \
+  /var/lib/cathedral-confidential-sn39/policy-history
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=256
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+`CapabilityBoundingSet=` is empty on purpose: it is what makes "runs as root"
+mean "owns these files" rather than "can open anything".
+
+`IPAddressDeny=any` with `IPAddressAllow=localhost` is the other one that
+matters: the enrollment service never needs to reach anything, so even full
+compromise of the process cannot originate a connection off the host.
+
+`InaccessiblePaths=` includes the allowlist signing seed. The service verifies
+signatures; it never makes them, so it must not be able to read the key that
+does.
+
+The `ExecStart` interpreter is a **separate venv**
+(`/opt/cathedral-sn39/venvs/enroll-path-b`). The commit-pinned venv the epoch
+loop runs from is not modified: a new service must not change the code an
+already-attesting production loop imports.
+
 `--production-mode` refuses to start without `--registered-hotkeys-file`,
 `--enroll-allowlist`, `--enroll-allowlist-keys-digest`, and
-`--enroll-allowlist-digest`, so a half-configured gate cannot come up.
-`--trusted-proxy` is required only because nginx terminates TLS: without it
-every request appears to come from 127.0.0.1 and the per-IP rate limit
-collapses to a single bucket. It is correct only behind a proxy that
-overwrites `X-Forwarded-For`.
+`--enroll-allowlist-digest`, so a half-configured gate cannot come up. The
+process also refuses to start if no sr25519 verifier is importable: without
+that preflight the deployed venv, which has `bittensor_wallet` but no
+`substrateinterface`, would have answered every single enrollment with a 403
+whose message reads like the miner's mistake.
+
+`--host 127.0.0.1` is enforced: the process refuses a non-loopback bind unless
+explicitly overridden, so exposure is always the proxy's decision.
+`--trusted-proxy` is correct only because nginx overwrites `X-Forwarded-For`
+with the peer address below. Without the flag every request would appear to
+come from 127.0.0.1 and the per-IP limit would collapse to one bucket; with
+it, but without the overwrite, any caller could pick their own bucket. The
+service additionally discards any forwarded value that is not exactly one IP
+literal.
 
 Expose it on the existing `api.cathedral.computer` server block
 (`/etc/nginx/sites-available/cathedral-validator-canonical`), which already
-uses exact-match locations:
+uses exact-match locations. Add the two zones at http scope first
+(`/etc/nginx/conf.d/cathedral-enroll-limits.conf`):
+
+```nginx
+limit_req_zone $binary_remote_addr zone=cathedral_enroll_req:10m rate=6r/m;
+limit_conn_zone $binary_remote_addr zone=cathedral_enroll_conn:10m;
+```
+
+Then the route itself:
 
 ```nginx
 location = /v1/enroll {
+    limit_except POST { deny all; }
+    limit_req zone=cathedral_enroll_req burst=3 nodelay;
+    limit_conn cathedral_enroll_conn 4;
+    limit_req_status 429;
+    limit_conn_status 429;
+
+    client_max_body_size 16k;
+    client_body_timeout 5s;
+    client_body_buffer_size 16k;
+
     proxy_pass http://127.0.0.1:8090/v1/enroll;
     proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header Host $host;
+    proxy_connect_timeout 2s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 10s;
+    proxy_request_buffering on;
+
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
 }
 ```
+
+`proxy_set_header X-Forwarded-For $remote_addr` *overwrites*; it does not
+append. A client that sends its own `X-Forwarded-For` never has it forwarded.
+`proxy_request_buffering on` with a 16k body cap means a slow or oversized
+body is absorbed and rejected by nginx, never by the single-process registry.
+The body cap matches the registry's own `MAX_BODY`.
+
+### The CDN in front of the origin
+
+`api.cathedral.computer` resolves to Cloudflare, not to the origin. Two
+consequences, both of which must be handled or the exposure hardening above is
+partly decorative:
+
+**`$remote_addr` is a CDN egress address, not the miner.** Without correction,
+the nginx rate-limit key and the `X-Forwarded-For` handed to the registry both
+identify Cloudflare. Install `/etc/nginx/conf.d/cathedral-realip.conf`:
+
+```nginx
+set_real_ip_from 173.245.48.0/20;   # every range from
+set_real_ip_from 103.21.244.0/22;   # https://www.cloudflare.com/ips-v4
+# ... and https://www.cloudflare.com/ips-v6
+real_ip_header CF-Connecting-IP;
+real_ip_recursive off;
+```
+
+`set_real_ip_from` is restricted to Cloudflare's published ranges, so a client
+that reaches the origin address directly cannot spoof `CF-Connecting-IP`.
+Re-fetch the ranges when Cloudflare publishes new ones; a missing range only
+costs accuracy in the rate-limit key, never correctness of a gate.
+
+Verify it by sending a request with a bogus `X-Forwarded-For` and confirming
+the access log shows the real client address and never the claimed one:
+
+```bash
+sudo grep -c '10.9.9.9' /var/log/nginx/cathedral-validator-canonical.access.log   # must be 0
+```
+
+**The CDN rejects `Python-urllib/*` outright with its own 403.** That is why
+`cathedral enroll submit` sends an explicit `User-Agent`. A miner writing
+their own client with bare `urllib` will get an opaque CDN 403 that has
+nothing to do with their enrollment; tell them to set a User-Agent.
 
 ```bash
 sudo systemctl daemon-reload
@@ -367,21 +598,35 @@ sudo nginx -t && sudo systemctl reload nginx
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://api.cathedral.computer/v1/enroll -d '{}'
 ```
 
-A malformed body must come back 400, never 200 and never a 5xx.
+A malformed body must come back 400, never 200 and never a 5xx. Confirm the
+verifier line is in the journal before trusting the service at all:
+
+```bash
+sudo journalctl -u cathedral-enroll-sn39.service --no-pager | grep 'sr25519 verifier ready'
+```
 
 **Rollback:**
 
 ```bash
 sudo systemctl disable --now cathedral-enroll-sn39.service
-# and remove the nginx location, then
+# and remove the nginx location and the conf.d zones, then
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
 Stopping the service returns the subnet to today's posture (private channel
 only) and touches no enrollment row. Never "roll back" by dropping
 `--production-mode` or the allowlist flags: that also drops the registration
-gate and the IP-literal endpoint check, which is a larger regression than the
-one being undone.
+gate, the strict snapshot verification, and the IP-literal endpoint check,
+which is a larger regression than the one being undone.
+
+Nothing on disk was re-permissioned, so there is nothing else to undo. To
+remove the service entirely:
+
+```bash
+sudo rm /etc/systemd/system/cathedral-enroll-sn39.service
+sudo systemctl daemon-reload
+sudo rm -r /opt/cathedral-sn39/venvs/enroll-path-b
+```
 
 ## Rotation and revocation
 
@@ -389,32 +634,47 @@ The registry re-reads and re-verifies the artifact on every request, but the
 pinned artifact digest means any new release needs a restart. That restart is
 the intended cost of a revocation.
 
+**Each release gets its own versioned path.** The unit names
+`enroll-allowlist-sn39.r1.json`, the next release is written to
+`enroll-allowlist-sn39.r2.json`, and the unit is edited to point at the new
+path and the new digest in the same change as the restart. Never overwrite the
+artifact the running process is pinned to: the process is pinned to the old
+digest, so from the instant the file changes until the restart lands, every
+enrollment fails closed with `allowlist_unavailable`, including the operator's
+own miner. With a versioned path there is no such window, because the old file
+is still there and still matches its pin right up to the restart.
+
 ```bash
-# 1. sign the next release to a staging path, listing every coldkey that stays
+# 1. sign the next release to its own versioned path, listing every coldkey
+#    that stays approved. The tool refuses to overwrite, so a path collision
+#    fails loudly instead of replacing a live artifact.
 sudo "$VENV/bin/python" /usr/local/sbin/cathedral-enroll-allowlist sign \
   --signing-key-file /etc/cathedral/enroll-allowlist-signing-sn39.key \
   --signing-key-id cathedral-enroll-allowlist-1 \
   --release 2 \
   --coldkey 5FEMxbMJTwhj1FVJN8ULjdZRXnVTw5WDK8VLRs39k7if9K1S \
   --valid-days 30 --max-age-seconds 2592000 \
-  --out /root/enroll-allowlist-sn39.release2.json
+  --out /etc/cathedral/enroll-allowlist-sn39.r2.json
 
-# 2. keep the current artifact, then install the new one
-sudo cp -a /etc/cathedral/enroll-allowlist-sn39.json \
-  /etc/cathedral/enroll-allowlist-sn39.json.release1.bak
-sudo install -m 0644 -o root -g root \
-  /root/enroll-allowlist-sn39.release2.json /etc/cathedral/enroll-allowlist-sn39.json
-
-# 3. re-verify in place and take the new pin
+# 2. verify the new file where it will live, and take its digest. The running
+#    service is still serving from r1 and is completely unaffected.
+sudo sha256sum /etc/cathedral/enroll-allowlist-sn39.r2.json
 sudo "$VENV/bin/python" /usr/local/sbin/cathedral-enroll-allowlist verify \
-  --allowlist /etc/cathedral/enroll-allowlist-sn39.json \
+  --allowlist /etc/cathedral/enroll-allowlist-sn39.r2.json \
   --allowlist-keys /etc/cathedral/enroll-allowlist-keys-sn39.json \
   --allowlist-keys-digest sha256:<KEYS_DIGEST> \
+  --expect-digest sha256:<R2_DIGEST> \
   --expect-coldkey 5FEMxbMJTwhj1FVJN8ULjdZRXnVTw5WDK8VLRs39k7if9K1S \
   --max-age-seconds 2592000
 
-# 4. Path B only: update --enroll-allowlist-digest in the unit and restart
+# 3. grant the service read access to the new file
+sudo setfacl -m u:cathedral-enroll:r-- /etc/cathedral/enroll-allowlist-sn39.r2.json
+
+# 4. edit BOTH --enroll-allowlist and --enroll-allowlist-digest in the unit,
+#    in one edit, then reload and restart. This is the only moment the
+#    approved set changes.
 sudo systemctl daemon-reload && sudo systemctl restart cathedral-enroll-sn39.service
+sudo journalctl -u cathedral-enroll-sn39.service --since '-1min' --no-pager | tail
 
 # 5. retire any enrollment the new release no longer approves
 sudo "$VENV/bin/cathedral" enroll reconcile ... --remove
@@ -424,11 +684,15 @@ Release numbers must never decrease. A revoked coldkey stays revoked only
 while the pin points at the newer release, which is why step 4 is not
 optional under Path B.
 
-**Rollback:** restore
-`/etc/cathedral/enroll-allowlist-sn39.json.release1.bak` over the artifact and
-restart with the old digest. Note the running process keeps the highest
-release it has accepted, so an in-process downgrade fails closed until the
-restart.
+**Rollback:** point the unit's `--enroll-allowlist` and
+`--enroll-allowlist-digest` back at `enroll-allowlist-sn39.r1.json` and its
+digest, then `daemon-reload` and restart. The r1 file was never touched, so
+there is nothing to restore. Note the running process keeps the highest
+release it has accepted, so an in-process downgrade fails closed until that
+restart; the restart is what clears it.
+
+Keep the superseded artifact on disk until the next rotation. It is the
+rollback.
 
 ## Triage
 
@@ -462,19 +726,16 @@ tightest freshness bound (one hour) and the most moving parts (chain access).
 4. **Run `reconcile --remove` (step 6).** It is destructive lifecycle
    retirement of a currently attested miner. Read the read-only output first,
    take the DB backup, then run it by hand.
-5. **Approve the nginx exposure and rate-limit posture (step 7, Path B),**
+5. **Approve the nginx exposure and rate-limit posture (step 8, Path B),**
    including `--trusted-proxy` and whether `POST /v1/enroll` belongs on the
    same hostname as the validator read API.
 6. **Diarize the 30-day rotation.** When the artifact goes stale every
    enrollment fails closed, including the operator's own miner after an IP
    rotation. Re-sign around day 21.
-7. **Decide the SQLite concurrency posture before Path B.** The enrollment
-   service and the epoch loop would write the same `registry.sqlite`, which is
-   in rollback-journal mode (not WAL) with the default 5-second busy timeout.
-   Enrollment POSTs landing inside an epoch write window can fail with
-   "database is locked"; the miner retries, but this should be measured on a
-   staging copy, and switching the DB to WAL is a deliberate change with a
-   backup, not a side effect of this rollout.
+7. **Approve the brief epoch-loop stop in step 7.** The WAL migration takes an
+   exclusive lock, so the loop is stopped for it. One epoch may be skipped.
+   Nothing else stops, no scoring changes, and the loop must be confirmed
+   producing a fresh attested epoch before step 8 proceeds.
 
 ## Verification of this runbook
 
@@ -482,6 +743,15 @@ tightest freshness bound (one hour) and the most moving parts (chain access).
 through the same verifier the registry uses, that the pinned digest rejects a
 resigned release, and that the snapshot is the format from which the gate
 resolves coldkeys. `tests/test_enroll_allowlist.py` covers the gate itself.
+`tests/test_enroll_public_endpoint.py` covers the Path B request path: the
+verifier fallback and the refuse-to-start preflight, endpoint validation,
+signed domain separation, the online backup and WAL migration, a real
+two-process lock-contention test that proves the bounded 503, strict snapshot
+verification, the bounded limiter and unspoofable forwarded address, the
+`enrolled_pending_secret` response, and the wallet-local submit CLI. It also
+asserts the two P2 fixes in this document: that no step copies a live SQLite
+file, and that rotation never replaces the pinned artifact in place.
+
 The step 6 sequence was rehearsed off-host against a registry holding exactly
 the production enrollment: the correct release 1 yields `"flagged": []`, a
 release without the operator coldkey flags that miner `not_allowlisted`, and a
