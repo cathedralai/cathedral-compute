@@ -10,6 +10,28 @@ Cathedral SN39.
 > non-paying. Apply before registering or provisioning a new paid machine so a
 > maintainer can confirm current capacity and the supported release.
 
+## Your measurement must be approved first
+
+This is the gate that stops most first attempts. Nothing else you do correctly
+works around it.
+
+Cathedral admits a worker only if its TDX measurement is already listed in the
+signed policy registry. The verifier compares the measurement in your quote
+against the active profile's approved list and rejects anything that is not on
+it. A cryptographically valid TDX quote with an unknown measurement is still
+rejected.
+
+The active profile is `cpu-tdx-sn39-v2`. It requires TCB status `UpToDate` and
+lists three approved measurements. Its window closes on 2026-10-22, after
+which a rollover publishes a successor profile under a new id.
+
+No reproducible image is published yet, so you cannot build a matching
+measurement yourself. A VM that boots to any other measurement returns
+`admit=N` every epoch, whatever else is configured correctly. Raise this in
+your beta request. The operator reviews the measurement and, if it is
+accepted, adds it in a signed policy release. Settle it before you pay for a
+machine.
+
 ## What a provider contributes
 
 A Cathedral provider runs a measured worker inside an Intel TDX confidential
@@ -115,7 +137,7 @@ Registration is a separate Bittensor transaction and may cost funds. Use the
 same hotkey address that the accepted worker will serve.
 
 ```bash
-# Mainnet live testing — only after explicit acceptance.
+# Mainnet live testing. Only after explicit acceptance.
 btcli subnet register \
   --network finney \
   --netuid 39 \
@@ -159,12 +181,17 @@ issues, and ordinary logs. A validator does not need any wallet private key.
 For a same-machine smoke test, bind only to loopback:
 
 ```bash
-sudo --preserve-env=CATHEDRAL_WORKER_BEARER_TOKEN \
-  "$PWD/.venv/bin/cathedral" worker serve \
+sudo "$PWD/.venv/bin/cathedral" worker serve \
   --hotkey "$HOTKEY_ADDRESS" \
   --host 127.0.0.1 \
-  --port 8081
+  --port 8081 \
+  --development-no-auth
 ```
+
+`--development-no-auth` is required for this test. Without it the worker
+refuses to start unless a channel binding is configured, and a plain loopback
+smoke test has no TLS identity to bind to. Use the flag only here, never on a
+worker anything else can reach.
 
 In a second shell:
 
@@ -178,9 +205,23 @@ curl -fsS http://127.0.0.1:8081/v1/evidence \
   | python3 -c 'import json,sys; r=json.load(sys.stdin); print("kind:", r["kind"]); print("quote bytes:", len(bytes.fromhex(r["quote_hex"]))); print("hotkey:", r["assigned_hotkey"])'
 ```
 
-Evidence collection is credential-free and bounded. Work endpoints are
-authenticated only after the channel has been verified. A nonempty local quote
-proves collection, not vendor verification, policy acceptance, or eligibility.
+That request carries no credential because `/v1/evidence` never checks one.
+This is deliberate: a validator holds no token for a worker it has not
+attested yet. The token you created in step 4 gates the work endpoints only,
+and the validator sends it after it has verified the attested channel.
+Evidence collection is unauthenticated at every stage, including in
+production.
+
+The worker bounds that public path itself. Evidence requests draw on a
+separate two-slot pool, so unauthenticated traffic cannot occupy the four
+slots reserved for work. A full pool returns `503 busy` immediately instead of
+queueing. Request bodies are capped at 64 KiB, and the request and its
+response each get their own 10-second deadline, so a caller that stalls cannot
+hold a slot. These bounds are fixed in the worker and are sized for the 4 vCPU
+guest it ships in.
+
+A nonempty local quote proves collection, not vendor verification, policy
+acceptance, or eligibility.
 
 Stop the loopback process after the test.
 
@@ -190,15 +231,19 @@ The production boundary is documented in
 [the Intel TDX launch path](docs/TDX_LAUNCH.md#production-channel-binding).
 In summary:
 
-- the worker remains on loopback;
-- TLS terminates inside the measured VM;
+- the worker is reachable only behind TLS terminated inside the measured VM;
+- Cathedral never sees a plaintext work request;
 - Cathedral pins the TLS SPKI digest;
 - the fresh quote binds that digest with the challenge and public hotkey;
 - the validator verifies the quote, reconnects, and rechecks the same SPKI
   before sending a bearer credential or work; and
 - the firewall admits only the approved validator addresses.
 
-The worker receives the public digest:
+Two shapes are supported. Both keep the TLS private key inside the measured
+VM.
+
+Run the worker on loopback behind an in-guest HTTPS terminator and hand it the
+terminator's public digest:
 
 ```bash
 cathedral worker serve \
@@ -206,6 +251,23 @@ cathedral worker serve \
   --channel-binding-type tls_spki_sha256 \
   --channel-binding-digest "$TLS_SPKI_SHA256"
 ```
+
+Or terminate TLS in the worker itself. It derives the same digest from the
+certificate, so no separate binding flag is needed, and it may bind a public
+address:
+
+```bash
+cathedral worker serve \
+  --hotkey "$HOTKEY_ADDRESS" \
+  --host 0.0.0.0 \
+  --port 8443 \
+  --tls-certificate /etc/cathedral/worker.crt \
+  --tls-private-key /etc/cathedral/worker.key
+```
+
+The private key must be a regular owner-only file. The worker refuses to start
+if it is a symlink or readable by group or other. Both commands read the
+bearer token from `CATHEDRAL_WORKER_BEARER_TOKEN`.
 
 The TLS private key must terminate inside the measured environment. A
 certificate on an external load balancer does not establish this claim.
@@ -256,7 +318,7 @@ Every gate must be current:
 |---|---|
 | Registration | Public hotkey maps exactly once |
 | Channel | HTTPS identity and quote binding match |
-| Attestation | Fresh TDX evidence passes vendor and Cathedral policy |
+| Attestation | Fresh TDX evidence verifies and its measurement is on the approved list |
 | Work | Validator-dispatched work completes and verifies |
 | Report | Candidate appears in the complete signed report |
 | Validator | Signature, freshness, policy, provenance, and UID mapping pass |
@@ -280,9 +342,10 @@ Neither a provider nor Cathedral can promise a future token amount.
 | Local evidence is empty | Check TDX availability and report-directory permission |
 | Endpoint unreachable | Check in-guest TLS service and the approved firewall allowlist |
 | Channel mismatch | TLS terminates in the wrong place or the SPKI digest changed |
-| `401` on work | Worker and validator bearer credentials differ |
+| `401` on work | Worker and validator bearer credentials differ. Never applies to `/v1/evidence`, which is unauthenticated |
+| `503 busy` | The two-slot evidence pool or the four-slot work pool is full. Requests are rejected, not queued |
 | `assigned_hotkey mismatch` | Worker was started with a different public address |
-| `admit=N` | Quote crypto, TCB, measurement, binding, identity, or policy failed |
+| `admit=N` | Most often a measurement that is not on the approved list. Otherwise quote crypto, TCB status, binding, identity, or the policy window |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |
 | `NOT_PROVEN` | A required artifact or independent verification input is absent |
 
