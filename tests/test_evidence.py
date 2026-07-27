@@ -8,6 +8,7 @@ verify`` — like a real external validator — judges freshness against now.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1922,6 +1923,179 @@ def test_export_evidence_requires_source_revision_before_any_publication(tmp_pat
         EvidenceStore(development_dir).get_blob(index_document["latest"]["manifest"])
     )
     assert manifest_document["source_revision"] is None
+
+
+def _reissued_registry_bytes() -> bytes:
+    """A same-policy freshness reissue: higher release, later publication
+    time, fresh signature bytes. No policy material moves, yet the live file
+    hash changes and every already-frozen epoch's pinned digest is stale."""
+    successor = {key: value for key, value in REGISTRY_DOCUMENT.items() if key != "signature"}
+    successor["release"] = 2
+    successor["generated_at"] = _registry_text(NOW)
+    return canonical_json(sign_registry(successor, REGISTRY_SEED))
+
+
+REISSUED_REGISTRY_BYTES = _reissued_registry_bytes()
+
+
+def _archive_release(history_dir: Path, release: int, registry_bytes: bytes) -> Path:
+    """Write one outgoing release exactly where republish-install's
+    archive-then-install step writes it."""
+    archive = (
+        history_dir / f"release-{release:020d}-{hashlib.sha256(registry_bytes).hexdigest()}.json"
+    )
+    archive.write_bytes(registry_bytes)
+    return archive
+
+
+def test_export_evidence_reconciles_a_frozen_epoch_across_a_registry_reissue(
+    tmp_path: Path, capsys
+):
+    """Issue #71: an epoch pins its registry digest at freeze time and the
+    12-hourly reissue changes the live file hash permanently, so reconcile
+    could never converge again. Against the archived release the export
+    succeeds and reproduces the pre-reissue bundle exactly."""
+    control_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    assert cli_main(_export_evidence_args(tmp_path, snapshot_path, evidence_dir=control_dir)) == 0
+    control = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    history = tmp_path / "policy-history"
+    history.mkdir()
+    _archive_release(history, SNAPSHOT.release, REGISTRY_BYTES)
+    (tmp_path / "registry.json").write_bytes(REISSUED_REGISTRY_BYTES)
+
+    # The deadlock the issue reports: the live successor alone is terminal.
+    reissued_dir = tmp_path / "evidence-after-reissue"
+    assert cli_main(_export_evidence_args(tmp_path, snapshot_path, evidence_dir=reissued_dir)) != 0
+    assert "policy_digest does not match" in capsys.readouterr().err
+    assert not reissued_dir.exists()
+
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                evidence_dir=reissued_dir,
+                policy_registry_history_dir=str(history),
+            )
+        )
+        == 0
+    )
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert json.loads(lines[0]) == {
+        "policy_registry": "archived",
+        "release": SNAPSHOT.release,
+        "digest": SNAPSHOT.digest,
+    }
+    manifest_digest = json.loads(lines[-1])["manifest"]
+    assert manifest_digest == control["manifest"]
+    manifest = parse_manifest(EvidenceStore(reissued_dir).get_blob(manifest_digest))
+    assert manifest["policy_registry"] == {
+        "release": SNAPSHOT.release,
+        "digest": SNAPSHOT.digest,
+        "blob": digest_bytes(REGISTRY_BYTES),
+    }
+    # The published blob is the pinned release's bytes, not the live file's.
+    assert EvidenceStore(reissued_dir).get_blob(digest_bytes(REGISTRY_BYTES)) == REGISTRY_BYTES
+
+
+def test_export_evidence_fails_closed_when_no_release_carries_the_pinned_digest(
+    tmp_path: Path, capsys
+):
+    """Digest equality stays the only gate. A pinned digest present in
+    neither the live file nor the history fails with the pre-existing error,
+    and the invocation without the flag is unchanged."""
+    evidence_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    (tmp_path / "registry.json").write_bytes(REISSUED_REGISTRY_BYTES)
+    history = tmp_path / "policy-history"
+    history.mkdir()
+    _archive_release(history, 3, canonical_json({"schema": "an unrelated release"}))
+
+    without_history = _export_evidence_args(tmp_path, snapshot_path)
+    assert cli_main(without_history) != 0
+    baseline = json.loads(capsys.readouterr().err.strip())
+    assert baseline == {
+        "error": "signed report policy_digest does not match the supplied registry file"
+    }
+    assert not evidence_dir.exists()
+
+    assert cli_main([*without_history, "--policy-registry-history-dir", str(history)]) != 0
+    assert json.loads(capsys.readouterr().err.strip()) == baseline
+    assert not evidence_dir.exists()
+
+    # A history path that is not a directory is a misconfiguration to
+    # report, never a silent fall back to the live file.
+    assert (
+        cli_main(
+            [*without_history, "--policy-registry-history-dir", str(tmp_path / "registry.json")]
+        )
+        != 0
+    )
+    assert "history path is not a directory" in capsys.readouterr().err
+    assert not evidence_dir.exists()
+
+
+def test_export_evidence_refuses_an_archived_release_that_does_not_hash_to_its_name(
+    tmp_path: Path, capsys
+):
+    """The content-addressed name is a lookup hint, never evidence: an
+    archive carrying the pinned hex in its name but different bytes is not
+    used, so a writable history directory cannot substitute policy."""
+    evidence_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    (tmp_path / "registry.json").write_bytes(REISSUED_REGISTRY_BYTES)
+    history = tmp_path / "policy-history"
+    history.mkdir()
+    tampered = json.loads(REGISTRY_BYTES)
+    tampered["metadata"] = {"purpose": "substituted policy"}
+    pinned_hex = SNAPSHOT.digest.removeprefix("sha256:")
+    (history / f"release-{SNAPSHOT.release:020d}-{pinned_hex}.json").write_bytes(
+        canonical_json(tampered)
+    )
+
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                policy_registry_history_dir=str(history),
+            )
+        )
+        != 0
+    )
+    assert json.loads(capsys.readouterr().err.strip()) == {
+        "error": "signed report policy_digest does not match the supplied registry file"
+    }
+    assert not evidence_dir.exists()
+
+
+def test_policy_history_lookup_never_blocks_on_a_non_regular_file(tmp_path: Path):
+    """A FIFO carrying the pinned hex in its name must be skipped without
+    being opened. Blocking here would hang the unattended epoch loop instead
+    of failing closed, which is a worse wedge than the reissue deadlock."""
+    import os
+    import threading
+
+    from cathedral.cli import _resolve_pinned_policy_registry
+
+    history = tmp_path / "policy-history"
+    history.mkdir()
+    pinned_hex = SNAPSHOT.digest.removeprefix("sha256:")
+    os.mkfifo(history / f"release-{SNAPSHOT.release:020d}-{pinned_hex}.json")
+
+    resolved: list[tuple[bytes, bool]] = []
+    lookup = threading.Thread(
+        target=lambda: resolved.append(
+            _resolve_pinned_policy_registry(REISSUED_REGISTRY_BYTES, SNAPSHOT.digest, str(history))
+        ),
+        daemon=True,
+    )
+    lookup.start()
+    lookup.join(timeout=10)
+    assert not lookup.is_alive(), "the history lookup blocked on a non-regular file"
+    assert resolved == [(REISSUED_REGISTRY_BYTES, False)]
 
 
 VECTOR_SEED = bytes(range(128, 160))

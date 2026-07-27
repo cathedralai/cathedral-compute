@@ -114,6 +114,31 @@ the receipt time falls inside that registry's validity window. That historical
 check does not update the admission high-water mark and never makes the old
 release current again.
 
+### Evidence export across a registry succession
+
+`runtime export-evidence` reconciles a frozen epoch against the release that
+epoch pinned, not against whatever is live now, so a reissue between two epoch
+cycles otherwise leaves the last frozen epoch permanently unreconcilable.
+Because `republish-install` archives the outgoing signed registry under
+`release-<release>-<sha256>.json` before installing its successor, give the
+exporter the same history directory:
+
+```bash
+cathedral runtime export-evidence \
+  --policy-registry /etc/cathedral/policy-registry-sn39.json \
+  --policy-registry-history-dir /var/lib/cathedral-confidential-sn39/policy-history \
+  ...
+```
+
+The live file is used whenever its digest already equals the signed report's
+pinned `policy_digest`; only a mismatch reads the history directory. Only a
+file whose content hashes to the pinned digest is accepted, so the archive
+name is a lookup hint and never evidence. A pinned digest carried by neither
+the live file nor an archived release still fails closed with the same error.
+When an archived release is used, the export prints
+`{"policy_registry": "archived", "release": N, "digest": "sha256:..."}` ahead
+of its run summary.
+
 ## Freshness republication and window rollover
 
 Production admission keeps a hard 24-hour maximum registry age. Do not widen
