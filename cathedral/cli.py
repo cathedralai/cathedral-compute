@@ -1262,6 +1262,56 @@ def _resolve_evidence_epoch(ledger: Ledger, epoch_argument: str) -> int:
         raise ValueError("epoch id must be an integer or 'latest-published'") from exc
 
 
+def _resolve_pinned_policy_registry(
+    live_bytes: bytes, pinned_digest: object, history_dir: str | None
+) -> tuple[bytes, bool]:
+    """Return the registry bytes a frozen epoch pinned, and whether they came
+    from the succession archive.
+
+    A frozen epoch pins its registry digest forever, but the live registry is
+    reissued (re-signed, same policy material) on the bounded freshness
+    schedule, so the pinned digest stops matching the live file permanently
+    the moment a successor is installed. ``republish-install`` archives the
+    outgoing bytes under their content-addressed name BEFORE installing the
+    successor, so the pinned release stays resolvable with no missing-archive
+    window.
+
+    Content-hash equality with the pinned digest stays the only acceptance
+    rule: the archive file name is a lookup hint, never evidence. Anything
+    unresolvable returns the live bytes so the caller's existing digest check
+    fails exactly as it does without a history directory.
+    """
+    if "sha256:" + hashlib.sha256(live_bytes).hexdigest() == pinned_digest:
+        return live_bytes, False
+    if history_dir is None or not isinstance(pinned_digest, str):
+        return live_bytes, False
+    # Constrain the pinned hex BEFORE it reaches the filesystem: a report is
+    # signed input and its digest field must never shape a lookup path.
+    pinned = re.fullmatch(r"sha256:([0-9a-f]{64})", pinned_digest)
+    if pinned is None:
+        return live_bytes, False
+    pinned_hex = pinned.group(1)
+    history = Path(history_dir)
+    if not history.is_dir():
+        raise ValueError("policy registry history path is not a directory")
+    for candidate in sorted(history.glob(f"release-*-{pinned_hex}.json")):
+        # The epoch loop runs unattended: opening a FIFO or device node here
+        # would block it forever, a worse wedge than the one this resolves.
+        if not candidate.is_file():
+            continue
+        try:
+            with candidate.open("rb") as handle:
+                archived = handle.read(MAX_REGISTRY_BYTES + 1)
+        except OSError:
+            continue  # an unreadable archive is a non-match, never a pass
+        if len(archived) > MAX_REGISTRY_BYTES:
+            continue
+        if hashlib.sha256(archived).hexdigest() != pinned_hex:
+            continue
+        return archived, True
+    return live_bytes, False
+
+
 def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
     """Export one published epoch as a public content-addressed evidence bundle.
 
@@ -1335,12 +1385,31 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
         report = json.loads(report_bytes)
 
         registry_bytes = _read_bounded_registry_file(args.policy_registry, "policy registry")
+        registry_bytes, registry_from_archive = _resolve_pinned_policy_registry(
+            registry_bytes,
+            report.get("policy_digest"),
+            args.policy_registry_history_dir,
+        )
         registry_document = parse_registry_json(registry_bytes)
         registry_release = registry_document.get("release")
         registry_digest = "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
         if report.get("policy_digest") != registry_digest:
             raise ValueError(
                 "signed report policy_digest does not match the supplied registry file"
+            )
+        if registry_from_archive:
+            # The whole bundle now publishes a superseded release; say so on
+            # the same channel as the run summary so the substitution needs
+            # no journal archaeology to find.
+            print(
+                json.dumps(
+                    {
+                        "policy_registry": "archived",
+                        "release": int(registry_release),
+                        "digest": registry_digest,
+                    },
+                    sort_keys=True,
+                )
             )
         if report.get("verifier_digest") != args.verifier_digest:
             raise ValueError("signed report verifier_digest does not match --verifier-digest")
@@ -3575,6 +3644,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_evidence.add_argument("--class-id", default="confidential_compute")
     p_export_evidence.add_argument("--source-id", default="cathedralconfidential")
     p_export_evidence.add_argument("--policy-registry", required=True)
+    p_export_evidence.add_argument(
+        "--policy-registry-history-dir",
+        help="content-addressed archive of superseded signed registries "
+        "(release-<n>-<sha256>.json, written by republish-install); read "
+        "only when the live --policy-registry no longer carries the frozen "
+        "epoch's pinned digest, and only a file whose content hashes to that "
+        "digest is accepted",
+    )
     p_export_evidence.add_argument("--verifier-digest", required=True)
     p_export_evidence.add_argument("--verifier-binary")
     p_export_evidence.add_argument(
