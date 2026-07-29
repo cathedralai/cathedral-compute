@@ -96,6 +96,66 @@ predates exact worker-state binding and contains only the receipt issuance
 state. The runtime no longer issues new version 1 receipts; converting or
 re-signing historical bytes is forbidden.
 
+## What work units bind
+
+`work.work_units` is the field lane credit is computed from, so it is worth
+stating precisely what a receipt proves about it and what it does not. A
+signature proves who ASSERTED a number, not that the number was derived.
+
+Bound today, inside this repository:
+
+- the runtime never signs a miner's claimed units. The lane re-derives them
+  under the versioned `sat_work_units_v1` rule
+  ([`cathedral/lanes/sat.py`](../cathedral/lanes/sat.py)) purely from the
+  committed work item, and credits only certificates that passed
+  verification, once per challenge, matched to the challenge owner;
+- the ledger refuses to record verified work that is not validator-derived
+  ([`cathedral/ledger.py`](../cathedral/ledger.py));
+- full provenance re-derives the units independently from the published,
+  content-addressed work artifacts with the same rule the producer used, and
+  requires equality with the receipt's signed units
+  ([`cathedral/workproof.py`](../cathedral/workproof.py)). A positive miner
+  with no published artifacts never reaches FULL: a valid quote plus a
+  signer-asserted work claim is refused.
+
+Not bound, at the receipt boundary itself:
+
+- `ReceiptIssuer.issue()` signs the units it is handed, and receipt
+  verification checks only that they are canonical decimal and that
+  non-passing work records `"0"`. A consumer holding the receipt ALONE, with
+  no work artifacts, cannot distinguish a derived number from an inflated
+  one. The receipt does not name the derivation rule that produced it.
+
+That gap is why the durable work artifacts exist, and why FULL provenance
+requires them. It is pinned as executable behavior in
+[`tests/test_work_unit_binding.py`](../tests/test_work_unit_binding.py).
+
+### DECISION NEEDED: the cross-repo derivation contract
+
+Consumers in other repositories currently accept the signed units verbatim.
+The cathedral-distill compute lane validates decimal syntax, forwards the
+value as the lane contribution, and composition normalizes it; the validator
+seam that drives it credits the result. Neither requires the work artifacts,
+so across repository boundaries Compute units are signer-asserted. This is
+pinned in
+[`tests/test_cross_repo_receipt_v2_contract.py`](../tests/test_cross_repo_receipt_v2_contract.py).
+
+Resolving it is an owner decision, not something this repository can close
+unilaterally, because it determines what a Compute contribution means to every
+consumer. The safe options are:
+
+1. independent derivation: require the published manifest and result artifacts
+   at the consumer and re-derive units there, exactly as FULL provenance does
+   here, so a receipt without replayable artifacts earns nothing;
+2. a versioned derivation or cap rule the consumer applies: the receipt names
+   its unit rule, and the consumer enforces that rule's bound before crediting,
+   so an out-of-rule number is refused rather than trusted;
+3. an explicit owner decision to keep the trusted-issuer model for Compute,
+   with the contract copy corrected everywhere to say that units are asserted
+   by an authorized signer rather than independently derived.
+
+No option is adopted here, and no unit economics are implied by this document.
+
 ## Canonical bytes and durable storage
 
 Receipts use JSON with keys sorted, ASCII escaping enabled, separators `,` and

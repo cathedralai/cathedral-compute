@@ -323,6 +323,28 @@ def test_the_extended_receipt_reaches_the_validator_preview_as_pass():
     assert lane["contributing"] is True
 
 
+def test_signer_asserted_work_units_cross_the_boundary_unchecked():
+    # The open cross-repo question, stated as behavior rather than prose: an
+    # extended receipt whose signed units were never derived is still admitted
+    # by distill's compute lane and still credited by the validator preview,
+    # because neither consumer requires the work artifacts this repo replays
+    # in FULL provenance (cathedral/workproof.py). See docs/RECEIPTS.md,
+    # "What work units bind", DECISION NEEDED.
+    snapshot, _policy, _claims, receipt = _issued_receipt(
+        measurement=CROSS_MEASUREMENT, work_units=999.0
+    )
+    document = json.loads(receipt.receipt_bytes)
+    document["platform"] = dict(CPU_PLATFORM)
+    receipt_bytes = _resign(document)
+    # This repo accepts it too: the receipt boundary checks canonical decimal,
+    # not derivation.
+    assert verify_receipt(receipt_bytes, snapshot).document["work"]["work_units"] == "999"
+    verified = _distill_verify(document, snapshot)
+    assert compute_receipt.lane_contribution(verified)["work_units"] == "999"
+    out = _validator_preview(document, snapshot)
+    assert out["audit"]["verdicts"]["pass"] == 1
+
+
 def test_a_platform_less_receipt_is_not_credited_by_the_validator_preview():
     # The same seam, the legacy receipt shape: no contribution, and the lane
     # allocation goes to burn rather than crediting unverified work.
