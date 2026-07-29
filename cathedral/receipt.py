@@ -83,30 +83,30 @@ _TOP_KEYS = frozenset(
     }
 )
 # The single declared cross-repo extension point (cathedral-distill's compute
-# receipts carry a top-level `platform` block naming the CPU TEE and, for a
-# composite, the bound confidential GPU). `platform` is OPTIONAL: receipts
-# without it are byte-for-byte unchanged, and any other unknown top-level key
-# still fails closed. Because receipt_id and the signature cover every key
-# except themselves, a `platform` block can never be stripped from or injected
-# into a signed receipt without invalidating both.
+# receipts carry a top-level `platform` block naming the CPU TEE). `platform`
+# is OPTIONAL and version-2 only: receipts without it are byte-for-byte
+# unchanged, and any other unknown top-level key still fails closed. Because
+# receipt_id and the signature cover every key except themselves, a `platform`
+# block can never be stripped from or injected into a signed receipt without
+# invalidating both.
 _OPTIONAL_TOP_KEYS = frozenset({"platform"})
 PLATFORM_CLASS_CPU = "confidential_cpu"
-PLATFORM_CLASS_GPU = "confidential_gpu"
 CPU_TEE_TDX = "intel_tdx"
 CPU_TEE_SEV_SNP = "amd_sev_snp"
-# The cross-repo attestable set. Plain SEV ("amd_sev") has no attestation
-# interface and is deliberately absent; nothing outside this set is accepted.
+# The cross-repo attestable set: a CPU TEE that exposes an attestation
+# interface at all. Plain SEV ("amd_sev", what the live G4 GCP profile emits)
+# has none and is deliberately absent, so it can never be admitted.
 ATTESTABLE_CPU_TEES = frozenset({CPU_TEE_TDX, CPU_TEE_SEV_SNP})
-# The TEEs whose measurement/TCB evidence grammar this verifier actually
-# validates. The body checks below are Intel TDX only, so an `amd_sev_snp`
-# label over a TDX-validated body is a label/body mismatch and fails closed
-# until an SEV-SNP evidence grammar is added deliberately.
-_VERIFIABLE_CPU_TEES = frozenset({CPU_TEE_TDX})
+# What this extension accepts TODAY, which is deliberately narrower than the
+# attestable set: exactly the confidential CPU class over Intel TDX. This
+# verifier's measurement and TCB evidence grammar is Intel TDX only, so an
+# `amd_sev_snp` label over a TDX-validated body is a label/body mismatch, and
+# a composite `confidential_gpu` block would assert GPU evidence this repo does
+# not verify inside a receipt. Both are refused here and are separate,
+# deliberate changes with their own evidence grammar.
+ACCEPTED_PLATFORM_CLASSES = frozenset({PLATFORM_CLASS_CPU})
+ACCEPTED_CPU_TEES = frozenset({CPU_TEE_TDX})
 _PLATFORM_CPU_KEYS = frozenset({"class", "cpu_tee"})
-_PLATFORM_GPU_KEYS = frozenset({"class", "cpu_tee", "gpu"})
-_PLATFORM_GPU_EVIDENCE_KEYS = frozenset(
-    {"cc_mode", "vbios_measurement", "attestation_report_digest", "bound_measurement"}
-)
 _TCB_KEYS = frozenset(
     {
         "status",
@@ -335,52 +335,27 @@ def _validate_claim_times_and_policy(
 
 
 def _validate_platform(document: Mapping[str, object]) -> None:
-    """Strict validation of the optional cross-repo `platform` block."""
+    """Strict validation of the optional cross-repo `platform` block.
+
+    Accepts exactly ``{"class": "confidential_cpu", "cpu_tee": "intel_tdx"}``.
+    Everything else fails closed: no arbitrary nested data, no composite GPU
+    evidence, no plain SEV, and no SEV-SNP until this repo carries an SEV-SNP
+    measurement and TCB grammar to validate such a receipt's body against.
+    """
     platform = document["platform"]
     if not isinstance(platform, dict):
         raise ReceiptError("schema", "receipt platform block must be an object")
     platform_class = platform.get("class")
-    if platform_class == PLATFORM_CLASS_CPU:
-        if frozenset(platform) != _PLATFORM_CPU_KEYS:
-            raise ReceiptError(
-                "schema", "receipt confidential_cpu platform keys are invalid"
-            )
-    elif platform_class == PLATFORM_CLASS_GPU:
-        if frozenset(platform) != _PLATFORM_GPU_KEYS:
-            raise ReceiptError(
-                "schema", "receipt confidential_gpu platform keys are invalid"
-            )
-        gpu = platform["gpu"]
-        if not isinstance(gpu, dict) or frozenset(gpu) != _PLATFORM_GPU_EVIDENCE_KEYS:
-            raise ReceiptError(
-                "schema", "receipt platform GPU evidence keys are invalid"
-            )
-        if gpu["cc_mode"] != "on":
-            raise ReceiptError(
-                "policy", "receipt platform GPU must be in confidential-compute mode"
-            )
-        for name in ("vbios_measurement", "attestation_report_digest"):
-            if not isinstance(gpu[name], str) or _DIGEST_RE.fullmatch(gpu[name]) is None:
-                raise ReceiptError(
-                    "schema", f"receipt platform GPU {name} is invalid"
-                )
-        if (
-            not isinstance(gpu["bound_measurement"], str)
-            or not gpu["bound_measurement"]
-            or gpu["bound_measurement"] != document["measurement"]
-        ):
-            raise ReceiptError(
-                "policy",
-                "receipt platform GPU evidence is not bound to the receipt measurement",
-            )
-    else:
-        raise ReceiptError("schema", "receipt platform class is unknown")
-    cpu_tee = platform.get("cpu_tee")
-    if cpu_tee not in ATTESTABLE_CPU_TEES:
+    if platform_class not in ACCEPTED_PLATFORM_CLASSES:
+        raise ReceiptError("schema", "receipt platform class is unsupported")
+    if frozenset(platform) != _PLATFORM_CPU_KEYS:
+        raise ReceiptError("schema", "receipt platform keys are invalid")
+    cpu_tee = platform["cpu_tee"]
+    if not isinstance(cpu_tee, str) or cpu_tee not in ATTESTABLE_CPU_TEES:
         raise ReceiptError(
             "policy", "receipt platform cpu_tee is not in the attestable set"
         )
-    if cpu_tee not in _VERIFIABLE_CPU_TEES:
+    if cpu_tee not in ACCEPTED_CPU_TEES:
         raise ReceiptError(
             "policy",
             "receipt platform cpu_tee names a TEE whose evidence grammar this "

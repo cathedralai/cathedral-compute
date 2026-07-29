@@ -2,25 +2,27 @@
 
 Cross-repo contract: cathedral-distill's compute receipts extend
 `cathedral_assurance_receipt_v2` with exactly one top-level `platform` block
-(class + cpu_tee, plus a bound GPU block for a composite). This repo's parser
-previously did `frozenset(document) != _TOP_KEYS -> reject`, so the two lanes
-could never admit each other's receipts. These tests pin the reconciliation:
+naming the confidential CPU TEE. This repo's parser previously did
+`frozenset(document) != _TOP_KEYS -> reject`, so neither lane could ever admit
+the other's receipts. These tests pin the reconciliation:
 
-  * receipts WITHOUT `platform` are byte-for-byte unchanged and still verify;
-  * receipts WITH `platform` validate the block strictly (recognized class,
-    cpu_tee from the attestable set, exact keys, GPU guest binding);
+  * receipts WITHOUT `platform` are byte-for-byte unchanged and still verify,
+    v1 and v2 alike (the golden fixtures are the proof);
+  * `platform` is version-2 only: v1 plus `platform` fails;
+  * with `platform` the block is accepted only as exactly
+    `{"class": "confidential_cpu", "cpu_tee": "intel_tdx"}`. No arbitrary
+    nested data, no composite GPU evidence, no plain SEV, and no SEV-SNP,
+    because this repo validates an Intel TDX measurement and TCB body only;
   * `platform` is the ONLY tolerated extension; any other unknown top-level
     key still fails closed;
-  * `platform` is covered by receipt_id and the signature, so it can be
-    neither stripped from nor injected into a signed receipt;
-  * plain "amd_sev" (no attestation interface) is never accepted, and the
-    TDX/SEV-SNP requirements are not weakened: this verifier's evidence
-    grammar is Intel TDX, so an `amd_sev_snp` label fails closed until an
-    SEV-SNP body grammar is added deliberately.
+  * `platform` is covered by receipt_id and the signature, so mutating it
+    without recomputing the id fails, and recomputing the id without
+    resigning fails.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -29,53 +31,64 @@ import pytest
 from cathedral.policy_registry import canonical_json
 from cathedral.receipt import ReceiptError, verify_receipt
 
-from tests.test_receipt import _issued_receipt, _resign, _snapshot
+from tests.test_receipt import _issued_receipt, _reidentify, _resign, _snapshot
 
 CPU_PLATFORM = {"class": "confidential_cpu", "cpu_tee": "intel_tdx"}
+V1_FIXTURE = Path("tests/fixtures/assurance-receipt-v1.json")
+V2_FIXTURE = Path("tests/fixtures/assurance-receipt-v2.json")
 
 
 def _extended(platform: object) -> tuple[object, bytes]:
-    """A genuine issued receipt with `platform` injected and re-signed."""
+    """A genuine issued receipt with `platform` added and re-signed."""
     snapshot, _policy, _claims, receipt = _issued_receipt()
     document = json.loads(receipt.receipt_bytes)
     document["platform"] = platform
     return snapshot, _resign(document)
 
 
-def test_receipt_without_platform_is_byte_for_byte_unchanged_and_verifies():
+# --- minimum test 1: the existing fixtures stay valid, byte for byte -------- #
+
+
+def test_platform_less_v2_fixture_remains_valid_and_unchanged():
     snapshot, _policy, _claims, receipt = _issued_receipt()
     verified = verify_receipt(receipt.receipt_bytes, snapshot)
     assert "platform" not in verified.document
-    # The golden fixture pins the exact pre-extension bytes: adding the
-    # optional key changed nothing for receipts that do not carry it.
-    assert (
-        Path("tests/fixtures/assurance-receipt-v2.json").read_bytes().rstrip(b"\n")
-        == receipt.receipt_bytes
+    # The golden fixture pins the exact pre-extension bytes: making `platform`
+    # optional changed nothing for a receipt that does not carry it.
+    assert V2_FIXTURE.read_bytes().rstrip(b"\n") == receipt.receipt_bytes
+    assert verify_receipt(V2_FIXTURE.read_bytes().rstrip(b"\n"), snapshot).receipt_id == (
+        receipt.receipt_id
     )
 
 
-def test_valid_cpu_platform_block_verifies_and_round_trips():
+def test_platform_less_v1_fixture_remains_valid():
+    verified = verify_receipt(V1_FIXTURE.read_bytes().rstrip(b"\n"), _snapshot())
+    assert verified.document["schema"] == "cathedral_assurance_receipt_v1"
+    assert "platform" not in verified.document
+
+
+# --- minimum test 2: v1 plus platform fails -------------------------------- #
+
+
+def test_platform_on_the_legacy_v1_schema_is_rejected():
+    document = json.loads(V1_FIXTURE.read_bytes().rstrip(b"\n"))
+    document["platform"] = dict(CPU_PLATFORM)
+    with pytest.raises(ReceiptError, match="requires schema version 2"):
+        verify_receipt(_resign(document), _snapshot())
+
+
+# --- minimum test 3: a real issued v2 with the exact CPU-TDX platform ------ #
+
+
+def test_exact_cpu_tdx_platform_block_verifies_and_round_trips():
     snapshot, receipt_bytes = _extended(dict(CPU_PLATFORM))
     verified = verify_receipt(receipt_bytes, snapshot)
     assert verified.document["platform"] == CPU_PLATFORM
     assert verified.receipt_bytes == receipt_bytes
+    assert verified.receipt_digest == "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
 
 
-def test_valid_gpu_platform_block_bound_to_the_receipt_measurement_verifies():
-    snapshot, _policy, _claims, receipt = _issued_receipt()
-    document = json.loads(receipt.receipt_bytes)
-    document["platform"] = {
-        "class": "confidential_gpu",
-        "cpu_tee": "intel_tdx",
-        "gpu": {
-            "cc_mode": "on",
-            "vbios_measurement": "sha256:" + "1" * 64,
-            "attestation_report_digest": "sha256:" + "2" * 64,
-            "bound_measurement": document["measurement"],
-        },
-    }
-    verified = verify_receipt(_resign(document), snapshot)
-    assert verified.document["platform"]["class"] == "confidential_gpu"
+# --- minimum test 6: unknown top-level and nested keys, TEE/class conflicts - #
 
 
 def test_platform_plus_any_other_unknown_top_level_key_is_rejected():
@@ -95,11 +108,130 @@ def test_unknown_top_level_key_without_platform_is_still_rejected():
         verify_receipt(_resign(document), snapshot)
 
 
+@pytest.mark.parametrize(
+    ("platform", "match"),
+    [
+        ("confidential_cpu", "must be an object"),
+        ([], "must be an object"),
+        ({}, "class is unsupported"),
+        ({"class": "gpu_only", "cpu_tee": "intel_tdx"}, "class is unsupported"),
+        # A composite confidential-GPU block asserts GPU evidence this repo
+        # does not verify inside a receipt: refused, not silently accepted.
+        (
+            {
+                "class": "confidential_gpu",
+                "cpu_tee": "intel_tdx",
+                "gpu": {
+                    "cc_mode": "on",
+                    "vbios_measurement": "sha256:" + "1" * 64,
+                    "attestation_report_digest": "sha256:" + "2" * 64,
+                    "bound_measurement": "tdx-measurement-sha256:sample-v1",
+                },
+            },
+            "class is unsupported",
+        ),
+        # Unknown nested key, missing nested key, and nested arbitrary data.
+        (
+            {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "extra": 1},
+            "platform keys are invalid",
+        ),
+        ({"class": "confidential_cpu"}, "platform keys are invalid"),
+        (
+            {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "gpu": {}},
+            "platform keys are invalid",
+        ),
+    ],
+)
+def test_malformed_platform_blocks_fail_closed(platform, match):
+    snapshot, receipt_bytes = _extended(platform)
+    with pytest.raises(ReceiptError, match=match):
+        verify_receipt(receipt_bytes, snapshot)
+
+
+# --- D5: plain SEV and anything outside the attestable set are rejected ----- #
+
+
+@pytest.mark.parametrize(
+    "cpu_tee",
+    ["amd_sev", "", None, "AMD_SEV_SNP", "sgx", "intel_tdx2", "intel_sgx", 1, True, {}],
+)
+def test_cpu_tee_outside_the_attestable_set_is_rejected(cpu_tee):
+    # The live G4 GCP profile emits plain "amd_sev": no attestation interface
+    # at all. It must never be admitted, and nothing outside the attestable
+    # set is recognized either.
+    snapshot, receipt_bytes = _extended(
+        {"class": "confidential_cpu", "cpu_tee": cpu_tee}
+    )
+    with pytest.raises(ReceiptError, match="not in the attestable set"):
+        verify_receipt(receipt_bytes, snapshot)
+
+
+def test_sev_snp_is_attestable_but_still_refused_without_a_sev_body_grammar():
+    # "amd_sev_snp" is attestable in the cross-repo contract, but this repo's
+    # measurement and TCB grammar is Intel TDX only, so the label would not
+    # describe the body that was validated. Fail closed instead of weakening
+    # the TDX requirements to let it through.
+    snapshot, receipt_bytes = _extended(
+        {"class": "confidential_cpu", "cpu_tee": "amd_sev_snp"}
+    )
+    with pytest.raises(ReceiptError, match="evidence grammar"):
+        verify_receipt(receipt_bytes, snapshot)
+
+
+# --- minimum test 7: mutation without re-ID, re-ID without resigning ------- #
+
+
+def test_platform_mutation_without_recomputing_the_receipt_id_fails():
+    snapshot, receipt_bytes = _extended(dict(CPU_PLATFORM))
+    document = json.loads(receipt_bytes)
+    document["platform"]["cpu_tee"] = "amd_sev"
+    # Fails closed on the value itself; the stale id and signature below are
+    # pinned separately with a platform block that is valid on its face, so
+    # the identity binding is proved independently of validation order.
+    with pytest.raises(ReceiptError, match="not in the attestable set"):
+        verify_receipt(canonical_json(document), snapshot)
+    _reidentify(document)
+    with pytest.raises(ReceiptError, match="not in the attestable set"):
+        verify_receipt(canonical_json(document), snapshot)
+
+
+def test_a_valid_platform_block_with_a_stale_receipt_id_fails():
+    # receipt_id is computed over the canonical body including `platform`, so
+    # the platform-less receipt's id cannot identify the extended body.
+    snapshot, _policy, _claims, receipt = _issued_receipt()
+    plain = json.loads(receipt.receipt_bytes)
+    document = json.loads(_extended(dict(CPU_PLATFORM))[1])
+    document["receipt_id"] = plain["receipt_id"]
+    with pytest.raises(ReceiptError, match="does not match its canonical body"):
+        verify_receipt(canonical_json(document), snapshot)
+
+
+def test_a_valid_platform_block_with_a_stale_signature_fails():
+    # The signature covers every field except itself, `platform` included: a
+    # correctly recomputed id over the extended body plus the platform-less
+    # signature is exactly "re-ID without resigning" and must fail.
+    snapshot, _policy, _claims, receipt = _issued_receipt()
+    plain = json.loads(receipt.receipt_bytes)
+    document = json.loads(_extended(dict(CPU_PLATFORM))[1])
+    document["signature"] = plain["signature"]
+    with pytest.raises(ReceiptError, match="signature verification failed"):
+        verify_receipt(canonical_json(document), snapshot)
+
+
 def test_platform_cannot_be_stripped_after_signing():
     snapshot, receipt_bytes = _extended(dict(CPU_PLATFORM))
     document = json.loads(receipt_bytes)
     del document["platform"]  # keep the original receipt_id and signature
     with pytest.raises(ReceiptError, match="does not match its canonical body"):
+        verify_receipt(canonical_json(document), snapshot)
+
+
+def test_platform_stripped_with_a_recomputed_id_but_no_resign_fails():
+    snapshot, receipt_bytes = _extended(dict(CPU_PLATFORM))
+    document = json.loads(receipt_bytes)
+    del document["platform"]
+    _reidentify(document)
+    with pytest.raises(ReceiptError, match="signature verification failed"):
         verify_receipt(canonical_json(document), snapshot)
 
 
@@ -111,106 +243,23 @@ def test_platform_cannot_be_injected_after_signing():
         verify_receipt(canonical_json(document), snapshot)
 
 
-def test_platform_on_the_legacy_v1_schema_is_rejected():
-    receipt_bytes = Path("tests/fixtures/assurance-receipt-v1.json").read_bytes().rstrip(b"\n")
-    document = json.loads(receipt_bytes)
-    document["platform"] = dict(CPU_PLATFORM)
-    with pytest.raises(ReceiptError, match="requires schema version 2"):
-        verify_receipt(_resign(document), _snapshot())
-
-
-@pytest.mark.parametrize(
-    ("platform", "match"),
-    [
-        ("confidential_cpu", "must be an object"),
-        ({}, "class is unknown"),
-        ({"class": "gpu_only", "cpu_tee": "intel_tdx"}, "class is unknown"),
-        (
-            {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "extra": 1},
-            "confidential_cpu platform keys are invalid",
-        ),
-        ({"class": "confidential_cpu"}, "confidential_cpu platform keys are invalid"),
-        (
-            {
-                "class": "confidential_cpu",
-                "cpu_tee": "intel_tdx",
-                "gpu": {"cc_mode": "on"},
-            },
-            "confidential_cpu platform keys are invalid",
-        ),
-        (
-            {"class": "confidential_gpu", "cpu_tee": "intel_tdx"},
-            "confidential_gpu platform keys are invalid",
-        ),
-    ],
-)
-def test_malformed_platform_blocks_fail_closed(platform, match):
-    snapshot, receipt_bytes = _extended(platform)
-    with pytest.raises(ReceiptError, match=match):
-        verify_receipt(receipt_bytes, snapshot)
-
-
-@pytest.mark.parametrize(
-    "cpu_tee",
-    ["amd_sev", "", None, "AMD_SEV_SNP", "sgx", "intel_tdx2"],
-)
-def test_cpu_tee_outside_the_attestable_set_is_rejected(cpu_tee):
-    # The live G4 GCP profile emits plain "amd_sev" (no attestation interface).
-    # It must never be accepted; only the attestable set is recognized at all.
-    snapshot, receipt_bytes = _extended(
-        {"class": "confidential_cpu", "cpu_tee": cpu_tee}
-    )
-    with pytest.raises(ReceiptError, match="not in the attestable set"):
-        verify_receipt(receipt_bytes, snapshot)
-
-
-def test_sev_snp_label_fails_closed_until_a_sev_body_grammar_exists():
-    # "amd_sev_snp" IS in the attestable set, but this verifier's measurement
-    # and TCB grammar is Intel TDX only. A receipt labeled amd_sev_snp over a
-    # TDX-validated body is a label/body mismatch: fail closed, exactly as
-    # distill's _validate_cpu_tee_body enforces label/body consistency.
-    snapshot, receipt_bytes = _extended(
-        {"class": "confidential_cpu", "cpu_tee": "amd_sev_snp"}
-    )
-    with pytest.raises(ReceiptError, match="evidence grammar"):
-        verify_receipt(receipt_bytes, snapshot)
-
-
-@pytest.mark.parametrize(
-    ("gpu_mutation", "match"),
-    [
-        (lambda gpu: gpu.update(cc_mode="off"), "confidential-compute mode"),
-        (lambda gpu: gpu.update(extra="x"), "GPU evidence keys are invalid"),
-        (lambda gpu: gpu.pop("bound_measurement"), "GPU evidence keys are invalid"),
-        (
-            lambda gpu: gpu.update(vbios_measurement="not-a-digest"),
-            "vbios_measurement is invalid",
-        ),
-        (
-            lambda gpu: gpu.update(attestation_report_digest="sha256:short"),
-            "attestation_report_digest is invalid",
-        ),
-        (
-            lambda gpu: gpu.update(bound_measurement="tdx-measurement-sha256:other"),
-            "not bound to the receipt measurement",
-        ),
-        (lambda gpu: gpu.update(bound_measurement=""), "not bound to the receipt"),
-    ],
-)
-def test_gpu_platform_evidence_fails_closed(gpu_mutation, match):
+def test_platform_injected_with_a_recomputed_id_but_no_resign_fails():
     snapshot, _policy, _claims, receipt = _issued_receipt()
     document = json.loads(receipt.receipt_bytes)
-    gpu = {
-        "cc_mode": "on",
-        "vbios_measurement": "sha256:" + "1" * 64,
-        "attestation_report_digest": "sha256:" + "2" * 64,
-        "bound_measurement": document["measurement"],
-    }
-    gpu_mutation(gpu)
-    document["platform"] = {
-        "class": "confidential_gpu",
-        "cpu_tee": "intel_tdx",
-        "gpu": gpu,
-    }
-    with pytest.raises(ReceiptError, match=match):
-        verify_receipt(_resign(document), snapshot)
+    document["platform"] = dict(CPU_PLATFORM)
+    _reidentify(document)
+    with pytest.raises(ReceiptError, match="signature verification failed"):
+        verify_receipt(canonical_json(document), snapshot)
+
+
+# --- minimum test 8: legacy platform-less behavior is explicit ------------- #
+
+
+def test_this_runtime_still_issues_platform_less_receipts():
+    # The issuer is deliberately unchanged: deployed verifiers of earlier
+    # releases reject any receipt that carries `platform`, so emission is a
+    # separate rollout decision. Pin the current behavior so a change to it
+    # cannot land silently.
+    _snapshot_value, _policy, _claims, receipt = _issued_receipt()
+    assert "platform" not in receipt.document
+    assert "platform" not in json.loads(receipt.receipt_bytes)
