@@ -47,9 +47,40 @@ The schema identifier issued by the current runtime is
 | `lifecycle` | Receipt state plus the exact attested worker generation, revision, event ID, safe transition reason, and evidence-expiry boundary used for eligibility. Version 2 accepts only an eligible `attested` worker snapshot and an `issued` receipt with a `null` revocation reference. |
 | `issued_at` | UTC issuance time with exactly six fractional digits. |
 | `signing_key_id`, `signature` | Registry-anchored Ed25519 key and signature over all other receipt fields. |
+| `platform` | Optional cross-repo extension block; see below. Absent from receipts issued by this runtime. |
 
 Unknown or missing fields fail closed. A new critical field or lifecycle state
 requires a new schema version; verifiers do not silently ignore it.
+
+### The optional `platform` extension block
+
+`platform` is the single declared top-level extension point, shared with the
+cathedral-distill compute lane, which names the confidential CPU TEE a receipt
+attests and, for a composite, the confidential GPU bound to it. It is optional
+and version-2 only: receipts without it are byte-for-byte unchanged, and any
+other unknown top-level key still fails closed. Because `receipt_id` and the
+Ed25519 signature cover every field except themselves, a `platform` block can
+never be stripped from or injected into a signed receipt.
+
+When present the block is validated strictly:
+
+- `class` must be `confidential_cpu` (exact keys `class`, `cpu_tee`) or
+  `confidential_gpu` (exact keys `class`, `cpu_tee`, `gpu`).
+- `cpu_tee` must come from the attestable set: `intel_tdx` or `amd_sev_snp`.
+  Plain SEV (`amd_sev`) exposes no attestation interface and is never
+  accepted. This verifier's measurement and TCB evidence grammar is Intel TDX
+  only, so an `amd_sev_snp` label additionally fails closed as a label/body
+  mismatch until an SEV-SNP body grammar is added deliberately.
+- A `confidential_gpu` block requires `gpu.cc_mode` of `"on"`, canonical
+  SHA-256 digests for `vbios_measurement` and `attestation_report_digest`, and
+  `bound_measurement` equal to the receipt's own `measurement` (the guest
+  binding), so GPU evidence can never be admitted detached from the
+  confidential guest it rode on.
+
+This runtime does not yet emit `platform`: deployed verifiers of earlier
+releases reject any receipt that carries it, so issuance is a separate,
+deliberate rollout decision taken only after verifier-side acceptance has
+shipped everywhere.
 
 Historical `cathedral_assurance_receipt_v1` bytes remain verifiable. Version 1
 predates exact worker-state binding and contains only the receipt issuance

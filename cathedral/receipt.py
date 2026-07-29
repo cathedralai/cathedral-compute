@@ -82,6 +82,31 @@ _TOP_KEYS = frozenset(
         "signature",
     }
 )
+# The single declared cross-repo extension point (cathedral-distill's compute
+# receipts carry a top-level `platform` block naming the CPU TEE and, for a
+# composite, the bound confidential GPU). `platform` is OPTIONAL: receipts
+# without it are byte-for-byte unchanged, and any other unknown top-level key
+# still fails closed. Because receipt_id and the signature cover every key
+# except themselves, a `platform` block can never be stripped from or injected
+# into a signed receipt without invalidating both.
+_OPTIONAL_TOP_KEYS = frozenset({"platform"})
+PLATFORM_CLASS_CPU = "confidential_cpu"
+PLATFORM_CLASS_GPU = "confidential_gpu"
+CPU_TEE_TDX = "intel_tdx"
+CPU_TEE_SEV_SNP = "amd_sev_snp"
+# The cross-repo attestable set. Plain SEV ("amd_sev") has no attestation
+# interface and is deliberately absent; nothing outside this set is accepted.
+ATTESTABLE_CPU_TEES = frozenset({CPU_TEE_TDX, CPU_TEE_SEV_SNP})
+# The TEEs whose measurement/TCB evidence grammar this verifier actually
+# validates. The body checks below are Intel TDX only, so an `amd_sev_snp`
+# label over a TDX-validated body is a label/body mismatch and fails closed
+# until an SEV-SNP evidence grammar is added deliberately.
+_VERIFIABLE_CPU_TEES = frozenset({CPU_TEE_TDX})
+_PLATFORM_CPU_KEYS = frozenset({"class", "cpu_tee"})
+_PLATFORM_GPU_KEYS = frozenset({"class", "cpu_tee", "gpu"})
+_PLATFORM_GPU_EVIDENCE_KEYS = frozenset(
+    {"cc_mode", "vbios_measurement", "attestation_report_digest", "bound_measurement"}
+)
 _TCB_KEYS = frozenset(
     {
         "status",
@@ -307,6 +332,60 @@ def _validate_claim_times_and_policy(
         and claims.channel.policy_digest != CHANNEL_BINDING_POLICY_DIGEST
     ):
         raise ReceiptError("policy", "receipt channel claim policy is unsupported")
+
+
+def _validate_platform(document: Mapping[str, object]) -> None:
+    """Strict validation of the optional cross-repo `platform` block."""
+    platform = document["platform"]
+    if not isinstance(platform, dict):
+        raise ReceiptError("schema", "receipt platform block must be an object")
+    platform_class = platform.get("class")
+    if platform_class == PLATFORM_CLASS_CPU:
+        if frozenset(platform) != _PLATFORM_CPU_KEYS:
+            raise ReceiptError(
+                "schema", "receipt confidential_cpu platform keys are invalid"
+            )
+    elif platform_class == PLATFORM_CLASS_GPU:
+        if frozenset(platform) != _PLATFORM_GPU_KEYS:
+            raise ReceiptError(
+                "schema", "receipt confidential_gpu platform keys are invalid"
+            )
+        gpu = platform["gpu"]
+        if not isinstance(gpu, dict) or frozenset(gpu) != _PLATFORM_GPU_EVIDENCE_KEYS:
+            raise ReceiptError(
+                "schema", "receipt platform GPU evidence keys are invalid"
+            )
+        if gpu["cc_mode"] != "on":
+            raise ReceiptError(
+                "policy", "receipt platform GPU must be in confidential-compute mode"
+            )
+        for name in ("vbios_measurement", "attestation_report_digest"):
+            if not isinstance(gpu[name], str) or _DIGEST_RE.fullmatch(gpu[name]) is None:
+                raise ReceiptError(
+                    "schema", f"receipt platform GPU {name} is invalid"
+                )
+        if (
+            not isinstance(gpu["bound_measurement"], str)
+            or not gpu["bound_measurement"]
+            or gpu["bound_measurement"] != document["measurement"]
+        ):
+            raise ReceiptError(
+                "policy",
+                "receipt platform GPU evidence is not bound to the receipt measurement",
+            )
+    else:
+        raise ReceiptError("schema", "receipt platform class is unknown")
+    cpu_tee = platform.get("cpu_tee")
+    if cpu_tee not in ATTESTABLE_CPU_TEES:
+        raise ReceiptError(
+            "policy", "receipt platform cpu_tee is not in the attestable set"
+        )
+    if cpu_tee not in _VERIFIABLE_CPU_TEES:
+        raise ReceiptError(
+            "policy",
+            "receipt platform cpu_tee names a TEE whose evidence grammar this "
+            "verifier does not validate",
+        )
 
 
 def _id_material(document: Mapping[str, object]) -> bytes:
@@ -586,11 +665,18 @@ def verify_receipt(
     if encoded != canonical_input:
         raise ReceiptError("schema", "receipt JSON is not canonical")
     schema = document.get("schema")
-    if frozenset(document) != _TOP_KEYS or not isinstance(schema, str) or schema not in {
-        LEGACY_RECEIPT_SCHEMA,
-        RECEIPT_SCHEMA,
-    }:
+    if (
+        frozenset(document) - _OPTIONAL_TOP_KEYS != _TOP_KEYS
+        or not isinstance(schema, str)
+        or schema not in {LEGACY_RECEIPT_SCHEMA, RECEIPT_SCHEMA}
+    ):
         raise ReceiptError("schema", "receipt has missing, unknown, or unsupported fields")
+    if "platform" in document:
+        if schema != RECEIPT_SCHEMA:
+            raise ReceiptError(
+                "schema", "receipt platform extension requires schema version 2"
+            )
+        _validate_platform(document)
     issued_at = _timestamp(document["issued_at"])
     for name in ("epoch_id", "source_epoch", "policy_registry_release"):
         value = document[name]
