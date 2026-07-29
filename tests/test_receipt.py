@@ -66,6 +66,7 @@ ISSUED = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
 ISSUED_TEXT = "2026-07-17T12:00:00.000000Z"
 CHALLENGE_ID = "a" * 64
 MANIFEST_DIGEST = "sha256:" + "b" * 64
+MEASUREMENT = "tdx-measurement-sha256:sample-v1"
 
 
 def _public(seed: bytes) -> str:
@@ -110,6 +111,7 @@ def _registry_document(
     *,
     release: int = 1,
     receipt_keys: list[dict[str, object]] | None = None,
+    measurement: str = MEASUREMENT,
 ) -> dict[str, object]:
     unsigned = {
         "schema": "cathedral_policy_registry_v1",
@@ -130,7 +132,7 @@ def _registry_document(
                 "valid_from": "2026-07-17T01:00:00Z",
                 "valid_until": "2026-07-20T00:00:00Z",
                 "retire_at": None,
-                "measurements": ["tdx-measurement-sha256:sample-v1"],
+                "measurements": [measurement],
                 "runtime_measurements": ["runtime-sha256:sample-v1"],
                 "allowed_firmware": [],
                 "min_tcb": 0,
@@ -149,9 +151,16 @@ def _snapshot(
     release: int = 1,
     receipt_keys: list[dict[str, object]] | None = None,
     now: datetime = ISSUED,
+    measurement: str = MEASUREMENT,
 ):
     return verify_registry(
-        canonical_json(_registry_document(release=release, receipt_keys=receipt_keys)),
+        canonical_json(
+            _registry_document(
+                release=release,
+                receipt_keys=receipt_keys,
+                measurement=measurement,
+            )
+        ),
         TRUSTED,
         now=now,
         max_age_seconds=172800,
@@ -175,11 +184,11 @@ def _claims(policy: Policy, *, work_status: ClaimStatus = ClaimStatus.PASSED):
     return claims.with_claim(AssuranceDimension.WORK, work)
 
 
-def _attested(claims) -> Attested:
+def _attested(claims, *, measurement: str = MEASUREMENT) -> Attested:
     return Attested(
         tier=Tier.CC_CPU_TDX,
         chip_id="tdx-platform-sha256:" + "c" * 64,
-        measurement="tdx-measurement-sha256:sample-v1",
+        measurement=measurement,
         tcb=1,
         tcb_status="UpToDate",
         advisory_ids=(),
@@ -191,7 +200,9 @@ def _attested(claims) -> Attested:
     )
 
 
-def _worker_lifecycle(policy: Policy, claims, hotkey: str) -> LifecycleSnapshot:
+def _worker_lifecycle(
+    policy: Policy, claims, hotkey: str, *, measurement: str = MEASUREMENT
+) -> LifecycleSnapshot:
     return LifecycleSnapshot(
         hotkey=hotkey,
         state=WorkerLifecycleState.ATTESTED,
@@ -202,7 +213,7 @@ def _worker_lifecycle(policy: Policy, claims, hotkey: str) -> LifecycleSnapshot:
         state_changed_at=ISSUED,
         evidence_verified_at=ISSUED,
         evidence_expires_at=ISSUED + timedelta(hours=1),
-        measurement="tdx-measurement-sha256:sample-v1",
+        measurement=measurement,
         evidence_digest=claims.hardware.evidence_digest,
         policy_digest=claims.software.policy_digest,
         policy_registry_release=policy.registry_release,
@@ -218,11 +229,12 @@ def _issued_receipt(
     subject_hotkey: str = "public-hotkey",
     challenge_id: str = CHALLENGE_ID,
     work_units: float | None = None,
+    measurement: str = MEASUREMENT,
 ):
-    snapshot = _snapshot()
+    snapshot = _snapshot(measurement=measurement)
     policy = snapshot.to_policy(at=ISSUED)
     claims = _claims(policy, work_status=work_status)
-    attested = _attested(claims)
+    attested = _attested(claims, measurement=measurement)
     receipt = ReceiptIssuer(snapshot, "receipt-test-1", RECEIPT_SEED_1).issue(
         epoch_id=epoch_id,
         source_epoch=source_epoch,
@@ -230,7 +242,9 @@ def _issued_receipt(
         attested=attested,
         policy=policy,
         assurance=claims,
-        worker_lifecycle=_worker_lifecycle(policy, claims, subject_hotkey),
+        worker_lifecycle=_worker_lifecycle(
+            policy, claims, subject_hotkey, measurement=measurement
+        ),
         challenge_id=challenge_id,
         manifest_digest=MANIFEST_DIGEST,
         work_units=(
