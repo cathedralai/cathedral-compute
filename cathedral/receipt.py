@@ -30,7 +30,7 @@ from cathedral.assurance import (
     policy_digest,
     sha256_digest,
 )
-from cathedral.common import Attested, Policy
+from cathedral.common import Attested, Policy, Tier
 from cathedral.lifecycle import (
     LifecycleError,
     LifecycleReason,
@@ -341,15 +341,23 @@ def _validate_platform(document: Mapping[str, object]) -> None:
     Everything else fails closed: no arbitrary nested data, no composite GPU
     evidence, no plain SEV, and no SEV-SNP until this repo carries an SEV-SNP
     measurement and TCB grammar to validate such a receipt's body against.
+
+    Order matters. The block is attacker-controlled and unsigned at this point,
+    so shape comes before value and type comes before any set membership test:
+    an unhashable value such as ``{"class": []}`` must fail as a typed
+    ``ReceiptError``, never as a ``TypeError`` escaping the verifier.
     """
     platform = document["platform"]
     if not isinstance(platform, dict):
         raise ReceiptError("schema", "receipt platform block must be an object")
-    platform_class = platform.get("class")
-    if platform_class not in ACCEPTED_PLATFORM_CLASSES:
-        raise ReceiptError("schema", "receipt platform class is unsupported")
     if frozenset(platform) != _PLATFORM_CPU_KEYS:
         raise ReceiptError("schema", "receipt platform keys are invalid")
+    platform_class = platform["class"]
+    if (
+        not isinstance(platform_class, str)
+        or platform_class not in ACCEPTED_PLATFORM_CLASSES
+    ):
+        raise ReceiptError("schema", "receipt platform class is unsupported")
     cpu_tee = platform["cpu_tee"]
     if not isinstance(cpu_tee, str) or cpu_tee not in ATTESTABLE_CPU_TEES:
         raise ReceiptError(
@@ -443,8 +451,23 @@ class ReceiptIssuer:
         challenge_id: str | None,
         manifest_digest: str | None,
         work_units: float,
+        platform: Mapping[str, object] | None = None,
         issued_at: datetime | None = None,
     ) -> AssuranceReceipt:
+        """Issue one signed receipt.
+
+        `platform` is the optional cross-repo extension block and defaults to
+        None, so nothing is emitted unless a caller explicitly asks for it and
+        no existing caller's bytes change. When supplied it is validated by the
+        same `_validate_platform` the verifier applies, cross-checked against
+        the attested hardware so a non-TDX attestation can never be labeled
+        `intel_tdx`, and included in the document BEFORE the receipt id is
+        derived, so the id and signature cover it.
+
+        Whether the production runtime should start supplying it is a separate
+        deployment decision: verifiers of earlier releases reject any receipt
+        that carries the key, so acceptance has to ship everywhere first.
+        """
         when_text = _format_time(issued_at if issued_at is not None else self._clock())
         when = _timestamp(when_text)
         key = self.registry.receipt_key(self.signing_key_id)
@@ -604,6 +627,21 @@ class ReceiptIssuer:
             "issued_at": when_text,
             "signing_key_id": self.signing_key_id,
         }
+        if platform is not None:
+            if not isinstance(platform, Mapping):
+                raise ReceiptError("schema", "receipt platform block must be an object")
+            # Validated by the SAME function the verifier applies, so issuance
+            # can never emit a block verification would refuse.
+            document["platform"] = {str(key): value for key, value in platform.items()}
+            _validate_platform(document)
+            # The receipt itself carries no hardware tier, so the verifier
+            # cannot check the label against the evidence. Bind it here: only a
+            # genuine Intel TDX attestation may be labeled intel_tdx.
+            if attested.tier is not Tier.CC_CPU_TDX:
+                raise ReceiptError(
+                    "policy",
+                    "receipt platform cpu_tee does not match the attested hardware",
+                )
         receipt_id = "receipt-sha256:" + hashlib.sha256(
             _id_material(document)
         ).hexdigest()

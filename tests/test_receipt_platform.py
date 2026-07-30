@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from cathedral.common import Tier
 from cathedral.policy_registry import canonical_json
 from cathedral.receipt import ReceiptError, verify_receipt
 
@@ -113,7 +114,9 @@ def test_unknown_top_level_key_without_platform_is_still_rejected():
     [
         ("confidential_cpu", "must be an object"),
         ([], "must be an object"),
-        ({}, "class is unsupported"),
+        (17, "must be an object"),
+        (None, "must be an object"),
+        ({}, "platform keys are invalid"),
         ({"class": "gpu_only", "cpu_tee": "intel_tdx"}, "class is unsupported"),
         # A composite confidential-GPU block asserts GPU evidence this repo
         # does not verify inside a receipt: refused, not silently accepted.
@@ -128,14 +131,16 @@ def test_unknown_top_level_key_without_platform_is_still_rejected():
                     "bound_measurement": "tdx-measurement-sha256:sample-v1",
                 },
             },
-            "class is unsupported",
+            "platform keys are invalid",
         ),
+        ({"class": "confidential_gpu", "cpu_tee": "intel_tdx"}, "class is unsupported"),
         # Unknown nested key, missing nested key, and nested arbitrary data.
         (
             {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "extra": 1},
             "platform keys are invalid",
         ),
         ({"class": "confidential_cpu"}, "platform keys are invalid"),
+        ({"cpu_tee": "intel_tdx"}, "platform keys are invalid"),
         (
             {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "gpu": {}},
             "platform keys are invalid",
@@ -146,6 +151,41 @@ def test_malformed_platform_blocks_fail_closed(platform, match):
     snapshot, receipt_bytes = _extended(platform)
     with pytest.raises(ReceiptError, match=match):
         verify_receipt(receipt_bytes, snapshot)
+
+
+@pytest.mark.parametrize("bad_class", [[], {}, 1, True, None, "", "CONFIDENTIAL_CPU"])
+def test_a_non_string_platform_class_fails_as_a_typed_receipt_error(bad_class):
+    # Regression: `class` was membership-tested before its type, so an
+    # unhashable value raised TypeError out of the verifier instead of a
+    # ReceiptError. Platform validation runs before receipt-id and signature
+    # verification, so this is unsigned attacker-controlled input: it must
+    # never escape the typed error boundary.
+    snapshot, receipt_bytes = _extended({"class": bad_class, "cpu_tee": "intel_tdx"})
+    with pytest.raises(ReceiptError, match="class is unsupported"):
+        verify_receipt(receipt_bytes, snapshot)
+
+
+@pytest.mark.parametrize("bad_tee", [[], {}, 1, True, None])
+def test_a_non_string_platform_cpu_tee_fails_as_a_typed_receipt_error(bad_tee):
+    snapshot, receipt_bytes = _extended(
+        {"class": "confidential_cpu", "cpu_tee": bad_tee}
+    )
+    with pytest.raises(ReceiptError, match="not in the attestable set"):
+        verify_receipt(receipt_bytes, snapshot)
+
+
+def test_no_platform_shape_escapes_the_typed_error_boundary():
+    # Sweep the whole malformed cross-product and assert the ONLY exception
+    # type that can reach a caller is ReceiptError.
+    values = [[], {}, 1, True, None, "", "x", 1.5, [{"a": 1}], {"a": ["b"]}]
+    snapshot = _snapshot()
+    for key in ("class", "cpu_tee"):
+        for value in values:
+            block = dict(CPU_PLATFORM)
+            block[key] = value
+            _snapshot_value, receipt_bytes = _extended(block)
+            with pytest.raises(ReceiptError):
+                verify_receipt(receipt_bytes, snapshot)
 
 
 # --- D5: plain SEV and anything outside the attestable set are rejected ----- #
@@ -252,14 +292,79 @@ def test_platform_injected_with_a_recomputed_id_but_no_resign_fails():
         verify_receipt(canonical_json(document), snapshot)
 
 
-# --- minimum test 8: legacy platform-less behavior is explicit ------------- #
+# --- the public issuance path emits the extension when asked --------------- #
 
 
-def test_this_runtime_still_issues_platform_less_receipts():
-    # The issuer is deliberately unchanged: deployed verifiers of earlier
-    # releases reject any receipt that carries `platform`, so emission is a
-    # separate rollout decision. Pin the current behavior so a change to it
-    # cannot land silently.
+def test_the_issuer_emits_nothing_unless_a_caller_asks():
+    # `platform` defaults to None, so every existing caller's bytes are
+    # unchanged and the runtime keeps emitting the legacy shape. Deployed
+    # verifiers of earlier releases reject any receipt carrying the key, so
+    # WHEN to start supplying it stays a separate deployment decision.
     _snapshot_value, _policy, _claims, receipt = _issued_receipt()
     assert "platform" not in receipt.document
     assert "platform" not in json.loads(receipt.receipt_bytes)
+    assert V2_FIXTURE.read_bytes().rstrip(b"\n") == receipt.receipt_bytes
+
+
+def test_the_issuer_emits_a_verifiable_platform_block_when_asked():
+    # The real issuance path, not a test-assembled document: ReceiptIssuer
+    # signs the block, and the receipt it returns verifies unmodified.
+    snapshot, _policy, _claims, receipt = _issued_receipt(platform=dict(CPU_PLATFORM))
+    assert receipt.document["platform"] == CPU_PLATFORM
+    verified = verify_receipt(receipt.receipt_bytes, snapshot)
+    assert verified.document["platform"] == CPU_PLATFORM
+    assert verified.receipt_id == receipt.receipt_id
+    assert verified.receipt_digest == receipt.receipt_digest
+
+
+def test_the_issued_block_is_inside_the_receipt_id_and_the_signature():
+    # Issued with and without the block, everything else identical: the id and
+    # the signature must both differ, which is what makes the block
+    # unstrippable and uninjectable after signing.
+    _snapshot_value, _policy, _claims, plain = _issued_receipt()
+    _snapshot_value2, _policy2, _claims2, extended = _issued_receipt(
+        platform=dict(CPU_PLATFORM)
+    )
+    assert extended.receipt_id != plain.receipt_id
+    assert (
+        json.loads(extended.receipt_bytes)["signature"]["value_base64"]
+        != json.loads(plain.receipt_bytes)["signature"]["value_base64"]
+    )
+
+
+@pytest.mark.parametrize(
+    "platform",
+    [
+        {"class": "confidential_cpu", "cpu_tee": "amd_sev"},
+        {"class": "confidential_cpu", "cpu_tee": "amd_sev_snp"},
+        {"class": "confidential_gpu", "cpu_tee": "intel_tdx"},
+        {"class": "confidential_cpu", "cpu_tee": "intel_tdx", "extra": 1},
+        {"class": [], "cpu_tee": "intel_tdx"},
+        {"class": "confidential_cpu"},
+        {},
+    ],
+)
+def test_the_issuer_refuses_every_block_the_verifier_would_refuse(platform):
+    # Issuance and verification share one validator, so the issuer cannot emit
+    # a receipt its own verifier would reject. This is also why the malformed
+    # cases elsewhere in this module are assembled and re-signed by hand: they
+    # are shapes the issuer will not produce.
+    with pytest.raises(ReceiptError):
+        _issued_receipt(platform=platform)
+
+
+def test_the_issuer_refuses_a_tdx_label_on_non_tdx_attested_hardware():
+    # The receipt carries no hardware tier, so a verifier cannot check the
+    # label against the evidence. Bind it at issuance instead: an SEV-SNP or
+    # GPU attestation may never be labeled intel_tdx.
+    for tier in (Tier.CC_CPU_SNP, Tier.CC_GPU):
+        with pytest.raises(ReceiptError, match="does not match the attested hardware"):
+            _issued_receipt(platform=dict(CPU_PLATFORM), tier=tier)
+
+
+def test_a_platform_less_issuance_is_unaffected_by_a_non_tdx_tier():
+    # The tier cross-check exists only to guard the label. Without a platform
+    # block there is no label, so nothing new is enforced and the legacy path
+    # is untouched.
+    _snapshot_value, _policy, _claims, receipt = _issued_receipt(tier=Tier.CC_CPU_SNP)
+    assert "platform" not in receipt.document
