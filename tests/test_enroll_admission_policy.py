@@ -779,3 +779,157 @@ def test_a_policy_and_an_allowlist_cannot_both_be_configured(tmp_path: Path):
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
     with pytest.raises(ValueError, match="not both"):
         RegistryApp(store, admission_policy=object(), coldkey_allowlist=object())
+
+
+# ---------------------------------------------------------------------------
+# 8. Terminal lifecycle states are terminal
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("terminal", [WorkerLifecycleState.REVOKED, WorkerLifecycleState.RETIRED])
+def test_a_terminal_worker_cannot_rehabilitate_itself_by_re_enrolling(
+    tmp_path: Path, terminal: WorkerLifecycleState
+):
+    """reenroll_lifecycle writes 'pending' without consulting the transition table.
+
+    Without this gate a revoked worker undoes its own revocation by
+    re-enrolling into its own row: back in the probe queue, back on the
+    public board, retry counter reset. It would not mint weight, because
+    every attestation gate re-runs, but a revocation that a miner can lift
+    is not a revocation.
+    """
+    app, store, _ = build_app(tmp_path)
+    assert call(app, v2_payload())[0] == 200
+
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE worker_lifecycle_current SET state = ? WHERE hotkey = ?",
+            (terminal.value, HOTKEY),
+        )
+
+    status, body = call(
+        app, v2_payload(nonce="90" * 16, endpoint_url=ENDPOINT_TWO)
+    )
+    assert status == 403
+    assert body["error"] == "worker is in a terminal lifecycle state"
+
+    # The row is left exactly as the terminal transition left it.
+    with sqlite3.connect(store.path) as conn:
+        conn.row_factory = sqlite3.Row
+        current = conn.execute(
+            "SELECT state FROM worker_lifecycle_current WHERE hotkey = ?", (HOTKEY,)
+        ).fetchone()
+    assert current["state"] == terminal.value
+    assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT
+
+
+def test_a_live_worker_can_still_re_enroll_after_an_ip_rotation(tmp_path: Path):
+    """The #61 flow must keep working: only terminal states are refused."""
+    app, store, _ = build_app(tmp_path)
+    assert call(app, v2_payload())[0] == 200
+    status, _ = call(app, v2_payload(nonce="91" * 16, endpoint_url=ENDPOINT_TWO))
+    assert status == 200
+    assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT_TWO
+
+
+# ---------------------------------------------------------------------------
+# 9. Reconcile is reachable under a policy
+# ---------------------------------------------------------------------------
+
+def test_reconcile_runs_under_an_admission_policy(tmp_path: Path, capsys):
+    """The documented way to free capacity must be runnable.
+
+    docs/ADMISSION_POLICY.md names `enroll reconcile` as the remedy, but its
+    allowlist arguments were required, so a policy-configured operator could
+    not run the one command that frees a slot.
+    """
+    import argparse
+
+    from cathedral.cli import cmd_enroll_reconcile
+
+    app, store, policy_path = build_app(tmp_path, policy=policy_bytes(coldkeys=[COLDKEY]))
+    assert call(app, v2_payload())[0] == 200
+
+    keys = tmp_path / "policy-keys.json"
+    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
+
+    args = argparse.Namespace(
+        registry_db=str(store.path),
+        allowlist=None,
+        admission_policy=str(policy_path),
+        admission_policy_keys=str(keys),
+        admission_policy_keys_digest=None,
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=False,
+    )
+    assert cmd_enroll_reconcile(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["admission_mode"] == "selected"
+    assert report["checked"] == 1
+    assert report["flagged"] == []  # the approved coldkey is not flagged
+
+
+def test_open_mode_reconcile_reclaims_only_deregistered_workers(tmp_path: Path, capsys):
+    """Applying coldkey approval in open mode would retire the whole board."""
+    import argparse
+
+    from cathedral.cli import cmd_enroll_reconcile
+
+    app, store, policy_path = build_app(
+        tmp_path,
+        policy=policy_bytes(mode="all_registered", coldkeys=[]),
+        registered={HOTKEY: COLDKEY, HOTKEY_TWO: COLDKEY},
+    )
+    assert call(app, v2_payload())[0] == 200
+    assert call(app, v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT_TWO, nonce="a0" * 16))[0] == 200
+
+    # One of the two leaves the subnet.
+    (tmp_path / "registered.json").write_text(json.dumps({"hotkeys": {HOTKEY: COLDKEY}}))
+
+    keys = tmp_path / "policy-keys.json"
+    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
+    args = argparse.Namespace(
+        registry_db=str(store.path),
+        allowlist=None,
+        admission_policy=str(policy_path),
+        admission_policy_keys=str(keys),
+        admission_policy_keys_digest=None,
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=False,
+    )
+    assert cmd_enroll_reconcile(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["admission_mode"] == "all_registered"
+    assert [entry["hotkey"] for entry in report["flagged"]] == [HOTKEY_TWO]
+    assert report["flagged"][0]["status"] == "not_registered"
+
+
+def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):
+    import argparse
+
+    from cathedral.cli import cmd_enroll_reconcile
+
+    _app, store, policy_path = build_app(tmp_path)
+    base = dict(
+        registry_db=str(store.path),
+        admission_policy_keys=None,
+        admission_policy_keys_digest=None,
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=False,
+    )
+    for allowlist, policy in ((None, None), ("a.json", str(policy_path))):
+        with pytest.raises(ValueError, match="exactly one"):
+            cmd_enroll_reconcile(
+                argparse.Namespace(allowlist=allowlist, admission_policy=policy, **base)
+            )

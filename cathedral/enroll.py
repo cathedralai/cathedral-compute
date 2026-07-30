@@ -1565,6 +1565,7 @@ class RegistryStore:
         max_endpoints_per_coldkey: int | None = None,
         max_total_enrollments: int | None = None,
         unique_endpoint: bool = False,
+        refuse_terminal: bool = False,
     ) -> None:
         """Write or refresh one pending enrollment, inside the caps.
 
@@ -1587,6 +1588,7 @@ class RegistryStore:
                 max_endpoints_per_coldkey=max_endpoints_per_coldkey,
                 max_total_enrollments=max_total_enrollments,
                 unique_endpoint=unique_endpoint,
+                refuse_terminal=refuse_terminal,
             )
             lifecycle_when = self._lifecycle_now()
             if nonce is not None:
@@ -1666,6 +1668,7 @@ class RegistryStore:
         max_endpoints_per_coldkey: int | None,
         max_total_enrollments: int | None,
         unique_endpoint: bool,
+        refuse_terminal: bool,
     ) -> None:
         """Refuse an enrollment that would exceed a cap or steal an endpoint.
 
@@ -1698,6 +1701,23 @@ class RegistryStore:
             LEFT JOIN worker_lifecycle_current c ON c.hotkey = e.hotkey
             WHERE (c.state IS NULL OR c.state IN ({live}))
         """
+
+        if refuse_terminal:
+            row = conn.execute(
+                "SELECT state FROM worker_lifecycle_current WHERE hotkey = ?", (hotkey,)
+            ).fetchone()
+            terminal = {state.value for state in TERMINAL_STATES}
+            if row is not None and row["state"] in terminal:
+                # reenroll_lifecycle writes 'pending' directly and never
+                # consults ALLOWED_TRANSITIONS, so without this a revoked or
+                # retired worker rehabilitates itself by re-enrolling into its
+                # own row. It would not mint weight, since every attestation
+                # gate re-runs, but it would undo a revocation and put the
+                # worker back in the probe queue and on the public board.
+                raise EnrollmentRejected(
+                    "worker is in a terminal lifecycle state",
+                    reason=f"lifecycle_{row['state']}",
+                )
 
         canonical = canonical_endpoint_key(endpoint_url)
         if unique_endpoint:
@@ -2510,6 +2530,7 @@ class RegistryApp:
                 max_endpoints_per_coldkey=policy.max_enrolled_endpoints_per_coldkey,
                 max_total_enrollments=policy.max_admitted_workers_total,
                 unique_endpoint=True,
+                refuse_terminal=True,
             )
         except EnrollmentRejected as exc:
             return self._reject(

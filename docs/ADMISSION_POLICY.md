@@ -140,10 +140,21 @@ two concurrent enrollments cannot both observe capacity and then both take
 it. A retry that re-enrolls the same hotkey at the same endpoint consumes no
 additional capacity.
 
-Retired rows are excluded from every count: retirement is the operator's
-deliberate act of freeing capacity. **Revoked rows still consume capacity**,
-so losing a worker to a revocation never hands its owner a fresh slot to
-retry from.
+What consumes capacity is deliberate in both directions:
+
+| State | Consumes | Why |
+|---|---|---|
+| `PENDING`, `ATTESTED`, `STALE`, `RETIRING` | yes | the validator still owes it work |
+| `REVOKED` | yes | freeing the slot would hand its owner a fresh one to retry from |
+| `FAILED` | no | never probed again, cannot legally return to `PENDING`; counting it would let anyone exhaust a shared cap with junk enrollments |
+| `RETIRED` | no | the operator's own act of freeing capacity |
+
+A worker in a terminal state (`REVOKED`, `RETIRED`) is refused if it tries to
+re-enroll. `reenroll_lifecycle` writes `PENDING` directly without consulting
+the transition table, so without that gate a revoked worker would rehabilitate
+itself by re-enrolling into its own row. It would not mint weight, because
+every attestation gate re-runs, but a revocation a miner can lift is not a
+revocation.
 
 One further rule applies only under a policy: an endpoint already enrolled by
 a different live worker is refused (`endpoint_claimed`). This is the
@@ -152,10 +163,19 @@ remains the chip-id gate at admission.
 
 > `max_admitted_workers_total` is enforced at enrollment as a necessary
 > condition, because enrolled is always greater than or equal to admitted.
-> The authoritative admitted-count gate belongs at admission, alongside the
-> per-epoch probe budget. Until that lands, do not read this cap as a proof
-> that the admitted population is bounded — read it as a bound on the pending
-> directory.
+> The authoritative admitted-count gate belongs at admission
+> (`runtime.py::_admit_unique_chips`) and **is not implemented**. Until it
+> lands, do not read this cap as a proof that the admitted population is
+> bounded — read it as a bound on the pending directory.
+>
+> Two related limits worth knowing before enabling open mode. The per-pass
+> probe budget bounds the standalone prober; the validator's own epoch
+> attestation loop is **not** bounded by it, and that is the loop whose
+> result reaches scoring. And `requested_profile_id` is recorded at
+> enrollment but not yet read by anything: the validator tests under its own
+> configured policy, which is authoritative and strictly narrower, so a miner
+> cannot be tested under a laxer profile by asking for one — but a mismatch
+> between what was requested and what was tested is not currently reported.
 
 ## Running it
 
@@ -209,3 +229,15 @@ Tokens, signatures, and wallet material are never logged.
 Rollback is a restart with `--enroll-allowlist` and the previous artifact.
 The legacy path is untouched by this change and still works exactly as
 `docs/ENROLLMENT_ALLOWLIST.md` describes.
+
+## Freeing capacity
+
+`cathedral enroll reconcile --admission-policy ...` lists the rows the current
+artifact no longer covers, and retires them with `--remove`. It accepts either
+approval artifact, because it is the only way to free enrollment capacity.
+
+Its meaning depends on the mode. Under `selected` it flags rows whose coldkey
+is not approved. Under `all_registered` there is no approved-coldkey set, so
+coldkey approval is not a criterion — applying one anyway would flag every row
+and, with `--remove`, retire the entire board. Open mode therefore reclaims
+exactly the rows whose hotkey is no longer registered on the subnet.
