@@ -12,7 +12,23 @@ Group=root
 UMask=0077
 Restart=on-failure
 RestartSec=5min
-ExecStart=/home/polaris/cathedral-sn39/.venv/bin/python /home/polaris/cathedral-sn39/scripts/cathedral_measurement_approval.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
+
+# This unit runs as root, so every path it executes must be root-owned all
+# the way up. An interpreter or script under a user-writable directory is
+# that user's code running as root at the next timer firing, whatever the
+# file's own mode says. ProtectHome=read-only does not help: it stops this
+# service writing /home, not the owner of /home writing it first.
+#
+# The deployment root therefore lives under /opt, and this preflight refuses
+# to start if the chain is ever loosened. It is deliberately ExecStartPre and
+# not documentation: a check an operator has to remember to run is a check
+# that is not run.
+ExecStartPre=/opt/cathedral-sn39/.venv/bin/python -m cathedral.privileged_paths \
+    /opt/cathedral-sn39/.venv/bin/python \
+    /opt/cathedral-sn39/scripts/cathedral_measurement_approval.py \
+    /etc/cathedral/policy-registry-sn39.json \
+    /etc/cathedral/policy-signing-sn39.key
+ExecStart=/opt/cathedral-sn39/.venv/bin/python /opt/cathedral-sn39/scripts/cathedral_measurement_approval.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 DevicePolicy=closed

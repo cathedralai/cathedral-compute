@@ -1,0 +1,251 @@
+"""Trusted-path checks for anything a privileged process reads or executes.
+
+The finding these regress: a root epoch wrapper sourced an environment file
+owned by, and writable by, an unprivileged user. Mode 0600 was not a
+mitigation, because the danger was the owner, not the group or other bits.
+The shipped policy-republisher unit had the same shape: `User=root` running
+an interpreter out of a home directory.
+
+Covers:
+  1. A root-owned file under root-owned directories is accepted.
+  2. A file owned by another user is refused even at mode 0600.
+  3. A trusted file inside an untrusted or writable directory is refused,
+     anywhere up the chain.
+  4. Symlinks are refused rather than followed.
+  5. Group- and world-writable components are refused; --allow-group-write
+     narrows to world-writable only.
+  6. Missing, non-regular, and non-directory components are refused.
+  7. Every violation is reported at once, and the CLI exits non-zero.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from cathedral.privileged_paths import (
+    UntrustedPath,
+    inspect_path,
+    main,
+    require_trusted_path,
+)
+
+ME = os.getuid()
+OTHER = ME + 1  # a uid this process certainly is not
+# A realistic accepting set: the service account plus root, which owns the
+# system directories every temporary path is nested under.
+ACCEPT = {ME, 0}
+
+
+def _chain(tmp_path: Path, *, mode: int = 0o755) -> tuple[Path, Path]:
+    """A directory holding one file, both owned by the invoking user."""
+    directory = tmp_path / "etc"
+    directory.mkdir(mode=mode)
+    target = directory / "epoch.env.sh"
+    target.write_text("export CATHEDRAL_X=1\n")
+    target.chmod(0o600)
+    return directory, target
+
+
+# ---------------------------------------------------------------------------
+# 1. Accepted
+# ---------------------------------------------------------------------------
+
+def test_a_trusted_chain_is_accepted(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    verdict = inspect_path(target, trusted_uids=ACCEPT)
+    assert verdict.trusted
+    assert verdict.violations == ()
+    assert require_trusted_path(target, trusted_uids=ACCEPT) == os.path.abspath(target)
+
+
+def test_a_directory_target_is_accepted_when_asked_for(tmp_path: Path):
+    directory, _ = _chain(tmp_path)
+    assert inspect_path(directory, trusted_uids=ACCEPT, require_file=False).trusted
+
+
+# ---------------------------------------------------------------------------
+# 2. Ownership — the finding itself
+# ---------------------------------------------------------------------------
+
+def test_a_file_owned_by_another_user_is_refused_even_at_0600(tmp_path: Path):
+    """Mode 0600 is not a mitigation when the owner is the untrusted party."""
+    _, target = _chain(tmp_path)
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+    # Trust only root; this file is owned by the invoking user, standing in
+    # for the polaris-owned .env.sh a root wrapper would have sourced.
+    verdict = inspect_path(target, trusted_uids={0})
+    assert not verdict.trusted
+    assert any("is owned by" in violation for violation in verdict.violations)
+
+    with pytest.raises(UntrustedPath, match="not safe for privileged use"):
+        require_trusted_path(target, trusted_uids={0})
+
+
+def test_the_exception_carries_every_reason(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    with pytest.raises(UntrustedPath) as caught:
+        require_trusted_path(target, trusted_uids={OTHER})
+    assert caught.value.target == str(target.resolve())
+    assert caught.value.violations
+    assert all(isinstance(item, str) for item in caught.value.violations)
+
+
+# ---------------------------------------------------------------------------
+# 3. The chain, not just the file
+# ---------------------------------------------------------------------------
+
+def test_a_trusted_file_in_a_writable_directory_is_refused(tmp_path: Path):
+    """A root-owned file can be replaced wholesale by renaming its parent."""
+    directory, target = _chain(tmp_path)
+    directory.chmod(0o777)
+
+    verdict = inspect_path(target, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any(str(directory) in violation and "writable" in violation
+               for violation in verdict.violations)
+
+
+def test_an_untrusted_ancestor_further_up_is_refused(tmp_path: Path):
+    nested = tmp_path / "home" / "polaris" / "cathedral"
+    nested.mkdir(parents=True)
+    target = nested / "epoch.env.sh"
+    target.write_text("export X=1\n")
+    target.chmod(0o600)
+
+    # The whole chain belongs to this user, so trusting only root refuses it
+    # at every level rather than only at the leaf.
+    verdict = inspect_path(target, trusted_uids={0})
+    assert not verdict.trusted
+    owner_violations = [v for v in verdict.violations if "is owned by" in v]
+    assert len(owner_violations) >= 3  # file, cathedral, polaris, home, ...
+
+
+# ---------------------------------------------------------------------------
+# 4. Symlinks
+# ---------------------------------------------------------------------------
+
+def test_a_symlinked_target_is_refused_not_followed(tmp_path: Path):
+    _, real = _chain(tmp_path)
+    link = tmp_path / "etc" / "link.env.sh"
+    link.symlink_to(real)
+
+    verdict = inspect_path(link, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("is a symlink" in violation for violation in verdict.violations)
+
+
+def test_a_symlinked_ancestor_is_refused(tmp_path: Path):
+    directory, _ = _chain(tmp_path)
+    linked_dir = tmp_path / "etc-link"
+    linked_dir.symlink_to(directory)
+
+    verdict = inspect_path(linked_dir / "epoch.env.sh", trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("is a symlink" in violation for violation in verdict.violations)
+
+
+# ---------------------------------------------------------------------------
+# 5. Writability
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", [0o660, 0o606, 0o666, 0o777])
+def test_group_or_world_writable_targets_are_refused(tmp_path: Path, mode: int):
+    _, target = _chain(tmp_path)
+    target.chmod(mode)
+    verdict = inspect_path(target, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("writable" in violation for violation in verdict.violations)
+
+
+def test_allow_group_write_narrows_to_world_writable_only(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    target.chmod(0o660)
+    assert inspect_path(target, trusted_uids=ACCEPT, allow_group_write=True).trusted
+
+    target.chmod(0o662)
+    assert not inspect_path(target, trusted_uids=ACCEPT, allow_group_write=True).trusted
+
+
+def test_the_default_refuses_group_write(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    target.chmod(0o640)
+    assert inspect_path(target, trusted_uids=ACCEPT).trusted
+    target.chmod(0o660)
+    assert not inspect_path(target, trusted_uids=ACCEPT).trusted
+
+
+# ---------------------------------------------------------------------------
+# 6. Shape
+# ---------------------------------------------------------------------------
+
+def test_a_missing_target_is_refused(tmp_path: Path):
+    verdict = inspect_path(tmp_path / "absent.sh", trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("does not exist" in violation for violation in verdict.violations)
+
+
+def test_a_directory_where_a_file_was_expected_is_refused(tmp_path: Path):
+    directory, _ = _chain(tmp_path)
+    verdict = inspect_path(directory, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("not a regular file" in violation for violation in verdict.violations)
+
+
+def test_a_fifo_is_refused(tmp_path: Path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    verdict = inspect_path(fifo, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("not a regular file" in violation for violation in verdict.violations)
+    assert stat.S_ISFIFO(fifo.lstat().st_mode)
+
+
+def test_invalid_arguments_are_rejected(tmp_path: Path):
+    with pytest.raises(ValueError, match="at least one trusted uid"):
+        inspect_path(tmp_path, trusted_uids=set())
+    with pytest.raises(TypeError, match="must be a path"):
+        inspect_path(1234)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 7. CLI
+# ---------------------------------------------------------------------------
+
+def test_cli_accepts_a_trusted_chain(tmp_path: Path, capsys):
+    _, target = _chain(tmp_path)
+    assert main([str(target), "--trusted-uid", str(ME), "--trusted-uid", "0"]) == 0
+    assert "ok " in capsys.readouterr().out
+
+
+def test_cli_exits_non_zero_and_names_every_reason(tmp_path: Path, capsys):
+    _, target = _chain(tmp_path)
+    target.chmod(0o666)
+    assert main([str(target), "--trusted-uid", str(OTHER)]) == 1
+
+    err = capsys.readouterr().err
+    assert "REFUSED" in err
+    assert "is owned by" in err
+    assert "writable" in err
+
+
+def test_cli_checks_every_path_before_failing(tmp_path: Path, capsys):
+    _, good = _chain(tmp_path)
+    bad = tmp_path / "missing.sh"
+    assert main([str(good), str(bad), "--trusted-uid", str(ME), "--trusted-uid", "0"]) == 1
+
+    captured = capsys.readouterr()
+    assert "ok " in captured.out  # the good path was still reported
+    assert "does not exist" in captured.err
+
+
+def test_cli_defaults_to_root_only(tmp_path: Path, capsys):
+    _, target = _chain(tmp_path)
+    # No --trusted-uid: the default trusts root alone, so a user-owned file
+    # is refused. This is the shape the deployed wrapper needed.
+    assert main([str(target)]) == 1
+    assert "is owned by" in capsys.readouterr().err
