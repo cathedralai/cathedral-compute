@@ -47,14 +47,114 @@ The schema identifier issued by the current runtime is
 | `lifecycle` | Receipt state plus the exact attested worker generation, revision, event ID, safe transition reason, and evidence-expiry boundary used for eligibility. Version 2 accepts only an eligible `attested` worker snapshot and an `issued` receipt with a `null` revocation reference. |
 | `issued_at` | UTC issuance time with exactly six fractional digits. |
 | `signing_key_id`, `signature` | Registry-anchored Ed25519 key and signature over all other receipt fields. |
+| `platform` | Optional cross-repo extension block; see below. Absent from receipts issued by this runtime. |
 
 Unknown or missing fields fail closed. A new critical field or lifecycle state
 requires a new schema version; verifiers do not silently ignore it.
+
+### The optional `platform` extension block
+
+`platform` is the single declared top-level extension point, shared with the
+cathedral-distill compute lane, which names the confidential CPU TEE a receipt
+attests. It is optional and version-2 only: receipts without it are
+byte-for-byte unchanged, version 1 rejects it outright, and any other unknown
+top-level key still fails closed. Because `receipt_id` and the Ed25519
+signature cover every field except themselves, a `platform` block can never be
+stripped from, injected into, or mutated inside a signed receipt: the id stops
+matching its canonical body, and recomputing the id leaves a signature that
+does not verify.
+
+When present the block must be exactly:
+
+```json
+{"class": "confidential_cpu", "cpu_tee": "intel_tdx"}
+```
+
+Nothing else is accepted. Specifically:
+
+- the key set is exact: an unknown, missing, or extra nested key fails closed,
+  and arbitrary nested data is never carried through;
+- `cpu_tee` must be in the attestable set (`intel_tdx`, `amd_sev_snp`), the
+  set of CPU TEEs that expose an attestation interface at all. Plain SEV
+  (`amd_sev`, what the live G4 GCP profile emits) exposes none and is
+  therefore never admitted, nor is anything outside the set;
+- `amd_sev_snp` is attestable but still refused here, because this repo's
+  measurement and TCB evidence grammar is Intel TDX only: the label would not
+  describe the body that was validated. An SEV-SNP body grammar is a separate,
+  deliberate change;
+- the composite `confidential_gpu` class is refused for the same reason: it
+  asserts GPU evidence (confidential-compute mode, VBIOS measurement, report
+  digest, guest binding) that this repo does not verify inside a receipt.
+
+This runtime does not emit `platform`: deployed verifiers of earlier releases
+reject any receipt that carries it, so issuance is a separate, deliberate
+rollout decision taken only after verifier-side acceptance has shipped
+everywhere. Accepting the extension and emitting it are independent steps.
 
 Historical `cathedral_assurance_receipt_v1` bytes remain verifiable. Version 1
 predates exact worker-state binding and contains only the receipt issuance
 state. The runtime no longer issues new version 1 receipts; converting or
 re-signing historical bytes is forbidden.
+
+## What work units bind
+
+`work.work_units` is the field lane credit is computed from, so it is worth
+stating precisely what a receipt proves about it and what it does not. A
+signature proves who ASSERTED a number, not that the number was derived.
+
+Bound today, inside this repository:
+
+- the runtime never signs a miner's claimed units. The lane re-derives them
+  under the versioned `sat_work_units_v1` rule
+  ([`cathedral/lanes/sat.py`](../cathedral/lanes/sat.py)) purely from the
+  committed work item, and credits only certificates that passed
+  verification, once per challenge, matched to the challenge owner;
+- the ledger refuses to record verified work that is not validator-derived
+  ([`cathedral/ledger.py`](../cathedral/ledger.py));
+- full provenance re-derives the units independently from the published,
+  content-addressed work artifacts with the same rule the producer used, and
+  requires equality with the receipt's signed units
+  ([`cathedral/workproof.py`](../cathedral/workproof.py)). A positive miner
+  with no published artifacts never reaches FULL: a valid quote plus a
+  signer-asserted work claim is refused.
+
+Not bound, at the receipt boundary itself:
+
+- `ReceiptIssuer.issue()` signs the units it is handed, and receipt
+  verification checks only that they are canonical decimal and that
+  non-passing work records `"0"`. A consumer holding the receipt ALONE, with
+  no work artifacts, cannot distinguish a derived number from an inflated
+  one. The receipt does not name the derivation rule that produced it.
+
+That gap is why the durable work artifacts exist, and why FULL provenance
+requires them. It is pinned as executable behavior in
+[`tests/test_work_unit_binding.py`](../tests/test_work_unit_binding.py).
+
+### DECISION NEEDED: the cross-repo derivation contract
+
+Consumers in other repositories currently accept the signed units verbatim.
+The cathedral-distill compute lane validates decimal syntax, forwards the
+value as the lane contribution, and composition normalizes it; the validator
+seam that drives it credits the result. Neither requires the work artifacts,
+so across repository boundaries Compute units are signer-asserted. This is
+pinned in
+[`tests/test_cross_repo_receipt_v2_contract.py`](../tests/test_cross_repo_receipt_v2_contract.py).
+
+Resolving it is an owner decision, not something this repository can close
+unilaterally, because it determines what a Compute contribution means to every
+consumer. The safe options are:
+
+1. independent derivation: require the published manifest and result artifacts
+   at the consumer and re-derive units there, exactly as FULL provenance does
+   here, so a receipt without replayable artifacts earns nothing;
+2. a versioned derivation or cap rule the consumer applies: the receipt names
+   its unit rule, and the consumer enforces that rule's bound before crediting,
+   so an out-of-rule number is refused rather than trusted;
+3. an explicit owner decision to keep the trusted-issuer model for Compute,
+   with the contract copy corrected everywhere to say that units are asserted
+   by an authorized signer rather than independently derived.
+
+No option is adopted here, and no unit economics are implied by this document.
 
 ## Canonical bytes and durable storage
 

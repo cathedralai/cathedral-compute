@@ -85,9 +85,19 @@ NONCE = b"n" * 32
 HOTKEY = "gpu-worker-hotkey"
 GPU_1 = "GPU-11111111-1111-4111-8111-111111111111"
 GPU_2 = "GPU-22222222-2222-4222-8222-222222222222"
-_TRUE_EXECUTABLE = shutil.which("true")
+# Do not discover this through PATH. GitHub's setup-python prepends a mutable
+# hosted-toolcache directory, so PATH lookup can select an executable with a
+# runner-owned path ancestor; the production pinning rule correctly rejects
+# that. This suite needs a stable native executable, so name the OS-owned
+# coreutils path explicitly; the production verifier below still performs every
+# ownership, mode, inode, size, and content check.
+_SYSTEM_TRUE_CANDIDATES = (Path("/usr/bin/true"), Path("/bin/true"))
+_TRUE_EXECUTABLE = next(
+    (candidate for candidate in _SYSTEM_TRUE_CANDIDATES if candidate.is_file()),
+    None,
+)
 assert _TRUE_EXECUTABLE is not None
-NATIVE_TEST_EXECUTABLE = str(Path(_TRUE_EXECUTABLE).resolve())
+NATIVE_TEST_EXECUTABLE = str(_TRUE_EXECUTABLE.resolve())
 TEST_VERIFIER_CONFIG = ExternalVerifierConfig(
     (NATIVE_TEST_EXECUTABLE,),
     implementation_artifacts=(NATIVE_TEST_EXECUTABLE,),

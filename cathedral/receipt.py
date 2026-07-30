@@ -30,7 +30,7 @@ from cathedral.assurance import (
     policy_digest,
     sha256_digest,
 )
-from cathedral.common import Attested, Policy
+from cathedral.common import Attested, Policy, Tier
 from cathedral.lifecycle import (
     LifecycleError,
     LifecycleReason,
@@ -82,6 +82,31 @@ _TOP_KEYS = frozenset(
         "signature",
     }
 )
+# The single declared cross-repo extension point (cathedral-distill's compute
+# receipts carry a top-level `platform` block naming the CPU TEE). `platform`
+# is OPTIONAL and version-2 only: receipts without it are byte-for-byte
+# unchanged, and any other unknown top-level key still fails closed. Because
+# receipt_id and the signature cover every key except themselves, a `platform`
+# block can never be stripped from or injected into a signed receipt without
+# invalidating both.
+_OPTIONAL_TOP_KEYS = frozenset({"platform"})
+PLATFORM_CLASS_CPU = "confidential_cpu"
+CPU_TEE_TDX = "intel_tdx"
+CPU_TEE_SEV_SNP = "amd_sev_snp"
+# The cross-repo attestable set: a CPU TEE that exposes an attestation
+# interface at all. Plain SEV ("amd_sev", what the live G4 GCP profile emits)
+# has none and is deliberately absent, so it can never be admitted.
+ATTESTABLE_CPU_TEES = frozenset({CPU_TEE_TDX, CPU_TEE_SEV_SNP})
+# What this extension accepts TODAY, which is deliberately narrower than the
+# attestable set: exactly the confidential CPU class over Intel TDX. This
+# verifier's measurement and TCB evidence grammar is Intel TDX only, so an
+# `amd_sev_snp` label over a TDX-validated body is a label/body mismatch, and
+# a composite `confidential_gpu` block would assert GPU evidence this repo does
+# not verify inside a receipt. Both are refused here and are separate,
+# deliberate changes with their own evidence grammar.
+ACCEPTED_PLATFORM_CLASSES = frozenset({PLATFORM_CLASS_CPU})
+ACCEPTED_CPU_TEES = frozenset({CPU_TEE_TDX})
+_PLATFORM_CPU_KEYS = frozenset({"class", "cpu_tee"})
 _TCB_KEYS = frozenset(
     {
         "status",
@@ -309,6 +334,43 @@ def _validate_claim_times_and_policy(
         raise ReceiptError("policy", "receipt channel claim policy is unsupported")
 
 
+def _validate_platform(document: Mapping[str, object]) -> None:
+    """Strict validation of the optional cross-repo `platform` block.
+
+    Accepts exactly ``{"class": "confidential_cpu", "cpu_tee": "intel_tdx"}``.
+    Everything else fails closed: no arbitrary nested data, no composite GPU
+    evidence, no plain SEV, and no SEV-SNP until this repo carries an SEV-SNP
+    measurement and TCB grammar to validate such a receipt's body against.
+
+    Order matters. The block is attacker-controlled and unsigned at this point,
+    so shape comes before value and type comes before any set membership test:
+    an unhashable value such as ``{"class": []}`` must fail as a typed
+    ``ReceiptError``, never as a ``TypeError`` escaping the verifier.
+    """
+    platform = document["platform"]
+    if not isinstance(platform, dict):
+        raise ReceiptError("schema", "receipt platform block must be an object")
+    if frozenset(platform) != _PLATFORM_CPU_KEYS:
+        raise ReceiptError("schema", "receipt platform keys are invalid")
+    platform_class = platform["class"]
+    if (
+        not isinstance(platform_class, str)
+        or platform_class not in ACCEPTED_PLATFORM_CLASSES
+    ):
+        raise ReceiptError("schema", "receipt platform class is unsupported")
+    cpu_tee = platform["cpu_tee"]
+    if not isinstance(cpu_tee, str) or cpu_tee not in ATTESTABLE_CPU_TEES:
+        raise ReceiptError(
+            "policy", "receipt platform cpu_tee is not in the attestable set"
+        )
+    if cpu_tee not in ACCEPTED_CPU_TEES:
+        raise ReceiptError(
+            "policy",
+            "receipt platform cpu_tee names a TEE whose evidence grammar this "
+            "verifier does not validate",
+        )
+
+
 def _id_material(document: Mapping[str, object]) -> bytes:
     material = dict(document)
     material.pop("receipt_id", None)
@@ -389,8 +451,23 @@ class ReceiptIssuer:
         challenge_id: str | None,
         manifest_digest: str | None,
         work_units: float,
+        platform: Mapping[str, object] | None = None,
         issued_at: datetime | None = None,
     ) -> AssuranceReceipt:
+        """Issue one signed receipt.
+
+        `platform` is the optional cross-repo extension block and defaults to
+        None, so nothing is emitted unless a caller explicitly asks for it and
+        no existing caller's bytes change. When supplied it is validated by the
+        same `_validate_platform` the verifier applies, cross-checked against
+        the attested hardware so a non-TDX attestation can never be labeled
+        `intel_tdx`, and included in the document BEFORE the receipt id is
+        derived, so the id and signature cover it.
+
+        Whether the production runtime should start supplying it is a separate
+        deployment decision: verifiers of earlier releases reject any receipt
+        that carries the key, so acceptance has to ship everywhere first.
+        """
         when_text = _format_time(issued_at if issued_at is not None else self._clock())
         when = _timestamp(when_text)
         key = self.registry.receipt_key(self.signing_key_id)
@@ -550,6 +627,21 @@ class ReceiptIssuer:
             "issued_at": when_text,
             "signing_key_id": self.signing_key_id,
         }
+        if platform is not None:
+            if not isinstance(platform, Mapping):
+                raise ReceiptError("schema", "receipt platform block must be an object")
+            # Validated by the SAME function the verifier applies, so issuance
+            # can never emit a block verification would refuse.
+            document["platform"] = {str(key): value for key, value in platform.items()}
+            _validate_platform(document)
+            # The receipt itself carries no hardware tier, so the verifier
+            # cannot check the label against the evidence. Bind it here: only a
+            # genuine Intel TDX attestation may be labeled intel_tdx.
+            if attested.tier is not Tier.CC_CPU_TDX:
+                raise ReceiptError(
+                    "policy",
+                    "receipt platform cpu_tee does not match the attested hardware",
+                )
         receipt_id = "receipt-sha256:" + hashlib.sha256(
             _id_material(document)
         ).hexdigest()
@@ -586,11 +678,18 @@ def verify_receipt(
     if encoded != canonical_input:
         raise ReceiptError("schema", "receipt JSON is not canonical")
     schema = document.get("schema")
-    if frozenset(document) != _TOP_KEYS or not isinstance(schema, str) or schema not in {
-        LEGACY_RECEIPT_SCHEMA,
-        RECEIPT_SCHEMA,
-    }:
+    if (
+        frozenset(document) - _OPTIONAL_TOP_KEYS != _TOP_KEYS
+        or not isinstance(schema, str)
+        or schema not in {LEGACY_RECEIPT_SCHEMA, RECEIPT_SCHEMA}
+    ):
         raise ReceiptError("schema", "receipt has missing, unknown, or unsupported fields")
+    if "platform" in document:
+        if schema != RECEIPT_SCHEMA:
+            raise ReceiptError(
+                "schema", "receipt platform extension requires schema version 2"
+            )
+        _validate_platform(document)
     issued_at = _timestamp(document["issued_at"])
     for name in ("epoch_id", "source_epoch", "policy_registry_release"):
         value = document[name]
