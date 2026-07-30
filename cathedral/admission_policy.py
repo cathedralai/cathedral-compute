@@ -33,6 +33,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import os
 import re
 import threading
 from collections.abc import Mapping
@@ -46,6 +47,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from cathedral.launch_limits import MAX_LAUNCH_CANDIDATES
 from cathedral.policy_registry import (
     MAX_SQLITE_INTEGER,
     canonical_json,
@@ -63,8 +65,14 @@ MAX_POLICY_BYTES = 1024 * 1024
 MAX_POLICY_COLDKEYS = 4096
 MAX_REQUIRED_PROFILE_IDS = 32
 # Ceiling on every operator-chosen cap. Caps exist to bound the validator's
-# work; a cap larger than this is a configuration mistake, not a policy.
-MAX_CAP_VALUE = 100_000
+# work, so a cap larger than this is a configuration mistake, not a policy.
+#
+# Pinned to the frozen launch cardinality rather than picked. A policy that
+# authorized more workers than the launch grammar accepts would be a validly
+# signed artifact whose population makes epoch completion raise, so no epoch
+# closes and nobody is paid. The signed artifact must not be able to express
+# that.
+MAX_CAP_VALUE = MAX_LAUNCH_CANDIDATES
 MAX_NETUID = 65_535
 DEFAULT_POLICY_MAX_AGE_SECONDS = 86_400
 
@@ -395,9 +403,17 @@ class SignedAdmissionPolicyProvider:
     the file in place and the staleness ceiling catches a stuck rotation
     within one interval.
 
-    The in-process ``config_version`` guard resets on restart, exactly like
-    the allowlist's release guard. Durable rollback resistance comes from
-    pinning the artifact digest, which is why production requires it.
+    Rollback resistance is durable when ``state_path`` is given: the highest
+    accepted ``config_version`` is written there and survives a restart.
+    Without it the guard is in-process only and a restart forgets it.
+
+    Pinning the artifact digest also resists rollback, but it cannot be the
+    production answer on its own. The staleness ceiling forces a re-sign
+    within ``max_age_seconds``; re-signing changes ``issued_at``, hence the
+    canonical document, hence the digest — so a required artifact pin makes
+    the service refuse every enrollment one day later until someone restarts
+    it with a new digest. The durable high-water mark is what makes
+    revocation survive a restart without that trap.
     """
 
     def __init__(
@@ -409,6 +425,7 @@ class SignedAdmissionPolicyProvider:
         netuid: int,
         max_age_seconds: int = DEFAULT_POLICY_MAX_AGE_SECONDS,
         pinned_digest: str | None = None,
+        state_path: str | None = None,
     ) -> None:
         if (
             isinstance(max_age_seconds, bool)
@@ -428,8 +445,63 @@ class SignedAdmissionPolicyProvider:
         self.netuid = netuid
         self.max_age_seconds = max_age_seconds
         self.pinned_digest = pinned_digest
+        self.state_path = state_path
         self._lock = threading.Lock()
-        self._highest_config_version = 0
+        self._highest_config_version = self._load_high_water()
+
+    def _load_high_water(self) -> int:
+        """Read the durable high-water mark, failing closed on damage.
+
+        An unreadable or malformed state file is treated as the maximum
+        version, which refuses every policy until an operator looks at it.
+        Treating it as zero would silently restore the exact rollback window
+        the file exists to close.
+        """
+        if self.state_path is None:
+            return 0
+        try:
+            with Path(self.state_path).open("rb") as handle:
+                raw = handle.read(64).decode("ascii").strip()
+        except FileNotFoundError:
+            return 0
+        except (OSError, UnicodeDecodeError):
+            return MAX_SQLITE_INTEGER
+        if not raw.isdigit():
+            return MAX_SQLITE_INTEGER
+        try:
+            return int(raw)
+        except ValueError:
+            return MAX_SQLITE_INTEGER
+
+    def _persist_high_water(self, config_version: int) -> bool:
+        """Durably record *config_version*; a failed write fails closed."""
+        if self.state_path is None:
+            return True
+        target = Path(self.state_path)
+        scratch = target.with_name(f".{target.name}.{os.getpid()}")
+        try:
+            descriptor = os.open(
+                scratch,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(str(config_version).encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(scratch, target)
+            parent = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        except OSError:
+            try:
+                scratch.unlink()
+            except OSError:
+                pass
+            return False
+        return True
 
     def load(self) -> AdmissionPolicySnapshot | None:
         try:
@@ -456,5 +528,8 @@ class SignedAdmissionPolicyProvider:
         with self._lock:
             if snapshot.config_version < self._highest_config_version:
                 return None  # rollback; fail closed
-            self._highest_config_version = snapshot.config_version
+            if snapshot.config_version > self._highest_config_version:
+                if not self._persist_high_water(snapshot.config_version):
+                    return None  # cannot record the advance; fail closed
+                self._highest_config_version = snapshot.config_version
         return snapshot

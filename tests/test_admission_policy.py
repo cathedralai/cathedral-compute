@@ -444,3 +444,44 @@ def test_empty_or_malformed_key_file_is_refused(tmp_path: Path):
 def test_signing_refuses_a_presigned_document():
     with pytest.raises(AdmissionPolicyError, match="must not contain signature"):
         sign_admission_policy(policy_document(), SEED)
+
+
+# ---------------------------------------------------------------------------
+# 9. The invariant, guarded rather than asserted in prose
+# ---------------------------------------------------------------------------
+
+def test_the_admission_modules_cannot_reach_the_scoring_or_chain_path():
+    """Enrollment must never be able to create weight.
+
+    `tests/test_runtime.py` AST-guards runtime.py this way. The admission
+    modules need the same guard: prose in a docstring does not stop a later
+    edit from importing a scorer or a chain client into the enrollment door.
+
+    substrateinterface is permitted because enrollment verifies sr25519
+    signatures with it and makes no RPC call.
+    """
+    import ast
+    from pathlib import Path
+
+    forbidden = {
+        "attested_epoch",
+        "apply_routing",
+        "bittensor",
+        "subtensor",
+        "set_weights",
+        "cathedral.ledger",
+        "cathedral.score_class",
+        "cathedral.poster",
+    }
+    root = Path(__file__).parents[1] / "cathedral"
+    for name in ("admission_policy.py",):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                seen.update(alias.name.lower() for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                seen.add((node.module or "").lower())
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                seen.add(node.func.id.lower())
+        assert not (seen & forbidden), f"{name} reaches {sorted(seen & forbidden)}"

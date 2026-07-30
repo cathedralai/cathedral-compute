@@ -610,6 +610,60 @@ def test_the_total_worker_cap_is_enforced(tmp_path: Path):
     assert row(store, STRANGER_HOTKEY) is None
 
 
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "https://8.8.8.8:8443/",
+        "HTTPS://8.8.8.8:8443",
+        "https://8.8.8.8.:8443",
+        "https://8.8.8.8:8443",
+    ],
+)
+def test_a_cosmetic_endpoint_variant_cannot_collide_with_a_victim(
+    tmp_path: Path, variant: str
+):
+    """Raw string comparison here would zero the victim, not stop the attacker.
+
+    The runtime dedups targets on a canonical endpoint and excludes *every*
+    claimant of a duplicate. So an attacker who enrolls a cosmetic variant of
+    a victim's endpoint gets both dropped before attestation, and the
+    victim's score goes to zero without the attacker owning any hardware.
+    """
+    app, store, _ = build_app(
+        tmp_path,
+        policy=policy_bytes(mode="all_registered", coldkeys=[]),
+        registered={HOTKEY: COLDKEY, STRANGER_HOTKEY: OTHER_COLDKEY},
+    )
+    assert call(app, v2_payload())[0] == 200  # victim holds ENDPOINT
+
+    status, body = call(
+        app,
+        v2_payload(
+            keypair=STRANGER,
+            coldkey=OTHER_COLDKEY,
+            endpoint_url=variant,
+            nonce="41" * 16,
+        ),
+    )
+    assert status == 403
+    assert body["error"] == "endpoint is already enrolled by another worker"
+    assert row(store, STRANGER_HOTKEY) is None
+
+
+def test_the_per_coldkey_cap_counts_machines_not_spellings(tmp_path: Path):
+    app, store, _ = build_app(tmp_path, policy=policy_bytes(max_endpoints=2))
+    assert call(app, v2_payload())[0] == 200
+
+    # Same machine, different spelling: must be refused as a duplicate rather
+    # than consuming a second slot of the operator's cap.
+    status, body = call(
+        app,
+        v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT + "/", nonce="42" * 16),
+    )
+    assert status == 403
+    assert body["error"] == "endpoint is already enrolled by another worker"
+
+
 def test_two_hotkeys_cannot_claim_one_endpoint(tmp_path: Path):
     app, store, _ = build_app(
         tmp_path,

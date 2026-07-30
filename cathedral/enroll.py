@@ -322,6 +322,40 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
     return endpoint_url
 
 
+def canonical_endpoint_key(endpoint_url: str) -> str:
+    """The normal form two enrollments are the same machine under.
+
+    Must agree with ``runtime._canonical_endpoint``. The runtime dedups
+    targets on that normal form and excludes **every** claimant of a
+    duplicate, so any uniqueness rule here that compares raw strings is worse
+    than no rule: an attacker enrolls a cosmetic variant of a victim's
+    endpoint, both collide at epoch time, and both are dropped before
+    attestation. Scheme and host case, a trailing dot, an IPv6 spelling, a
+    default port, and a bare ``/`` path are all the same address.
+
+    This is a comparison key only. The endpoint the miner signed is what gets
+    stored and dialled; nothing here rewrites it.
+    """
+    parsed = urlparse(endpoint_url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").rstrip(".").lower()
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        host = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
+    try:
+        port = parsed.port
+    except ValueError:
+        # Unparseable port: fall back to the raw authority rather than
+        # silently collapsing two different endpoints onto one key.
+        return f"{scheme}://{(parsed.netloc or '').lower()}"
+    default_port = 443 if scheme == "https" else 80
+    authority = host if port in {None, default_port} else f"{host}:{port}"
+    return f"{scheme}://{authority}"
+
+
 def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timestamp: str) -> bytes:
     """Canonical bytes miners sign before calling /v1/enroll.
 
@@ -543,6 +577,20 @@ class RegistryStore:
                 conn.execute("ALTER TABLE enrollments ADD COLUMN coldkey TEXT")
             if "requested_profile_id" not in enrollment_columns:
                 conn.execute("ALTER TABLE enrollments ADD COLUMN requested_profile_id TEXT")
+            # The normal form uniqueness and caps compare on. Derived, not
+            # authoritative: endpoint_url stays exactly what the miner signed.
+            if "endpoint_canonical" not in enrollment_columns:
+                conn.execute("ALTER TABLE enrollments ADD COLUMN endpoint_canonical TEXT")
+                conn.execute(
+                    "UPDATE enrollments SET endpoint_canonical = endpoint_url"
+                    " WHERE endpoint_canonical IS NULL"
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS enrollments_endpoint_canonical_idx
+                ON enrollments(endpoint_canonical)
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS enrollments_coldkey_idx
@@ -1564,18 +1612,27 @@ class RegistryStore:
                 """
                 INSERT INTO enrollments(
                     hotkey, endpoint_url, enrolled_at_iso, updated_at_iso,
-                    coldkey, requested_profile_id
+                    coldkey, requested_profile_id, endpoint_canonical
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hotkey) DO UPDATE SET
                     endpoint_url=excluded.endpoint_url,
                     updated_at_iso=excluded.updated_at_iso,
                     coldkey=COALESCE(excluded.coldkey, enrollments.coldkey),
                     requested_profile_id=COALESCE(
                         excluded.requested_profile_id, enrollments.requested_profile_id
-                    )
+                    ),
+                    endpoint_canonical=excluded.endpoint_canonical
                 """,
-                (hotkey, endpoint_url, ts, ts, coldkey, requested_profile_id),
+                (
+                    hotkey,
+                    endpoint_url,
+                    ts,
+                    ts,
+                    coldkey,
+                    requested_profile_id,
+                    canonical_endpoint_key(endpoint_url),
+                ),
             )
 
             # Changed endpoint: clear the old attestation so the miner returns
@@ -1612,20 +1669,29 @@ class RegistryStore:
     ) -> None:
         """Refuse an enrollment that would exceed a cap or steal an endpoint.
 
-        Retired rows are excluded from every count: retirement is the
-        operator's deliberate act of freeing capacity (``enroll reconcile
-        --remove``). Revoked rows still consume capacity, so losing a worker
-        to a revocation never hands its owner a fresh slot to retry from.
+        What consumes capacity is deliberate, because both directions are
+        exploitable:
+
+        - ``RETIRED`` does not. Retirement is the operator's own act of
+          freeing capacity (``enroll reconcile --remove``).
+        - ``FAILED`` does not. A failed worker is never probed again
+          (``NETWORK_ELIGIBLE_STATES`` excludes it) and cannot legally return
+          to ``PENDING``, so counting it would let anyone permanently exhaust
+          a shared cap with junk enrollments that cost one registration each.
+        - ``REVOKED`` **does**. Revocation is a punishment; freeing its slot
+          would hand the owner a fresh one to retry from.
+        - ``PENDING``, ``ATTESTED``, ``STALE``, and ``RETIRING`` do, because
+          each is a worker the validator still owes work to.
 
         Every check is off by default. The legacy enrollment path predates
         these rules and is left exactly as it was; only a request governed by
         an admission policy opts in.
         """
-        live = ", ".join(
-            f"'{state.value}'"
-            for state in WorkerLifecycleState
-            if state is not WorkerLifecycleState.RETIRED
+        consuming = (
+            set(NETWORK_ELIGIBLE_STATES)
+            | {WorkerLifecycleState.REVOKED, WorkerLifecycleState.RETIRING}
         )
+        live = ", ".join(f"'{state.value}'" for state in sorted(consuming, key=lambda s: s.value))
         # A worker with no lifecycle row yet (legacy data) counts as live.
         live_join = f"""
             FROM enrollments e
@@ -1633,10 +1699,11 @@ class RegistryStore:
             WHERE (c.state IS NULL OR c.state IN ({live}))
         """
 
+        canonical = canonical_endpoint_key(endpoint_url)
         if unique_endpoint:
             claimant = conn.execute(
-                f"SELECT e.hotkey {live_join} AND e.endpoint_url = ? AND e.hotkey != ?",
-                (endpoint_url, hotkey),
+                f"SELECT e.hotkey {live_join} AND e.endpoint_canonical = ? AND e.hotkey != ?",
+                (canonical, hotkey),
             ).fetchone()
             if claimant is not None:
                 # Pre-attestation proxy for one physical machine. True platform
@@ -1649,11 +1716,14 @@ class RegistryStore:
 
         if max_endpoints_per_coldkey is not None and coldkey is not None:
             rows = conn.execute(
-                f"SELECT DISTINCT e.endpoint_url {live_join} AND e.coldkey = ? AND e.hotkey != ?",
+                f"SELECT DISTINCT e.endpoint_canonical {live_join}"
+                " AND e.coldkey = ? AND e.hotkey != ?",
                 (coldkey, hotkey),
             ).fetchall()
-            held = {row["endpoint_url"] for row in rows}
-            if endpoint_url not in held and len(held) >= max_endpoints_per_coldkey:
+            # Counted on the normal form, so the cap bounds machines rather
+            # than spellings of one machine.
+            held = {row["endpoint_canonical"] for row in rows}
+            if canonical not in held and len(held) >= max_endpoints_per_coldkey:
                 raise EnrollmentRejected(
                     "coldkey has reached its enrolled endpoint cap",
                     reason="coldkey_endpoint_cap",
@@ -2645,8 +2715,21 @@ def main() -> None:
         "--admission-policy-digest",
         metavar="sha256:HEX",
         help=(
-            "pin the admission policy artifact itself to this digest; "
-            "rotation then requires a restart with the new digest"
+            "optionally pin the admission policy artifact itself to this "
+            "digest. Note this conflicts with rotation: the staleness ceiling "
+            "forces a re-sign, which changes the digest, so a pinned service "
+            "stops accepting enrollment until it is restarted with the new "
+            "value. Prefer --admission-policy-state for durable rollback "
+            "resistance"
+        ),
+    )
+    parser.add_argument(
+        "--admission-policy-state",
+        metavar="PATH",
+        help=(
+            "file recording the highest accepted config_version, so a "
+            "rollback to a superseded but validly signed policy is refused "
+            "across a restart. Mandatory when --production-mode is set"
         ),
     )
     parser.add_argument(
@@ -2690,12 +2773,17 @@ def main() -> None:
     if args.production_mode and args.admission_policy:
         if not args.admission_policy_keys_digest:
             parser.error("--production-mode requires --admission-policy-keys-digest")
-        # The key digest pins the root of trust, not the document. The
-        # config_version guard is in-process and resets on restart, so a
-        # superseded but still validly signed policy could otherwise be
-        # replayed to re-open a mode or restore a revoked coldkey.
-        if not args.admission_policy_digest:
-            parser.error("--production-mode requires --admission-policy-digest")
+        # The key digest pins the root of trust, not the document. Without a
+        # durable high-water mark the config_version guard resets on restart,
+        # so a superseded but still validly signed policy could be replayed to
+        # re-open a mode or restore a revoked coldkey.
+        #
+        # The state file rather than an artifact digest pin: the staleness
+        # ceiling forces a re-sign, a re-sign changes issued_at and therefore
+        # the digest, so a required artifact pin would make production refuse
+        # every enrollment one ceiling later until someone restarted it.
+        if not args.admission_policy_state:
+            parser.error("--production-mode requires --admission-policy-state")
     if args.production_mode and args.enroll_allowlist and not args.enroll_allowlist_keys_digest:
         parser.error("--production-mode requires --enroll-allowlist-keys-digest")
     # The key digest pins the root of trust, not the document. Release
@@ -2747,6 +2835,7 @@ def main() -> None:
             netuid=args.netuid,
             max_age_seconds=args.admission_policy_max_age_seconds,
             pinned_digest=args.admission_policy_digest,
+            state_path=args.admission_policy_state,
         )
 
     app = RegistryApp(
