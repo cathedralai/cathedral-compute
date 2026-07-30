@@ -155,6 +155,14 @@ release; the receipt chain records the release+digest each verdict was
 issued under, so any later dispute replays against the exact policy that
 was in force.
 
+`approve` requires `--profile-id` and applies the measurement to exactly
+that profile. A registry retains every prior profile after a rollover
+(`rollover` appends the successor), so the approval target is never
+inferred from list position: naming a profile that is absent, duplicated,
+not `cpu_tdx`, or not `active` fails before the live capture runs, and the
+emitted release is refused if any other profile changed. `show` prints
+every profile with its status rather than one positional entry.
+
 ## Verification path
 
 Admission and replay verify quotes through the pinned external verifier:
