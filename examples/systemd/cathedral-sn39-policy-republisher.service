@@ -28,6 +28,13 @@ ExecStartPre=/opt/cathedral-sn39/.venv/bin/python -m cathedral.privileged_paths 
     /opt/cathedral-sn39/scripts/cathedral_measurement_approval.py \
     /etc/cathedral/policy-registry-sn39.json \
     /etc/cathedral/policy-signing-sn39.key
+# site-packages is not an ancestor of the interpreter or the script, so the
+# check above does not reach it — and it is the directory root actually
+# imports every cathedral.* module from, and the one pip most often leaves
+# owned by the deploying user. Adjust the python version in this path to
+# match the venv.
+ExecStartPre=/opt/cathedral-sn39/.venv/bin/python -m cathedral.privileged_paths --directory \
+    /opt/cathedral-sn39/.venv/lib/python3.11/site-packages
 ExecStart=/opt/cathedral-sn39/.venv/bin/python /opt/cathedral-sn39/scripts/cathedral_measurement_approval.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH

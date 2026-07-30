@@ -64,6 +64,19 @@ operator everything to fix rather than one thing at a time.
 
 ## What it does not do
 
+**It only walks the target and its ancestors.** A sibling directory that the
+same process will later read is not covered. The important case is a
+virtualenv: `.venv/lib/python3.x/site-packages` is not an ancestor of
+`.venv/bin/python`, so checking the interpreter says nothing about the
+packages it imports — and site-packages is both where every `cathedral.*`
+module actually loads from and the directory `pip install` most often leaves
+owned by the deploying user. Name it explicitly, as the example unit does.
+
+**The check runs on the interpreter it is checking.** If the chain is already
+loosened and exploited, the attacker's interpreter runs before the check can
+refuse. The preflight catches loosening, not an exploit already in place; the
+real mitigation is that the deployment root is root-owned in the first place.
+
 It cannot close a time-of-check/time-of-use window that spans two processes:
 a shell that checks a path and then sources it has a gap no external checker
 can remove. What it is decisive about is the thing that actually matters
