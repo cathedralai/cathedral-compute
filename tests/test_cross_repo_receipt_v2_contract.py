@@ -4,10 +4,12 @@ These tests verify real receipts across three repositories with the private
 packages actually installed, because a parser extension on its own does not
 create compatibility. Each leg is proved or refused with a concrete reason:
 
-  * a genuine Cathedral-issued receipt, extended with the exact CPU-TDX
-    `platform` block and re-signed by its registry-anchored key, verifies in
-    cathedral-distill's compute lane through the authenticated registry
-    adapter (`cathedral.receipt_bridge.AnchoredReceiptKeyResolver`);
+  * a receipt produced by the real `ReceiptIssuer.issue()` path with the
+    optional CPU-TDX `platform` block verifies in cathedral-distill's compute
+    lane through the authenticated registry adapter
+    (`cathedral.receipt_bridge.AnchoredReceiptKeyResolver`). The passing case
+    is issuer output, not a test-assembled document: only the malformed blocks
+    below are hand-assembled, because the issuer refuses to emit them;
   * the same receipt reaches the validator seam's `verify_lane_receipt` as a
     PASS contribution;
   * the same receipt without `platform` still verifies here, and is refused by
@@ -19,8 +21,11 @@ create compatibility. Each leg is proved or refused with a concrete reason:
   * unknown top-level keys, plain SEV, and TEE/class conflicts fail on both
     sides.
 
-Skips cleanly when the private packages are absent. When they are present
-these tests RUN; a skip is not evidence of compatibility.
+The sibling packages are private, so this module skips when they are absent and
+CI (which installs only `.[dev]` and holds no read credential for them) will
+skip it. CI therefore does NOT prove this contract; only an environment with
+the sibling repos present does, and a skip is never evidence of compatibility.
+Read the run counts, not the green tick.
 """
 
 from __future__ import annotations
@@ -39,8 +44,6 @@ from cathedral.receipt import ReceiptError, verify_receipt
 from cathedral.receipt_bridge import AnchoredReceiptKeyResolver
 
 from tests.test_receipt import (
-    ISSUED,
-    ISSUED_TEXT,
     RECEIPT_SEED_1,
     _issued_receipt,
     _receipt_key,
@@ -86,15 +89,26 @@ SOURCE_EPOCH = 11
 LANE_CPU = "cathedral_confidential_tdx"
 
 
-def _cross_repo_receipt(platform: object | None = CPU_PLATFORM):
-    """A genuine Cathedral-issued receipt, optionally extended and re-signed."""
+def _cross_repo_receipt(platform: object | None = CPU_PLATFORM, **issue_kwargs):
+    """Issuer output: the real `ReceiptIssuer.issue()` path, with or without the
+    optional platform block. This is what makes the compatibility claim about
+    the production path rather than about a hand-built document."""
+    snapshot, _policy, _claims, receipt = _issued_receipt(
+        measurement=CROSS_MEASUREMENT, platform=platform, **issue_kwargs
+    )
+    return snapshot, json.loads(receipt.receipt_bytes), receipt.receipt_bytes
+
+
+def _assembled_receipt(platform: object):
+    """A malformed block the issuer REFUSES to emit, assembled by hand and
+    re-signed with the same registry-anchored key so the sibling verifiers still
+    see a genuine signature. Used only for the negative cases; that the issuer
+    refuses each of them is asserted in
+    tests/test_receipt_platform.py::test_the_issuer_refuses_every_block_the_verifier_would_refuse."""
     snapshot, _policy, _claims, receipt = _issued_receipt(measurement=CROSS_MEASUREMENT)
-    if platform is None:
-        return snapshot, json.loads(receipt.receipt_bytes), receipt.receipt_bytes
     document = json.loads(receipt.receipt_bytes)
     document["platform"] = platform
-    receipt_bytes = _resign(document)
-    return snapshot, document, receipt_bytes
+    return snapshot, document, _resign(document)
 
 
 def _resolver(snapshot) -> AnchoredReceiptKeyResolver:
@@ -115,7 +129,10 @@ def _distill_verify(document, snapshot, **overrides):
 
 def test_extended_cathedral_receipt_verifies_in_the_distill_compute_lane():
     snapshot, document, receipt_bytes = _cross_repo_receipt()
-    # It is a genuine receipt here first.
+    # Issuer output, unmodified: this is what ReceiptIssuer.issue() emits when a
+    # caller supplies the optional platform block, so the compatibility claim is
+    # about the production path and not about a document a test assembled.
+    assert document["platform"] == CPU_PLATFORM
     assert verify_receipt(receipt_bytes, snapshot).document["platform"] == CPU_PLATFORM
     # And it verifies in distill through the authenticated registry adapter.
     verified = _distill_verify(document, snapshot)
@@ -218,8 +235,8 @@ def test_platform_plus_an_unknown_top_level_key_is_rejected_on_both_sides():
 def test_a_non_attestable_cpu_tee_is_rejected_on_both_sides(cpu_tee):
     # Plain "amd_sev" is what the live G4 GCP profile emits and has no
     # attestation interface at all. Neither repo may admit it.
-    snapshot, document, receipt_bytes = _cross_repo_receipt(
-        platform={"class": "confidential_cpu", "cpu_tee": cpu_tee}
+    snapshot, document, receipt_bytes = _assembled_receipt(
+        {"class": "confidential_cpu", "cpu_tee": cpu_tee}
     )
     with pytest.raises(ReceiptError, match="not in the attestable set"):
         verify_receipt(receipt_bytes, snapshot)
@@ -231,8 +248,8 @@ def test_a_class_and_tee_conflict_is_rejected_on_both_sides():
     # confidential_gpu without the GPU evidence block: refused here because the
     # composite class is not accepted at all, and refused in distill because
     # the class demands evidence that is absent.
-    snapshot, document, receipt_bytes = _cross_repo_receipt(
-        platform={"class": "confidential_gpu", "cpu_tee": "intel_tdx"}
+    snapshot, document, receipt_bytes = _assembled_receipt(
+        {"class": "confidential_gpu", "cpu_tee": "intel_tdx"}
     )
     with pytest.raises(ReceiptError, match="class is unsupported"):
         verify_receipt(receipt_bytes, snapshot)
@@ -359,12 +376,10 @@ def test_signer_asserted_work_units_cross_the_boundary_unchecked():
     # because neither consumer requires the work artifacts this repo replays
     # in FULL provenance (cathedral/workproof.py). See docs/RECEIPTS.md,
     # "What work units bind", DECISION NEEDED.
-    snapshot, _policy, _claims, receipt = _issued_receipt(
-        measurement=CROSS_MEASUREMENT, work_units=999.0
-    )
-    document = json.loads(receipt.receipt_bytes)
-    document["platform"] = dict(CPU_PLATFORM)
-    receipt_bytes = _resign(document)
+    # Issuer output again: the issuer signs the units it is handed, so this
+    # receipt is exactly what the production path emits for an undeserved
+    # number, not a hand-edited document.
+    snapshot, document, receipt_bytes = _cross_repo_receipt(work_units=999.0)
     # This repo accepts it too: the receipt boundary checks canonical decimal,
     # not derivation.
     assert verify_receipt(receipt_bytes, snapshot).document["work"]["work_units"] == "999"

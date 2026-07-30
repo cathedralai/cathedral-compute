@@ -230,11 +230,13 @@ def _issued_receipt(
     challenge_id: str = CHALLENGE_ID,
     work_units: float | None = None,
     measurement: str = MEASUREMENT,
+    platform: dict[str, object] | None = None,
+    tier: Tier = Tier.CC_CPU_TDX,
 ):
     snapshot = _snapshot(measurement=measurement)
     policy = snapshot.to_policy(at=ISSUED)
     claims = _claims(policy, work_status=work_status)
-    attested = _attested(claims, measurement=measurement)
+    attested = replace(_attested(claims, measurement=measurement), tier=tier)
     receipt = ReceiptIssuer(snapshot, "receipt-test-1", RECEIPT_SEED_1).issue(
         epoch_id=epoch_id,
         source_epoch=source_epoch,
@@ -252,6 +254,7 @@ def _issued_receipt(
             if work_units is not None
             else (3.5 if work_status is ClaimStatus.PASSED else 0.0)
         ),
+        platform=platform,
         issued_at=ISSUED,
     )
     return snapshot, policy, claims, receipt
