@@ -34,6 +34,11 @@ from cathedral.assurance import (
     assurance_from_dict,
     empty_assurance_claims,
 )
+from cathedral.admission_policy import (
+    DEFAULT_POLICY_MAX_AGE_SECONDS,
+    SignedAdmissionPolicyProvider,
+    load_policy_keys,
+)
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
     SignedColdkeyAllowlistProvider,
@@ -64,6 +69,10 @@ logger = logging.getLogger("cathedral.enroll")
 
 HOTKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,128}$")
 ENROLL_NONCE_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
+NETWORK_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_NETUID = 65_535
+ENROLL_REQUEST_SCHEMA_V2 = "cathedral_enroll_request_v2"
 MAX_BODY = 16 * 1024
 DEFAULT_VERIFICATION_TTL_SECONDS = 60 * 60
 DEFAULT_ENROLL_SIGNATURE_TTL_SECONDS = 10 * 60
@@ -314,7 +323,11 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
 
 
 def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timestamp: str) -> bytes:
-    """Canonical bytes miners sign before calling /v1/enroll."""
+    """Canonical bytes miners sign before calling /v1/enroll.
+
+    Legacy v1 request. Accepted only while no admission policy is
+    configured; see ``canonical_enroll_payload_v2``.
+    """
 
     payload = {
         "endpoint_url": endpoint_url,
@@ -323,6 +336,93 @@ def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timesta
         "timestamp": timestamp,
     }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def canonical_enroll_payload_v2(
+    *,
+    hotkey: str,
+    coldkey: str,
+    network: str,
+    netuid: int,
+    endpoint_url: str,
+    requested_profile_id: str,
+    nonce: str,
+    timestamp: str,
+    expires_at: str,
+) -> bytes:
+    """Canonical bytes miners sign for a v2 enrollment request.
+
+    Every field the registry will act on is inside the signature, so a
+    request cannot be replayed against a different subnet, endpoint, or
+    profile than the one the hotkey agreed to. The ``schema`` member is
+    domain separation: a v1 signature can never satisfy a v2 request
+    because the two byte strings cannot collide.
+
+    The submitted ``coldkey`` is signed but never trusted. The registry
+    resolves ownership from the registration snapshot and rejects the
+    request when the two disagree; including it in the signature is what
+    makes that disagreement attributable rather than ambiguous.
+    """
+
+    payload = {
+        "coldkey": coldkey,
+        "endpoint_url": endpoint_url,
+        "expires_at": expires_at,
+        "hotkey": hotkey,
+        "netuid": netuid,
+        "network": network,
+        "nonce": nonce,
+        "requested_profile_id": requested_profile_id,
+        "schema": ENROLL_REQUEST_SCHEMA_V2,
+        "timestamp": timestamp,
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def validate_network(network: object) -> str:
+    if not isinstance(network, str) or NETWORK_RE.fullmatch(network) is None:
+        raise ValueError("network must be a bounded lowercase identifier")
+    return network
+
+
+def validate_netuid(netuid: object) -> int:
+    if isinstance(netuid, bool) or not isinstance(netuid, int) or not 0 <= netuid <= MAX_NETUID:
+        raise ValueError("netuid must be an integer within the subnet range")
+    return netuid
+
+
+def validate_profile_id(profile_id: object) -> str:
+    if not isinstance(profile_id, str) or PROFILE_ID_RE.fullmatch(profile_id) is None:
+        raise ValueError("requested_profile_id must be a bounded identifier")
+    return profile_id
+
+
+def validate_enroll_expiry(
+    expires_at: object,
+    timestamp: str,
+    *,
+    now: datetime | None = None,
+    max_ttl_seconds: int = DEFAULT_ENROLL_SIGNATURE_TTL_SECONDS,
+) -> str:
+    """Validate the miner-declared expiry of a v2 enrollment request.
+
+    The expiry must be in the future, must follow the request timestamp, and
+    must not extend the request beyond the server's own signature TTL: a
+    miner cannot mint a request that outlives the replay window the registry
+    is willing to police.
+    """
+    if not isinstance(expires_at, str):
+        raise ValueError("expires_at must be an ISO-8601 UTC string")
+    parsed = _parse_iso_utc(expires_at)
+    issued = _parse_iso_utc(timestamp)
+    current = now if now is not None else datetime.now(UTC)
+    if parsed <= issued:
+        raise ValueError("expires_at must follow the request timestamp")
+    if (parsed - issued).total_seconds() > max_ttl_seconds:
+        raise ValueError("expires_at exceeds the maximum enrollment request lifetime")
+    if parsed <= current:
+        raise ValueError("enrollment request has expired")
+    return expires_at
 
 
 def verify_enroll_signature(hotkey: str, message: bytes, signature_b64: object) -> None:
@@ -342,6 +442,19 @@ def verify_enroll_signature(hotkey: str, message: bytes, signature_b64: object) 
         raise ValueError("invalid enroll signature") from exc
     if not ok:
         raise ValueError("invalid enroll signature")
+
+
+class EnrollmentRejected(Exception):
+    """One enrollment was refused by a policy cap or an identity conflict.
+
+    Deliberately not a ``ValueError``: the WSGI app turns a ``ValueError``
+    into a 400 with the message echoed back, while these carry a stable
+    machine-readable ``reason`` and answer 403.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -416,6 +529,24 @@ class RegistryStore:
                     enrolled_at_iso TEXT NOT NULL,
                     updated_at_iso TEXT NOT NULL
                 )
+                """
+            )
+            enrollment_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(enrollments)")
+            }
+            # The owning coldkey resolved from the registration snapshot at
+            # enrollment time, and the profile the miner asked to be tested
+            # under. Both are NULL for rows written before the admission
+            # policy existed; the caps treat an unresolved coldkey as its own
+            # bucket rather than pooling every legacy row together.
+            if "coldkey" not in enrollment_columns:
+                conn.execute("ALTER TABLE enrollments ADD COLUMN coldkey TEXT")
+            if "requested_profile_id" not in enrollment_columns:
+                conn.execute("ALTER TABLE enrollments ADD COLUMN requested_profile_id TEXT")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS enrollments_coldkey_idx
+                ON enrollments(coldkey)
                 """
             )
             conn.execute(
@@ -1375,10 +1506,40 @@ class RegistryStore:
             history.append(event)
         return tuple(history)
 
-    def enroll(self, hotkey: str, endpoint_url: str, *, nonce: str | None = None) -> None:
+    def enroll(
+        self,
+        hotkey: str,
+        endpoint_url: str,
+        *,
+        nonce: str | None = None,
+        coldkey: str | None = None,
+        requested_profile_id: str | None = None,
+        max_endpoints_per_coldkey: int | None = None,
+        max_total_enrollments: int | None = None,
+        unique_endpoint: bool = False,
+    ) -> None:
+        """Write or refresh one pending enrollment, inside the caps.
+
+        Every cap is evaluated in the same ``BEGIN IMMEDIATE`` transaction as
+        the write, so two concurrent enrollments cannot both observe capacity
+        and then both take it. A retry that re-enrolls the same hotkey at the
+        same endpoint consumes no additional capacity and stays idempotent.
+
+        Raises ``EnrollmentRejected`` when a cap would be exceeded or the
+        endpoint is already claimed by a different live worker.
+        """
         ts = now_iso()
         with self._lifecycle_lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._enforce_enrollment_caps(
+                conn,
+                hotkey=hotkey,
+                endpoint_url=endpoint_url,
+                coldkey=coldkey,
+                max_endpoints_per_coldkey=max_endpoints_per_coldkey,
+                max_total_enrollments=max_total_enrollments,
+                unique_endpoint=unique_endpoint,
+            )
             lifecycle_when = self._lifecycle_now()
             if nonce is not None:
                 try:
@@ -1401,13 +1562,20 @@ class RegistryStore:
 
             conn.execute(
                 """
-                INSERT INTO enrollments(hotkey, endpoint_url, enrolled_at_iso, updated_at_iso)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO enrollments(
+                    hotkey, endpoint_url, enrolled_at_iso, updated_at_iso,
+                    coldkey, requested_profile_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hotkey) DO UPDATE SET
                     endpoint_url=excluded.endpoint_url,
-                    updated_at_iso=excluded.updated_at_iso
+                    updated_at_iso=excluded.updated_at_iso,
+                    coldkey=COALESCE(excluded.coldkey, enrollments.coldkey),
+                    requested_profile_id=COALESCE(
+                        excluded.requested_profile_id, enrollments.requested_profile_id
+                    )
                 """,
-                (hotkey, endpoint_url, ts, ts),
+                (hotkey, endpoint_url, ts, ts, coldkey, requested_profile_id),
             )
 
             # Changed endpoint: clear the old attestation so the miner returns
@@ -1429,6 +1597,76 @@ class RegistryStore:
                     WorkerLifecycleState.PENDING,
                     LifecycleReason.ENROLLED,
                     lifecycle_when,
+                )
+
+    def _enforce_enrollment_caps(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        hotkey: str,
+        endpoint_url: str,
+        coldkey: str | None,
+        max_endpoints_per_coldkey: int | None,
+        max_total_enrollments: int | None,
+        unique_endpoint: bool,
+    ) -> None:
+        """Refuse an enrollment that would exceed a cap or steal an endpoint.
+
+        Retired rows are excluded from every count: retirement is the
+        operator's deliberate act of freeing capacity (``enroll reconcile
+        --remove``). Revoked rows still consume capacity, so losing a worker
+        to a revocation never hands its owner a fresh slot to retry from.
+
+        Every check is off by default. The legacy enrollment path predates
+        these rules and is left exactly as it was; only a request governed by
+        an admission policy opts in.
+        """
+        live = ", ".join(
+            f"'{state.value}'"
+            for state in WorkerLifecycleState
+            if state is not WorkerLifecycleState.RETIRED
+        )
+        # A worker with no lifecycle row yet (legacy data) counts as live.
+        live_join = f"""
+            FROM enrollments e
+            LEFT JOIN worker_lifecycle_current c ON c.hotkey = e.hotkey
+            WHERE (c.state IS NULL OR c.state IN ({live}))
+        """
+
+        if unique_endpoint:
+            claimant = conn.execute(
+                f"SELECT e.hotkey {live_join} AND e.endpoint_url = ? AND e.hotkey != ?",
+                (endpoint_url, hotkey),
+            ).fetchone()
+            if claimant is not None:
+                # Pre-attestation proxy for one physical machine. True platform
+                # uniqueness is the chip-id gate at admission; this only stops
+                # two hotkeys queueing probes against the same address.
+                raise EnrollmentRejected(
+                    "endpoint is already enrolled by another worker",
+                    reason="endpoint_claimed",
+                )
+
+        if max_endpoints_per_coldkey is not None and coldkey is not None:
+            rows = conn.execute(
+                f"SELECT DISTINCT e.endpoint_url {live_join} AND e.coldkey = ? AND e.hotkey != ?",
+                (coldkey, hotkey),
+            ).fetchall()
+            held = {row["endpoint_url"] for row in rows}
+            if endpoint_url not in held and len(held) >= max_endpoints_per_coldkey:
+                raise EnrollmentRejected(
+                    "coldkey has reached its enrolled endpoint cap",
+                    reason="coldkey_endpoint_cap",
+                )
+
+        if max_total_enrollments is not None:
+            existing = conn.execute(
+                f"SELECT COUNT(*) AS total {live_join} AND e.hotkey != ?", (hotkey,)
+            ).fetchone()["total"]
+            if existing >= max_total_enrollments:
+                raise EnrollmentRejected(
+                    "the subnet has reached its worker cap",
+                    reason="total_worker_cap",
                 )
 
     def check_and_record_hotkey_attempt(
@@ -1850,6 +2088,7 @@ class RegistryApp:
         enroll_signature_ttl_seconds: int | None = None,
         registration_provider: object | None = None,
         coldkey_allowlist: object | None = None,
+        admission_policy: object | None = None,
         production_mode: bool = False,
         trusted_proxy: bool = False,
         hotkey_enroll_limit: int = DEFAULT_HOTKEY_ENROLL_LIMIT,
@@ -1875,6 +2114,17 @@ class RegistryApp:
         # is inactive so tests and SN292 development flows keep the current
         # open behavior.
         self.coldkey_allowlist = coldkey_allowlist
+        # Signed admission policy (cathedral_admission_policy_v1): any object
+        # exposing ``load() -> snapshot | None``. When configured it replaces
+        # the standalone allowlist entirely and requires v2 enrollment
+        # requests; the two cannot be configured together, because a service
+        # answering to two approval artifacts has no single answer to "who is
+        # approved right now".
+        if admission_policy is not None and coldkey_allowlist is not None:
+            raise ValueError(
+                "configure either an admission policy or a coldkey allowlist, not both"
+            )
+        self.admission_policy = admission_policy
         # When True, enrollments are rejected if registration cannot be
         # confirmed even when no provider is configured.
         self.production_mode = production_mode
@@ -1921,6 +2171,23 @@ class RegistryApp:
             )
 
         payload = self._read_json(environ)
+
+        # The admission policy, when configured, is the authority for mode,
+        # binding, profiles, and caps. It is loaded before anything is parsed
+        # so an unavailable policy rejects uniformly rather than leaking which
+        # request shapes the service would otherwise have accepted.
+        policy = None
+        if self.admission_policy is not None:
+            policy = self.admission_policy.load()
+            if policy is None:
+                return self._reject(
+                    start_response,
+                    403,
+                    "admission policy unavailable",
+                    hotkey=None,
+                    reason="policy_unavailable",
+                )
+
         hotkey = validate_hotkey(payload.get("hotkey"))
         # Production mode requires a public IP literal endpoint: see
         # validate_endpoint_url for why this replaces a pinned custom
@@ -1933,11 +2200,55 @@ class RegistryApp:
             payload.get("timestamp"),
             max_age_seconds=self.enroll_signature_ttl_seconds,
         )
-        verify_enroll_signature(
-            hotkey,
-            canonical_enroll_payload(hotkey, endpoint_url, nonce, timestamp),
-            payload.get("signature_b64"),
-        )
+
+        claimed_coldkey: str | None = None
+        requested_profile_id: str | None = None
+        if policy is None:
+            verify_enroll_signature(
+                hotkey,
+                canonical_enroll_payload(hotkey, endpoint_url, nonce, timestamp),
+                payload.get("signature_b64"),
+            )
+        else:
+            # v2 request. Every field the registry acts on is inside the
+            # signature. There is no downgrade path: once a policy is
+            # configured a v1 request cannot satisfy this verification,
+            # because the signed byte strings cannot collide.
+            claimed_coldkey = validate_hotkey(payload.get("coldkey"))
+            network = validate_network(payload.get("network"))
+            netuid = validate_netuid(payload.get("netuid"))
+            requested_profile_id = validate_profile_id(payload.get("requested_profile_id"))
+            expires_at = validate_enroll_expiry(
+                payload.get("expires_at"),
+                timestamp,
+                max_ttl_seconds=self.enroll_signature_ttl_seconds,
+            )
+            verify_enroll_signature(
+                hotkey,
+                canonical_enroll_payload_v2(
+                    hotkey=hotkey,
+                    coldkey=claimed_coldkey,
+                    network=network,
+                    netuid=netuid,
+                    endpoint_url=endpoint_url,
+                    requested_profile_id=requested_profile_id,
+                    nonce=nonce,
+                    timestamp=timestamp,
+                    expires_at=expires_at,
+                ),
+                payload.get("signature_b64"),
+            )
+            # The signature proves the miner meant *this* subnet. The policy
+            # verifier has already proven the artifact means this subnet. A
+            # mismatch here is a request aimed somewhere else.
+            if network != policy.network or netuid != policy.netuid:
+                return self._reject(
+                    start_response,
+                    403,
+                    "request is bound to a different network or netuid",
+                    hotkey=hotkey,
+                    reason="network_mismatch",
+                )
 
         # Per-hotkey durable enrollment rate limit. Backed by SQLite so the
         # bound survives restarts and is consistent across app instances that
@@ -1985,6 +2296,17 @@ class RegistryApp:
                 "registration provider not configured",
                 hotkey=hotkey,
                 reason="registration_provider_missing",
+            )
+
+        if policy is not None:
+            return self._enroll_under_policy(
+                start_response,
+                policy=policy,
+                hotkey=hotkey,
+                claimed_coldkey=claimed_coldkey,
+                endpoint_url=endpoint_url,
+                requested_profile_id=requested_profile_id,
+                nonce=nonce,
             )
 
         # Approved-coldkey gate: active whenever an allowlist is configured,
@@ -2045,6 +2367,109 @@ class RegistryApp:
             )
         logger.info("enroll accepted hotkey=%s", hotkey)
         return self._json(start_response, 200, {"status": "enrolled"})
+
+    def _enroll_under_policy(
+        self,
+        start_response: Any,
+        *,
+        policy: Any,
+        hotkey: str,
+        claimed_coldkey: str | None,
+        endpoint_url: str,
+        requested_profile_id: str | None,
+        nonce: str,
+    ) -> list[bytes]:
+        """Apply the admission policy and write the pending record.
+
+        Enrollment is permission to be *tested*. Nothing decided here is
+        admission, a score, or a reward: the strict measurement, TCB,
+        channel-binding, and uniqueness gates run later and are identical in
+        both modes.
+        """
+        if not policy.admits_profile(requested_profile_id):
+            return self._reject(
+                start_response,
+                403,
+                "requested profile is not offered by the current policy",
+                hotkey=hotkey,
+                reason="profile_not_offered",
+            )
+
+        # Ownership comes from the registration snapshot, never from the
+        # request. The submitted coldkey is only ever compared against it.
+        coldkey = self._resolve_coldkey(hotkey)
+        if coldkey is None:
+            return self._reject(
+                start_response,
+                403,
+                "hotkey coldkey could not be resolved",
+                hotkey=hotkey,
+                coldkey="unresolvable",
+                reason="coldkey_unresolvable",
+            )
+        if claimed_coldkey is not None and claimed_coldkey != coldkey:
+            return self._reject(
+                start_response,
+                403,
+                "submitted coldkey does not own this hotkey",
+                hotkey=hotkey,
+                coldkey=coldkey,
+                reason="coldkey_mismatch",
+            )
+
+        # Selected mode consults the approval set. Open mode does not, and
+        # relies on the registration gate that has already run above: an
+        # unregistered hotkey never reaches this line in either mode.
+        if not policy.admits_coldkey(coldkey):
+            return self._reject(
+                start_response,
+                403,
+                "coldkey is not approved for enrollment",
+                hotkey=hotkey,
+                coldkey=coldkey,
+                reason="coldkey_not_selected",
+            )
+
+        try:
+            self.store.enroll(
+                hotkey,
+                endpoint_url,
+                nonce=nonce,
+                coldkey=coldkey,
+                requested_profile_id=requested_profile_id,
+                max_endpoints_per_coldkey=policy.max_enrolled_endpoints_per_coldkey,
+                max_total_enrollments=policy.max_admitted_workers_total,
+                unique_endpoint=True,
+            )
+        except EnrollmentRejected as exc:
+            return self._reject(
+                start_response,
+                403,
+                str(exc),
+                hotkey=hotkey,
+                coldkey=coldkey,
+                reason=exc.reason,
+            )
+        logger.info(
+            "enroll accepted hotkey=%s coldkey=%s mode=%s profile=%s config_version=%d",
+            hotkey,
+            coldkey,
+            policy.mode,
+            requested_profile_id,
+            policy.config_version,
+        )
+        # "pending" is the honest word: the worker is queued for testing and
+        # holds no score, no weight, and no admission until it passes every
+        # later gate.
+        return self._json(
+            start_response,
+            200,
+            {
+                "status": "pending",
+                "lifecycle_state": WorkerLifecycleState.PENDING.value,
+                "admission_config_version": policy.config_version,
+            },
+        )
 
     def _resolve_coldkey(self, hotkey: str) -> str | None:
         """Resolve the coldkey owning *hotkey* via the registration provider.
@@ -2192,18 +2617,86 @@ def main() -> None:
             "N seconds (default: 86400)"
         ),
     )
+    parser.add_argument(
+        "--admission-policy",
+        metavar="PATH",
+        help=(
+            "path to the signed admission policy artifact "
+            "(docs/ADMISSION_POLICY.md). Replaces --enroll-allowlist and "
+            "requires v2 enrollment requests; the two cannot be combined. "
+            "Either this or --enroll-allowlist is mandatory in production."
+        ),
+    )
+    parser.add_argument(
+        "--admission-policy-keys",
+        metavar="PATH",
+        help=(
+            "JSON object of key id to base64 32-byte Ed25519 public key "
+            "trusted to sign the admission policy. Required with "
+            "--admission-policy."
+        ),
+    )
+    parser.add_argument(
+        "--admission-policy-keys-digest",
+        metavar="sha256:HEX",
+        help="pin the admission policy key file to this sha256 digest",
+    )
+    parser.add_argument(
+        "--admission-policy-digest",
+        metavar="sha256:HEX",
+        help=(
+            "pin the admission policy artifact itself to this digest; "
+            "rotation then requires a restart with the new digest"
+        ),
+    )
+    parser.add_argument(
+        "--admission-policy-max-age-seconds",
+        type=int,
+        default=DEFAULT_POLICY_MAX_AGE_SECONDS,
+        metavar="N",
+        help=(
+            "reject the admission policy when its issued_at is older than "
+            "N seconds (default: 86400)"
+        ),
+    )
+    parser.add_argument(
+        "--network",
+        default="finney",
+        help="network the admission policy must be bound to (default: finney)",
+    )
+    parser.add_argument(
+        "--netuid",
+        type=int,
+        default=39,
+        help="netuid the admission policy must be bound to (default: 39)",
+    )
     args = parser.parse_args()
 
     if args.registration_max_age_seconds <= 0:
         parser.error("--registration-max-age-seconds must be a positive integer")
     if args.enroll_allowlist_max_age_seconds <= 0:
         parser.error("--enroll-allowlist-max-age-seconds must be a positive integer")
+    if args.admission_policy_max_age_seconds <= 0:
+        parser.error("--admission-policy-max-age-seconds must be a positive integer")
 
     if args.production_mode and not args.registered_hotkeys_file:
         parser.error("--production-mode requires --registered-hotkeys-file")
-    if args.production_mode and not args.enroll_allowlist:
-        parser.error("--production-mode requires --enroll-allowlist")
-    if args.production_mode and not args.enroll_allowlist_keys_digest:
+    if args.admission_policy and args.enroll_allowlist:
+        parser.error("--admission-policy and --enroll-allowlist are mutually exclusive")
+    if args.admission_policy and not args.admission_policy_keys:
+        parser.error("--admission-policy requires --admission-policy-keys")
+    if args.production_mode and not (args.admission_policy or args.enroll_allowlist):
+        parser.error("--production-mode requires --admission-policy or --enroll-allowlist")
+    if args.production_mode and args.admission_policy:
+        if not args.admission_policy_keys_digest:
+            parser.error("--production-mode requires --admission-policy-keys-digest")
+        # The key digest pins the root of trust, not the document. The
+        # config_version guard is in-process and resets on restart, so a
+        # superseded but still validly signed policy could otherwise be
+        # replayed to re-open a mode or restore a revoked coldkey.
+        if not args.admission_policy_digest:
+            parser.error("--production-mode requires --admission-policy-digest")
+    if args.production_mode and args.enroll_allowlist and not args.enroll_allowlist_keys_digest:
         parser.error("--production-mode requires --enroll-allowlist-keys-digest")
     # The key digest pins the root of trust, not the document. Release
     # monotonicity alone is in-process and resets on restart, so a superseded
@@ -2241,12 +2734,28 @@ def main() -> None:
             pinned_digest=args.enroll_allowlist_digest,
         )
 
+    admission: SignedAdmissionPolicyProvider | None = None
+    if args.admission_policy:
+        admission = SignedAdmissionPolicyProvider(
+            args.admission_policy,
+            load_policy_keys(
+                args.admission_policy_keys,
+                production_mode=args.production_mode,
+                pinned_digest=args.admission_policy_keys_digest,
+            ),
+            network=args.network,
+            netuid=args.netuid,
+            max_age_seconds=args.admission_policy_max_age_seconds,
+            pinned_digest=args.admission_policy_digest,
+        )
+
     app = RegistryApp(
         RegistryStore(args.db),
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,
         coldkey_allowlist=allowlist,
+        admission_policy=admission,
     )
     with make_server(args.host, args.port, app) as server:
         logger.info("serving registry on http://%s:%d", args.host, args.port)
