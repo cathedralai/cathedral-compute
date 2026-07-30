@@ -41,6 +41,7 @@ class FakeLifecycle:
     hotkey: str
     evidence_verified_at: datetime | None = None
     evidence_expires_at: datetime | None = None
+    state_changed_at: datetime | None = None
 
 
 def new_worker(name: str) -> tuple[FakeEnrollment, FakeLifecycle]:
@@ -230,3 +231,59 @@ def test_the_default_share_reserves_a_quarter():
     due += [attested(f"5R{index}", expires_in=timedelta(minutes=index + 1)) for index in range(10)]
     selected, _ = select_probe_targets(due, max_probes=8)
     assert len([name for name in names(selected) if name.startswith("5N")]) == 2
+
+
+# ---------------------------------------------------------------------------
+# 8. Fairness inside the fresh class, and dispatch order under a deadline
+# ---------------------------------------------------------------------------
+
+def waiting(name: str, *, since: timedelta) -> tuple[FakeEnrollment, FakeLifecycle]:
+    """A worker awaiting its first probe, enrolled *since* ago."""
+    return (
+        FakeEnrollment(name),
+        FakeLifecycle(name, state_changed_at=NOW - since),
+    )
+
+
+def test_the_fresh_class_is_first_come_first_served_not_lowest_hotkey():
+    """Ordering the fresh class by hotkey is grindable.
+
+    Both evidence timestamps are None for a worker awaiting its first probe,
+    so without an age key the whole class collapses onto the hotkey
+    tie-break, and an attacker who grinds a low-sorting ss58 takes the
+    reserved share every pass.
+    """
+    due = [
+        waiting("5ZZZ_oldest", since=timedelta(hours=3)),
+        waiting("5AAA_newest", since=timedelta(minutes=1)),
+        waiting("5MMM_middle", since=timedelta(hours=1)),
+    ]
+    selected, deferred = select_probe_targets(due, max_probes=2, new_worker_share=1.0)
+    assert names(selected) == ["5ZZZ_oldest", "5MMM_middle"]
+    assert names(deferred) == ["5AAA_newest"]
+
+
+def test_a_ground_low_sorting_hotkey_cannot_jump_the_fresh_queue():
+    honest = [waiting(f"5H{index:03d}", since=timedelta(hours=2)) for index in range(4)]
+    attacker = [waiting(f"1A{index:03d}", since=timedelta(seconds=1)) for index in range(20)]
+
+    selected, _ = select_probe_targets(
+        honest + attacker, max_probes=4, new_worker_share=1.0
+    )
+    assert all(name.startswith("5H") for name in names(selected))
+
+
+def test_refreshes_are_dispatched_before_first_probes():
+    """The deadline drops what has not started, so order decides who loses.
+
+    A first probe that waits for the next pass loses nothing it had. An
+    attested worker that misses its refresh loses its evidence, and with it
+    its place in the scored set.
+    """
+    due = [waiting(f"5N{index}", since=timedelta(hours=1)) for index in range(4)]
+    due += [attested(f"5R{index}", expires_in=timedelta(minutes=index + 1)) for index in range(4)]
+
+    selected, _ = select_probe_targets(due, max_probes=8, new_worker_share=0.5)
+    dispatched = names(selected)
+    assert all(name.startswith("5R") for name in dispatched[:4])
+    assert all(name.startswith("5N") for name in dispatched[4:])

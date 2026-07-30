@@ -425,6 +425,10 @@ def select_probe_targets(
     Deferral is not failure. A deferred target keeps its verdict, its
     lifecycle state, and its retry counter untouched; it is simply probed on
     a later pass.
+
+    The ordering applies even when everything fits inside the budget, because
+    the pass deadline still decides who starts, and a set that fits in the
+    budget can still exceed the clock.
     """
     if max_probes is None:
         return list(due), []
@@ -432,21 +436,31 @@ def select_probe_targets(
         raise ValueError(f"max_probes must be at least 1, got {max_probes}")
     if not 0.0 <= new_worker_share <= 1.0:
         raise ValueError("new_worker_share must be between 0.0 and 1.0")
-    if len(due) <= max_probes:
-        return list(due), []
+
+    def _epoch_seconds(value: Any) -> float | None:
+        try:
+            return value.timestamp()
+        except AttributeError:
+            return None
 
     def overdue_key(target: tuple[Any, Any]) -> tuple[Any, ...]:
         _enrollment, lifecycle = target
-        expires = getattr(lifecycle, "evidence_expires_at", None)
-        verified = getattr(lifecycle, "evidence_verified_at", None)
-        # None sorts first: never-verified and never-expiring evidence are the
-        # most overdue things in their class. The hotkey tie-break keeps the
-        # order deterministic for an identical due set.
+        expires = _epoch_seconds(getattr(lifecycle, "evidence_expires_at", None))
+        verified = _epoch_seconds(getattr(lifecycle, "evidence_verified_at", None))
+        # A worker awaiting its first probe has neither timestamp, so without
+        # a third key the whole fresh class would collapse onto the hotkey
+        # tie-break — and an attacker who grinds a low-sorting ss58 would take
+        # the reserved share every pass, which is the starvation this ordering
+        # exists to prevent. state_changed_at makes the fresh class
+        # first-come-first-served, which key choice cannot influence.
+        waiting_since = _epoch_seconds(getattr(lifecycle, "state_changed_at", None))
         return (
             expires is not None,
-            expires.timestamp() if expires is not None else 0.0,
+            expires if expires is not None else 0.0,
             verified is not None,
-            verified.timestamp() if verified is not None else 0.0,
+            verified if verified is not None else 0.0,
+            waiting_since is not None,
+            waiting_since if waiting_since is not None else 0.0,
             lifecycle.hotkey,
         )
 
@@ -475,7 +489,12 @@ def select_probe_targets(
         refresh_budget = min(len(refresh), refresh_budget + (fresh_budget - len(fresh)))
         fresh_budget = len(fresh)
 
-    selected = fresh[:fresh_budget] + refresh[:refresh_budget]
+    # Refreshes are dispatched first. The pass deadline drops whatever has
+    # not started, so whichever class goes last is the one systematically
+    # sacrificed — and sacrificing refreshes means attested workers lose
+    # evidence and fall out of the scored set because the validator was busy.
+    # A first probe that waits for the next pass loses nothing it had.
+    selected = refresh[:refresh_budget] + fresh[:fresh_budget]
     chosen = {id(target) for target in selected}
     return selected, [target for target in due if id(target) not in chosen]
 
@@ -594,12 +613,17 @@ def probe_once(
         max_probes=max_probes,
         new_worker_share=new_worker_share,
     )
+    all_reached = True
     if deferred:
         LOGGER.info(
             "probe budget %d reached: %d target(s) deferred to the next pass",
             max_probes,
             len(deferred),
         )
+        # A pass that did not reach every due target has not verified every
+        # due target. Reporting success here would let `--once --max-probes N`
+        # tell a health check the fleet is fine after contacting N of M.
+        all_reached = False
     gpu_evidence_slots = threading.BoundedSemaphore(MAX_GPU_EVIDENCE_CONCURRENCY)
 
     def _probe_one(target: tuple[Any, Any]) -> bool:
@@ -767,7 +791,7 @@ def probe_once(
                 LOGGER.exception("failed to record probe failure for hotkey %s", enrollment.hotkey)
             return False
 
-    all_succeeded = True
+    all_succeeded = all_reached
     effective_workers = (
         min(max_workers, MAX_GPU_EVIDENCE_CONCURRENCY)
         if expected_tier is Tier.CC_GPU
@@ -789,7 +813,9 @@ def probe_once(
                 "probe deadline reached; deferring hotkey=%s to the next pass",
                 enrollment.hotkey,
             )
-            return True
+            # Not a failure for the worker, but not a success for the pass:
+            # nothing was verified, so the pass must not claim it was.
+            return False
         return _probe_one(target)
 
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -964,6 +990,20 @@ def main() -> None:
             generation_anchor_path=args.gpu_identity_anchor_file,
         )
         expected_tier = Tier.CC_GPU
+
+    # Validated at startup, not on the first pass. probe_once raises for a bad
+    # budget, and the pass loop below swallows every exception and sleeps, so
+    # a typo would otherwise turn the prober into a silent no-op that logs
+    # once per interval while every worker's evidence quietly expires.
+    if args.max_probes is not None and args.max_probes < 1:
+        parser.error("--max-probes must be at least 1")
+    if not 0.0 <= args.new_worker_share <= 1.0:
+        parser.error("--new-worker-share must be between 0.0 and 1.0")
+    if args.pass_deadline_seconds is not None and args.pass_deadline_seconds <= 0:
+        parser.error("--pass-deadline-seconds must be positive")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+
     while True:
         try:
             if args.policy_registry is not None:
