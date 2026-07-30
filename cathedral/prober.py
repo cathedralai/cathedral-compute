@@ -392,11 +392,102 @@ def verify_cc_evidence_bundle(
     return None
 
 
+DEFAULT_NEW_WORKER_SHARE = 0.25
+
+
+def select_probe_targets(
+    due: list[tuple[Any, Any]],
+    *,
+    max_probes: int | None,
+    new_worker_share: float = DEFAULT_NEW_WORKER_SHARE,
+) -> tuple[list[tuple[Any, Any]], list[tuple[Any, Any]]]:
+    """Split the due set into this pass's targets and the deferred remainder.
+
+    A budget without an ordering is a starvation bug. ``due_refreshes``
+    returns rows ordered by hotkey, so truncating that list would probe the
+    same lexicographically smallest hotkeys every pass and never reach the
+    tail. Targets are therefore ordered **most overdue first**, which is both
+    fair and the order that minimises time spent outside a verdict.
+
+    The budget is also split across two classes, because a single queue lets
+    either class starve the other:
+
+    - workers with no verified evidence yet (a first probe), and
+    - workers with evidence due for refresh.
+
+    Open mode makes this load-bearing. If new workers always won, anyone
+    could enroll continuously and push already-attested miners past their
+    evidence expiry, turning an admission gate into a way to zero honest
+    supply. If refreshes always won, a full subnet would never admit anyone
+    new. Each class gets a reserved share and unused capacity spills to the
+    other, so the budget is never wasted on an empty class.
+
+    Deferral is not failure. A deferred target keeps its verdict, its
+    lifecycle state, and its retry counter untouched; it is simply probed on
+    a later pass.
+    """
+    if max_probes is None:
+        return list(due), []
+    if max_probes < 1:
+        raise ValueError(f"max_probes must be at least 1, got {max_probes}")
+    if not 0.0 <= new_worker_share <= 1.0:
+        raise ValueError("new_worker_share must be between 0.0 and 1.0")
+    if len(due) <= max_probes:
+        return list(due), []
+
+    def overdue_key(target: tuple[Any, Any]) -> tuple[Any, ...]:
+        _enrollment, lifecycle = target
+        expires = getattr(lifecycle, "evidence_expires_at", None)
+        verified = getattr(lifecycle, "evidence_verified_at", None)
+        # None sorts first: never-verified and never-expiring evidence are the
+        # most overdue things in their class. The hotkey tie-break keeps the
+        # order deterministic for an identical due set.
+        return (
+            expires is not None,
+            expires.timestamp() if expires is not None else 0.0,
+            verified is not None,
+            verified.timestamp() if verified is not None else 0.0,
+            lifecycle.hotkey,
+        )
+
+    fresh = sorted(
+        (t for t in due if getattr(t[1], "evidence_verified_at", None) is None),
+        key=overdue_key,
+    )
+    refresh = sorted(
+        (t for t in due if getattr(t[1], "evidence_verified_at", None) is not None),
+        key=overdue_key,
+    )
+
+    fresh_budget = min(len(fresh), int(max_probes * new_worker_share))
+    if fresh and fresh_budget == 0 and new_worker_share > 0:
+        # A share small enough to round to zero would silently mean "never
+        # admit anyone". An explicit 0.0 still means zero: that is a
+        # deliberate posture where newcomers get only leftover capacity.
+        fresh_budget = 1
+    refresh_budget = max_probes - fresh_budget
+    # Spill unused capacity both ways so a budget is never lost to an empty
+    # or short class.
+    if len(refresh) < refresh_budget:
+        fresh_budget = min(len(fresh), fresh_budget + (refresh_budget - len(refresh)))
+        refresh_budget = len(refresh)
+    elif len(fresh) < fresh_budget:
+        refresh_budget = min(len(refresh), refresh_budget + (fresh_budget - len(fresh)))
+        fresh_budget = len(fresh)
+
+    selected = fresh[:fresh_budget] + refresh[:refresh_budget]
+    chosen = {id(target) for target in selected}
+    return selected, [target for target in due if id(target) not in chosen]
+
+
 def probe_once(
     store: RegistryStore,
     policy: Policy,
     *,
     max_workers: int = 4,
+    max_probes: int | None = None,
+    new_worker_share: float = DEFAULT_NEW_WORKER_SHARE,
+    deadline_seconds: float | None = None,
     resolver: Any = None,
     opener: Any = None,
     production_mode: bool = False,
@@ -418,10 +509,23 @@ def probe_once(
         (recorded as a FAILED verdict for that hotkey, isolated from the
         rest of the pass). Matches the production enrollment-time policy in
         ``cathedral.enroll.validate_endpoint_url``.
+    :param max_probes: cap on targets probed in one pass. ``None`` (the
+        default) preserves the historical unbounded behaviour. Under open
+        enrollment this is what stops a large population from making a pass
+        unbounded in cost; see ``select_probe_targets`` for the fair
+        two-class ordering that keeps a cap from starving either class.
+    :param new_worker_share: fraction of *max_probes* reserved for workers
+        with no verified evidence yet.
+    :param deadline_seconds: wall-clock budget for the pass. Once it elapses,
+        targets that have not started are deferred rather than dispatched.
+        Probes already in flight are allowed to finish; their own transport
+        timeouts bound them.
     :raises ValueError: when *max_workers* is less than 1.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be at least 1, got {max_workers}")
+    if deadline_seconds is not None and deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be positive")
     gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
     if expected_tier is Tier.CC_GPU and any(item is None for item in gpu_configuration):
         raise ValueError("GPU probing requires profile, verifier, and identity registry")
@@ -480,11 +584,22 @@ def probe_once(
         snapshot.hotkey: snapshot
         for snapshot in store.due_refreshes(refresh_ahead_seconds=store.verification_ttl_seconds)
     }
-    probe_targets = [
+    all_due = [
         (enrollment, due_snapshots[enrollment.hotkey])
         for enrollment in store.enrollments()
         if enrollment.hotkey in due_snapshots
     ]
+    probe_targets, deferred = select_probe_targets(
+        all_due,
+        max_probes=max_probes,
+        new_worker_share=new_worker_share,
+    )
+    if deferred:
+        LOGGER.info(
+            "probe budget %d reached: %d target(s) deferred to the next pass",
+            max_probes,
+            len(deferred),
+        )
     gpu_evidence_slots = threading.BoundedSemaphore(MAX_GPU_EVIDENCE_CONCURRENCY)
 
     def _probe_one(target: tuple[Any, Any]) -> bool:
@@ -658,8 +773,27 @@ def probe_once(
         if expected_tier is Tier.CC_GPU
         else max_workers
     )
+    expires_at = (
+        time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    )
+
+    def _probe_within_deadline(target: tuple[Any, Any]) -> bool:
+        # Checked inside the worker, not at submit time: with a bounded pool
+        # the queue drains over the whole pass, so a target that would start
+        # after the deadline must be dropped when its turn comes rather than
+        # when it was queued. Deferral leaves its verdict and retry counter
+        # untouched.
+        if expires_at is not None and time.monotonic() >= expires_at:
+            enrollment, _lifecycle = target
+            LOGGER.info(
+                "probe deadline reached; deferring hotkey=%s to the next pass",
+                enrollment.hotkey,
+            )
+            return True
+        return _probe_one(target)
+
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        futures = [executor.submit(_probe_one, target) for target in probe_targets]
+        futures = [executor.submit(_probe_within_deadline, target) for target in probe_targets]
         for future in as_completed(futures):
             try:
                 if not future.result():
@@ -714,6 +848,38 @@ def main() -> None:
         type=int,
         default=4,
         help="concurrent probe workers per pass (default: 4, must be ≥ 1)",
+    )
+    parser.add_argument(
+        "--max-probes",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "cap targets probed per pass; the rest are deferred to the next "
+            "pass with their verdicts and retry counters untouched. Required "
+            "sizing under open enrollment (default: unbounded)"
+        ),
+    )
+    parser.add_argument(
+        "--new-worker-share",
+        type=float,
+        default=DEFAULT_NEW_WORKER_SHARE,
+        metavar="F",
+        help=(
+            "fraction of --max-probes reserved for workers with no verified "
+            "evidence yet, so neither first probes nor refreshes can starve "
+            "the other (default: 0.25)"
+        ),
+    )
+    parser.add_argument(
+        "--pass-deadline-seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help=(
+            "wall-clock budget for one pass; targets that have not started "
+            "when it elapses are deferred (default: unbounded)"
+        ),
     )
     parser.add_argument(
         "--production-mode",
@@ -809,6 +975,9 @@ def main() -> None:
                 store,
                 policy,
                 max_workers=args.workers,
+                max_probes=args.max_probes,
+                new_worker_share=args.new_worker_share,
+                deadline_seconds=args.pass_deadline_seconds,
                 production_mode=args.production_mode,
                 policy_refresher=(
                     (lambda: refresh_registry_authority()[0])
