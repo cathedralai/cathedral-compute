@@ -25,7 +25,11 @@ these tests RUN; a skip is not evidence of compatibility.
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import shutil
+import tempfile
 from datetime import UTC, datetime
 
 import pytest
@@ -61,6 +65,16 @@ thin_integration = pytest.importorskip(
     reason="cathedral-validator (private) is not installed in this environment",
 )
 distill_receipt = pytest.importorskip("cathedral_distill.distill_receipt")
+ConsumptionLedger = pytest.importorskip(
+    "cathedral_distill.consumption_ledger"
+).ConsumptionLedger
+
+# The shared contract refuses a non-durable ledger, so the policed preview needs
+# a real file. Cleaned up when the test process exits.
+_LEDGER_TMPDIRS: list[str] = []
+atexit.register(
+    lambda: [shutil.rmtree(p, ignore_errors=True) for p in _LEDGER_TMPDIRS]
+)
 
 # distill's compute lane requires a full 64-hex TDX measurement, so the test
 # registry publishes one instead of the shorter sample label used elsewhere.
@@ -296,6 +310,14 @@ def _validator_preview(document, snapshot, *, lane_receipts=None):
             )
         ]
     )
+    # A funded lane refuses to preview unpoliced, so this is a fully policed
+    # preview: the point of the cross-repo test is that a Cathedral-issued
+    # receipt survives the gates a launch would actually apply, not that it
+    # survives with the gates switched off. The allow-lists are pinned to this
+    # receipt's own measurement and TCB status, so a receipt that drifted from
+    # the policy would fail here rather than silently pass.
+    ledger_dir = tempfile.mkdtemp(prefix="cathedral-cross-repo-ledger-")
+    _LEDGER_TMPDIRS.append(ledger_dir)
     return thin_integration.preview_integrated_vector(
         burn_config=fixtures.burn_config(),
         allocation_config=fixtures.allocation_config(
@@ -308,6 +330,13 @@ def _validator_preview(document, snapshot, *, lane_receipts=None):
         source_epoch=SOURCE_EPOCH,
         now=NOW,
         now_iso=NOW_ISO,
+        allowed_measurements=frozenset({CROSS_MEASUREMENT}),
+        allowed_tcb_statuses=frozenset({"UpToDate"}),
+        allowed_advisories=frozenset(),
+        current_block=6_000_100,
+        consumption_ledger=ConsumptionLedger(
+            os.path.join(ledger_dir, "consumption.sqlite")
+        ),
     )
 
 
