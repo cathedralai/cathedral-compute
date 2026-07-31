@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """Auditable measurement-approval flow for the SN39 CPU policy registry.
 
-A TDX MRTD (launch measurement) can change when a confidential VM is fully
-stopped and restarted onto a host with different guest firmware (TDVF). The
-runtime already fails closed on any measurement not in the signed policy
-registry. This tool is the only sanctioned way to add a new measurement: it
-never trusts a measurement blindly. It
+The launch measurement changes far more easily than "different guest firmware"
+suggests, and this is the tool you run when it does.
+
+It is NOT a bare MRTD: it is a SHA-256 over eight fields, of which `mr_td` is
+one, and ALL FOUR RTMRs are folded in (see `cathedral/verify/tdx_quote.py` and
+`docs/MRTD.md`). RTMR1 conventionally measures kernel and initrd, so ANY
+initramfs regeneration moves it -- installing a single package is enough.
+Measured on real TDX hardware, `apt full-upgrade` plus installing Docker
+changed the value while `mr_td` and `rtmr0` stayed constant. Migration onto a
+host with different guest firmware (TDVF) also changes it, but it is not the
+common case; routine patching is.
+
+The runtime fails closed on any measurement not in the signed policy registry,
+so a provider that patches stops being admitted until this flow is run for its
+new measurement. Whether routine patching SHOULD be an approvable event, and at
+what cadence, is an open policy question (cathedral-compute#88) -- the mechanics
+below are ready either way.
+
+This tool is the only sanctioned way to add a new measurement: it never trusts
+a measurement blindly. It
 
   1. captures the candidate measurement live from a named worker, through the
      pinned production verifier, proving intel_verified + report_data_match +

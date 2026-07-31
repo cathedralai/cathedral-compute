@@ -57,11 +57,19 @@ a malformed receipt and sent operators to inspect the wrong artifact entirely.
 
 ### Open: freeze, or re-approve?
 
-**Undecided, and it needs an owner.** As things stand the honest instruction to a
-provider is "do not change this machine after approval", which is a poor thing to
-require of a host that must stay patched — Ubuntu enables unattended-upgrades by
-default. The alternatives are to document image-freeze plus re-submission as the
-expected workflow, or to build a re-approval flow. Tracked in
+**The mechanics already exist; the policy does not.**
+
+`scripts/cathedral_measurement_approval.py approve` is a working re-approval
+path: it captures the candidate measurement live from the named worker through
+the pinned production verifier, records provenance to an append-only approval
+log, and emits the next monotonic signed registry release. It is operator-gated
+— it needs the registry signing key, an `--operator` and a `--reason`, and it
+does not deploy — so a provider can never re-approve itself.
+
+What is undecided is whether routine patching SHOULD be an approvable event, and
+at what cadence. Every patched machine currently requires an operator to run an
+approval and ship a signed registry release, which is an operational load
+question at fleet scale rather than a security one. Tracked in
 cathedral-compute#88. Until it is settled, do not assume an approval outlives an
 `apt upgrade`.
 
