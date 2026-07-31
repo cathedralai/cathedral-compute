@@ -44,6 +44,32 @@ across reboots. It is simply sensitive to far more than the boot image. `mr_td`
 and `rtmr0` never moved, which is what proves the change came from RTMR1 and not
 from the image or the GCP virtual firmware.
 
+### What moves it, and what does not
+
+Measured on the same real TDX CVM. The distinction matters more than the list,
+because the two triggers behave differently for an operator:
+
+| Event | Measurement | Controllable by the provider? |
+|---|---|---|
+| `apt full-upgrade` + install Docker (initramfs regenerated) | **changes** | yes — freeze the image |
+| reboot, no changes | unchanged (byte-identical) | — |
+| **full stop + cold start** of the GCP instance | **unchanged** (`mr_td`, `rtmr0`, `rtmr1`, `rtmr2` and TCB SVN all constant) | — |
+| landing on a host with *different* guest firmware (TDVF) | changes | **no** |
+
+The stop/start result is worth stating explicitly because it is easy to assume
+otherwise: on GCP, cycling an instance does **not** by itself move the
+measurement. It lands on the same TDVF and everything holds.
+
+That leaves exactly one uncontrollable trigger — a TDVF rollout underneath you —
+and it is occasional rather than routine. One observed stop/start holding does
+not prove TDVF never differs; it proves the common case is benign. So a frozen
+image plus re-approval on the rare firmware change is a workable posture, and
+the operational load is far lower than "any restart might de-approve you" would
+suggest. That bears directly on the open question below.
+
+Freezing is the provider's half of it: mask `unattended-upgrades` and hold the
+boot-critical packages, so nothing regenerates initramfs without a decision.
+
 `runtime_measurements` is a separate registry field, and its existence does NOT
 mean the runtime-varying part is held separately: the runtime registers are
 already folded into the value above.
