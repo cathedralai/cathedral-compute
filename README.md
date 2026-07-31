@@ -146,6 +146,7 @@ eligible miner, or an on-chain write.
 - [Public and controlled provenance](docs/PROVENANCE.md)
 - [Policy registry](docs/POLICY_REGISTRY.md)
 - [Receipts](docs/RECEIPTS.md)
+- [Cathedral Computer customer receipts](docs/CUSTOMER_RECEIPTS.md)
 - [Worker lifecycle](docs/LIFECYCLE.md)
 - [Workload admission](docs/WORKLOAD_ADMISSION.md)
 
