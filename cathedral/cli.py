@@ -38,11 +38,18 @@ from cathedral import census as census_mod
 from cathedral.assurance import AssuranceDimension
 from cathedral.attest import collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
-from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
     load_allowlist_keys,
     verify_allowlist,
+)
+from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
+from cathedral.customer_receipt import (
+    MAX_CUSTOMER_RECEIPT_BYTES,
+    MAX_CUSTOMER_RECEIPT_TRUSTED_KEYS_BYTES,
+    CustomerReceiptError,
+    parse_customer_receipt_trusted_keys_json,
+    verify_customer_receipt,
 )
 from cathedral.enroll import JsonHotkeyRegistrationProvider, RegistryStore
 from cathedral.evidence import (
@@ -539,6 +546,23 @@ def _read_bounded_receipt_file(path: str, label: str) -> bytes:
     return data
 
 
+def _read_bounded_customer_receipt_file(
+    path: str,
+    label: str,
+    *,
+    maximum_bytes: int,
+    category: str,
+) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise CustomerReceiptError(category, f"unable to load {label}") from exc
+    if len(data) > maximum_bytes:
+        raise CustomerReceiptError(category, f"{label} exceeds the maximum encoded size")
+    return data
+
+
 def _load_private_seed(
     path: str,
     *,
@@ -694,6 +718,56 @@ def cmd_receipt_verify(args: argparse.Namespace) -> int:
                 "receipt_digest": verified.receipt_digest,
                 "policy_registry_release": policy_registry.release,
                 "key_registry_release": key_registry.release,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_customer_receipt_verify(args: argparse.Namespace) -> int:
+    try:
+        receipt_bytes = _read_bounded_customer_receipt_file(
+            args.receipt,
+            "customer receipt",
+            maximum_bytes=MAX_CUSTOMER_RECEIPT_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_customer_receipt_trusted_keys_json(
+            _read_bounded_customer_receipt_file(
+                args.trusted_keys,
+                "customer receipt trusted keys",
+                maximum_bytes=MAX_CUSTOMER_RECEIPT_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        verified = verify_customer_receipt(
+            receipt_bytes,
+            trusted_keys,
+            max_age_seconds=args.max_age_seconds,
+        )
+    except CustomerReceiptError as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "schema": verified.document["schema"],
+                "receipt_id": verified.receipt_id,
+                "receipt_digest": verified.receipt_digest,
+                "issued_at": verified.document["issued_at"],
+                "signing_key_id": verified.document["signing_key_id"],
+                "policy_digest": verified.document["policy_digest"],
+                "execution_class": verified.document["execution_class"],
+                "profile_id": verified.document["profile_id"],
+                "verification_scope": "cathedral_signed_assertions",
+                "evidence_independently_verified": False,
             },
             sort_keys=True,
         )
@@ -3374,6 +3448,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_receipt_verify.add_argument("--key-registry-trusted-keys")
     p_receipt_verify.add_argument("--key-registry-max-age-seconds", type=int, default=86400)
     p_receipt_verify.set_defaults(func=cmd_receipt_verify)
+
+    p_customer_receipt = sub.add_parser(
+        "customer-receipt",
+        help="verify signed Cathedral Computer customer receipts",
+    )
+    customer_receipt_sub = p_customer_receipt.add_subparsers(
+        dest="customer_receipt_command",
+        required=True,
+    )
+    p_customer_receipt_verify = customer_receipt_sub.add_parser(
+        "verify",
+        help="verify exact signed customer-receipt bytes",
+    )
+    p_customer_receipt_verify.add_argument("--receipt", required=True)
+    p_customer_receipt_verify.add_argument("--trusted-keys", required=True)
+    p_customer_receipt_verify.add_argument(
+        "--max-age-seconds",
+        type=int,
+        help="reject a valid signed receipt older than this many seconds",
+    )
+    p_customer_receipt_verify.set_defaults(func=cmd_customer_receipt_verify)
 
     p_lifecycle = sub.add_parser("lifecycle", help="inspect worker attestation lifecycle state")
     lifecycle_sub = p_lifecycle.add_subparsers(dest="lifecycle_command", required=True)
