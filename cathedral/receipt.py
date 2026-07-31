@@ -495,11 +495,25 @@ class ReceiptIssuer:
             raise ReceiptError("schema", "receipt epoch identifiers are invalid")
         if not _bounded_text(subject_hotkey, 512):
             raise ReceiptError("schema", "receipt subject hotkey is invalid")
-        if (
-            not _bounded_text(attested.measurement, 512)
-            or attested.measurement not in policy.allowed_measurements
-        ):
+        # Two different failures, deliberately not merged. A malformed value is a
+        # schema fault; a well-formed value that is simply not approved is a POLICY
+        # fault, and conflating them told a provider whose measurement had drifted
+        # that their receipt was malformed -- sending them to inspect the receipt
+        # instead of the policy registry. `category` is surfaced verbatim to
+        # operators by `cathedral verify` (cli.py), so it IS the signal they act on.
+        #
+        # Drift is not exotic: the launch measurement folds in all four RTMRs, so
+        # any initramfs regeneration -- installing a single package is enough --
+        # moves it while mr_td stays constant. See docs/MRTD.md.
+        if not _bounded_text(attested.measurement, 512):
             raise ReceiptError("schema", "receipt measurement is invalid")
+        if attested.measurement not in policy.allowed_measurements:
+            raise ReceiptError(
+                "policy",
+                "receipt measurement is well-formed but not approved by the current "
+                "policy; the machine's measurement has changed or its approval was "
+                "retired, and the receipt itself is not at fault",
+            )
         if not _bounded_text(attested.chip_id, 512):
             raise ReceiptError("schema", "receipt platform identity is invalid")
         if attested.assurance is None or any(

@@ -1629,3 +1629,71 @@ def test_score_class_export_retry_replays_the_originally_bound_snapshot(
     bound = json.loads(first)["candidate_snapshot"]
     assert "late-registration" not in bound["hotkeys"]
     ledger.close()
+
+
+def test_unapproved_measurement_is_a_policy_fault_not_a_schema_fault():
+    """A drifted measurement must not be reported as a malformed receipt.
+
+    The launch measurement folds in all four RTMRs, so any initramfs
+    regeneration moves it -- installing one package is enough, while `mr_td`
+    stays constant (docs/MRTD.md). That makes "approved yesterday, unapproved
+    today" an ordinary operational event, not an exotic one.
+
+    It used to raise category "schema" / "receipt measurement is invalid",
+    which reads as a malformed receipt and sends an operator to inspect the
+    receipt instead of the policy registry. `category` is what
+    `cathedral verify` prints, so it is the signal they actually act on.
+    """
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    claims = _claims(policy)
+    drifted = _attested(claims, measurement="tdx-measurement-sha256:drifted-v2")
+
+    with pytest.raises(ReceiptError) as raised:
+        ReceiptIssuer(snapshot, "receipt-test-1", RECEIPT_SEED_1).issue(
+            epoch_id=7,
+            source_epoch=11,
+            subject_hotkey="public-hotkey",
+            attested=drifted,
+            policy=policy,
+            assurance=claims,
+            worker_lifecycle=_worker_lifecycle(policy, claims, "public-hotkey"),
+            challenge_id=CHALLENGE_ID,
+            manifest_digest=MANIFEST_DIGEST,
+            work_units=3.5,
+            issued_at=ISSUED,
+        )
+
+    assert raised.value.category == "policy"
+    assert "not approved" in str(raised.value)
+    # The receipt is explicitly exonerated, so nobody goes looking at it.
+    assert "receipt itself is not at fault" in str(raised.value)
+
+
+def test_malformed_measurement_is_still_a_schema_fault():
+    """The split must not relabel the genuinely-malformed case.
+
+    Merging the two conditions is what caused the confusion; merging them the
+    other way would be the same bug with the categories swapped.
+    """
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    claims = _claims(policy)
+    malformed = _attested(claims, measurement="x" * 513)
+
+    with pytest.raises(ReceiptError) as raised:
+        ReceiptIssuer(snapshot, "receipt-test-1", RECEIPT_SEED_1).issue(
+            epoch_id=7,
+            source_epoch=11,
+            subject_hotkey="public-hotkey",
+            attested=malformed,
+            policy=policy,
+            assurance=claims,
+            worker_lifecycle=_worker_lifecycle(policy, claims, "public-hotkey"),
+            challenge_id=CHALLENGE_ID,
+            manifest_digest=MANIFEST_DIGEST,
+            work_units=3.5,
+            issued_at=ISSUED,
+        )
+
+    assert raised.value.category == "schema"
