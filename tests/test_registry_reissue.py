@@ -189,6 +189,10 @@ def test_empty_validity_window_is_rejected():
 def _write_inputs(tmp_path: Path, registry_bytes: bytes = REGISTRY_BYTES):
     registry_path = tmp_path / "registry.json"
     registry_path.write_bytes(registry_bytes)
+    # chmod, not the write mode: write_bytes/open honour the process umask, so
+    # under Ubuntu's default 002 this lands 0664 and the tool's
+    # "must not be group/world writable" guard fires before the assertion below.
+    registry_path.chmod(0o644)
     signing_key = tmp_path / "policy-signing.key"
     signing_key.write_text(base64.b64encode(REGISTRY_SEED).decode())
     signing_key.chmod(0o600)
