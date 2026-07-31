@@ -43,6 +43,10 @@ def _future_text(days: int = 30) -> str:
 def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     registry_path = tmp_path / "registry.json"
     registry_path.write_bytes(REGISTRY_BYTES)
+    # chmod, not the write mode: write_bytes/open honour the process umask, so
+    # under Ubuntu's default 002 this lands 0664 and the tool's
+    # "must not be group/world writable" guard fires before the assertion below.
+    registry_path.chmod(0o644)
     signing_key = tmp_path / "policy-signing.key"
     signing_key.write_text(base64.b64encode(REGISTRY_SEED).decode("ascii"))
     signing_key.chmod(0o600)

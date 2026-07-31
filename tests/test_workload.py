@@ -1100,7 +1100,12 @@ def test_external_execution_state_identity_fails_closed(
     if unsafe_kind == "parent_permissions":
         state_parent.chmod(0o777)
     elif unsafe_kind == "file_permissions":
-        state_path.touch(mode=0o644)
+        # chmod, not touch(mode=...): touch honours the process umask, so under a
+        # restrictive one (077) the file lands 0600, the guard correctly does not
+        # fire, and this negative test fails DID NOT RAISE without ever having
+        # built the unsafe condition it exists to check. chmod is not masked.
+        state_path.touch()
+        state_path.chmod(0o644)
     else:
         target = tmp_path / "target.sqlite"
         target.touch(mode=0o600)
