@@ -9,13 +9,70 @@ back for the claim **"SN39 mainnet: validated Intel TDX CPU compute."**
 > current signed registry, freshness, revocation state, and supported release;
 > otherwise report `NOT_PROVEN`.
 
+## The approved measurement is NOT an MRTD
+
+This document is named MRTD for historical reasons and the name is misleading.
+Read this before approving anything.
+
+`ParsedQuote.measurement` (`cathedral/verify/tdx_quote.py`) is a SHA-256 over
+**eight** fields, of which `mr_td` is one:
+
+    domain ‖ td_attributes ‖ xfam ‖ mr_td ‖ mr_config_id ‖ mr_owner
+          ‖ mr_owner_config ‖ rtmr0 ‖ rtmr1 ‖ rtmr2 ‖ rtmr3
+
+**All four RTMRs are inside it.** RTMR1 conventionally measures the kernel and
+initrd, so **anything that regenerates initramfs changes the approved
+measurement** — a kernel upgrade, yes, but also installing a single package that
+triggers an initramfs rebuild.
+
+A true MRTD would not behave this way: it is the static initial-TD measurement
+and does not move when you install software. That difference is exactly what
+makes the old name dangerous, because it invites the assumption that an approval
+survives routine patching. It does not.
+
+Measured on a real Intel TDX CVM (GCP `c3-standard-4`, stock Ubuntu 24.04),
+across three boots:
+
+| Boot | Measurement | `mr_td` / `rtmr0` |
+|---|---|---|
+| fresh image | `4574b60b…` | constant |
+| after `apt full-upgrade` + install Docker | **`f81c672a…`** | **constant** |
+| two further reboots, no changes | `f81c672a…` (byte-identical) | constant |
+
+So the value IS deterministic — same machine, same software, same measurement
+across reboots. It is simply sensitive to far more than the boot image. `mr_td`
+and `rtmr0` never moved, which is what proves the change came from RTMR1 and not
+from the image or the GCP virtual firmware.
+
+`runtime_measurements` is a separate registry field, and its existence does NOT
+mean the runtime-varying part is held separately: the runtime registers are
+already folded into the value above.
+
+### What a provider sees when it drifts
+
+`cathedral verify` reports `{"valid": false, "category": "policy", "error": …}`
+with a message saying the measurement is well-formed but not approved. It used
+to report `category: "schema"` / "receipt measurement is invalid", which read as
+a malformed receipt and sent operators to inspect the wrong artifact entirely.
+
+### Open: freeze, or re-approve?
+
+**Undecided, and it needs an owner.** As things stand the honest instruction to a
+provider is "do not change this machine after approval", which is a poor thing to
+require of a host that must stay patched — Ubuntu enables unattended-upgrades by
+default. The alternatives are to document image-freeze plus re-submission as the
+expected workflow, or to build a re-approval flow. Tracked in
+cathedral-compute#88. Until it is settled, do not assume an approval outlives an
+`apt upgrade`.
+
 ## Policy source of truth
 
 The signed policy registry (`cathedral_policy_registry_v1`, see
 `docs/POLICY_REGISTRY.md`) is the ONLY measurement authority:
 
-- Per-profile `measurements` (MRTD values) and `runtime_measurements`,
-  each with `status`, validity windows, and `retire_at`.
+- Per-profile `measurements` (launch measurement values — see above, these are
+  NOT bare MRTDs) and `runtime_measurements`, each with `status`, validity
+  windows, and `retire_at`.
 - TCB gates: `min_tcb`, `tdx_allowed_tcb_statuses` (production strict
   mode accepts `UpToDate`-class statuses only), `tdx_allowed_advisories`.
 - Ed25519-signed, monotonic `release`, `generated_at` monotonicity

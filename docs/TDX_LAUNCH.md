@@ -99,7 +99,7 @@ contract is:
 ```json
 {
   "report_data": "<hex or base64>",
-  "measurement": "<MRTD or policy measurement>",
+  "measurement": "<launch measurement: NOT a bare MRTD, see docs/MRTD.md>",
   "tcb_svn": "<32 lowercase hex characters>",
   "tcb_status": "UpToDate",
   "advisory_ids": [],
