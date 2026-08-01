@@ -3265,7 +3265,7 @@ def cmd_lifecycle_history(args: argparse.Namespace) -> int:
 def cmd_lifecycle_reenroll(args: argparse.Namespace) -> int:
     if not Path(args.registry_db).is_file():
         raise ValueError("registry database does not exist")
-    snapshot = RegistryStore(args.registry_db).reenroll_lifecycle(args.hotkey)
+    snapshot = RegistryStore(args.registry_db).reenroll_lifecycle(args.hotkey, operator=True)
     print(json.dumps({"hotkey": args.hotkey, **snapshot.public_dict()}, sort_keys=True))
     return 0
 

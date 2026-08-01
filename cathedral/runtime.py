@@ -796,7 +796,7 @@ class ConfidentialRuntime:
 
     def reenroll_worker(self, hotkey: str) -> LifecycleSnapshot:
         self.reattestor.cancel(hotkey)
-        return self.registry.reenroll_lifecycle(hotkey)
+        return self.registry.reenroll_lifecycle(hotkey, operator=True)
 
     def close(self) -> None:
         if self._owns_reattestor:

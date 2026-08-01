@@ -664,7 +664,7 @@ def test_expired_chip_binding_allows_rotation(tmp_path: Path) -> None:
 
     # Identity conflict is terminal until explicit reenrollment. Once the old
     # owner is stale, the claimant must start a new lifecycle generation.
-    store.reenroll_lifecycle(hotkey_b)
+    store.reenroll_lifecycle(hotkey_b, operator=True)
     store.record_verdict(hotkey_b, _attested(chip_id, "meas"))
     board = store.board()
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
