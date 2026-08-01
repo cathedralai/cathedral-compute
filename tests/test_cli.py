@@ -1096,3 +1096,99 @@ def test_miner_wrapper_help_uses_worker_parser(capsys):
     help_text = capsys.readouterr().out
     assert "usage: cathedral worker" in help_text
     assert "serve" in help_text
+
+
+def _tls_pair(tmp_path):
+    """A throwaway self-signed cert so tls_enabled is genuinely true."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.x509.oid import NameOID
+    from datetime import datetime, timedelta, UTC
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker-test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(UTC) - timedelta(days=1))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
+        .sign(key, None)
+    )
+    crt = tmp_path / "worker.crt"
+    pem = tmp_path / "worker.key"
+    crt.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    pem.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    pem.chmod(0o600)  # the loader requires an owner-only key file
+    return str(crt), str(pem)
+
+
+def test_tls_does_not_excuse_an_unauthenticated_non_loopback_bind(tmp_path):
+    """#87: supplying a certificate skipped the locality guard entirely.
+
+    TLS encrypts the channel; it does not authenticate the caller. Combined
+    with --development-no-auth this bound an unauthenticated worker to
+    0.0.0.0 and served /v1/sat-work to anyone who could reach the port, with
+    no warning. The plain-HTTP form of the same mistake was already refused,
+    so adding TLS -- what an operator does to make a service MORE secure --
+    silently removed a control.
+    """
+    crt, key = _tls_pair(tmp_path)
+    args = argparse.Namespace(
+        host="0.0.0.0",
+        port=18446,
+        hotkey="5DvjTESTHOTKEY",
+        bearer_token_env=None,
+        development_allow_non_loopback=False,
+        development_no_auth=True,
+        tls_certificate=crt,
+        tls_private_key=key,
+    )
+    with pytest.raises(ValueError, match="unauthenticated worker must bind loopback"):
+        cmd_worker_serve(args)
+
+
+def test_tls_with_authentication_may_still_bind_non_loopback(tmp_path, monkeypatch):
+    """The legitimate production shape must be untouched.
+
+    TLS + a bearer on a public bind is exactly how a real worker runs. The fix
+    must not regress that into the loopback refusal, so this asserts the guard
+    is CLEARED -- by stubbing the server so nothing actually listens.
+    """
+    crt, key = _tls_pair(tmp_path)
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "x" * 43)
+
+    class _Reached(Exception):
+        pass
+
+    def _stub(*a, **kw):
+        raise _Reached
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", _stub)
+
+    args = argparse.Namespace(
+        host="0.0.0.0",
+        port=18447,
+        hotkey="5DvjTESTHOTKEY",
+        bearer_token_env=DEFAULT_WORKER_BEARER_ENV,
+        development_allow_non_loopback=False,
+        development_no_auth=False,
+        tls_certificate=crt,
+        tls_private_key=key,
+        channel_binding_type="application_key_sha256",
+        channel_binding_digest="a" * 64,
+    )
+    # It must clear the LOCALITY guard. It may still fail on a later, unrelated
+    # control (the channel binding must match the certificate), which is fine and
+    # is not what this test is about -- asserting "not the loopback error" keeps
+    # the test pinned to the property under test instead of to every downstream gate.
+    with pytest.raises((ValueError, _Reached)) as raised:
+        cmd_worker_serve(args)
+    assert "loopback" not in str(raised.value), (
+        "TLS + bearer on a public bind must not be refused by the locality guard")

@@ -1075,9 +1075,37 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         is_loopback = ipaddress.ip_address(args.host).is_loopback
     except ValueError:
         is_loopback = args.host == "localhost"
-    if not is_loopback and not tls_enabled and not args.development_allow_non_loopback:
-        raise ValueError("plain worker HTTP must bind loopback unless development mode is explicit")
-    if getattr(args, "development_no_auth", False):
+    development_no_auth = bool(getattr(args, "development_no_auth", False))
+    # The locality guard keys off AUTHENTICATION, not TLS.
+    #
+    # It used to be `not tls_enabled`, so supplying a certificate satisfied it and
+    # the check was skipped. But TLS encrypts the channel; it does not authenticate
+    # the caller. Combined with --development-no-auth (which separately drops the
+    # bearer and the channel-binding requirement) that bound an unauthenticated
+    # worker to 0.0.0.0 and served /v1/sat-work to anyone who could reach the port,
+    # with no warning on stdout or stderr (#87).
+    #
+    # The plain-HTTP form of exactly the same mistake was already refused, which is
+    # what made this asymmetry a trap rather than a policy: adding TLS -- the thing
+    # an operator does to make a service MORE secure -- silently removed a control.
+    if not is_loopback and not args.development_allow_non_loopback:
+        if not tls_enabled:
+            raise ValueError(
+                "plain worker HTTP must bind loopback unless development mode is explicit")
+        if development_no_auth:
+            raise ValueError(
+                "an unauthenticated worker must bind loopback: TLS encrypts the "
+                "channel but does not authenticate the caller, so "
+                "--development-no-auth on a non-loopback bind serves work to anyone "
+                "who can reach the port")
+    if development_no_auth:
+        if not is_loopback:
+            # Reachable only via the explicit development escape hatch above.
+            print(
+                "WARNING: serving UNAUTHENTICATED on a non-loopback address "
+                f"({args.host}); every work endpoint is open to anyone who can "
+                "reach this port. Development only.",
+                file=sys.stderr, flush=True)
         token = None
     else:
         bearer_env = getattr(args, "bearer_token_env", DEFAULT_WORKER_BEARER_ENV)
