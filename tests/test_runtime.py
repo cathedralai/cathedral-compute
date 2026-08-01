@@ -28,6 +28,7 @@ from cathedral.common import (
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
+from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.remote import RemoteError
@@ -1329,3 +1330,69 @@ def test_production_cpu_preflight_requires_safe_retention_dir(tmp_path: Path) ->
     not_dir.chmod(0o700)
     with pytest.raises(ValueError, match="non-symlink directory|not a directory"):
         _preflight_evidence_retention(str(not_dir))
+
+
+def _fleet(tmp_path: Path, size: int):
+    """A fleet of `size` healthy, distinct-chip miners plus the canary."""
+    ports = [str(9100 + i) for i in range(size)]
+    specs = default_specs(**{p: MinerSpec(f"chip-{p}") for p in ports})
+    enrollments = [(f"miner-{p}", f"http://127.0.0.1:{p}") for p in ports]
+    return make_runtime(tmp_path, enrollments, specs)
+
+
+def test_epoch_completes_at_the_verified_candidate_limit(tmp_path: Path) -> None:
+    """The limit itself was never the problem; this is the control."""
+    runtime, ledger, _ = _fleet(tmp_path, MAX_LAUNCH_VERIFIED_CANDIDATES)
+    run = runtime.run_epoch(1, CANARY)
+    assert run.status == "complete"
+    assert ledger.get_epoch(1)["report_digest"]
+
+
+def test_one_over_the_limit_still_publishes_an_epoch(tmp_path: Path) -> None:
+    """#84: the 29th positively-scoring miner froze epoch production forever.
+
+    `complete_epoch` refused the over-cap report and rolled back, so NOTHING was
+    frozen -- not a partial report, not an all-zero one, not a burn vector -- and
+    the next epoch rebuilt the same over-cap report and failed identically. Only
+    the ledger-level refusal was pinned; nothing checked the runtime consequence.
+    """
+    runtime, ledger, _ = _fleet(tmp_path, MAX_LAUNCH_VERIFIED_CANDIDATES + 1)
+    run = runtime.run_epoch(1, CANARY)
+
+    assert run.status == "complete", "an over-cap fleet must still publish"
+    epoch = ledger.get_epoch(1)
+    assert epoch["status"] == "complete"
+    # The whole point: a report is actually FROZEN. Before the fix
+    # complete_epoch rolled back and left no report_digest at all.
+    assert epoch["report_digest"]
+
+    # The surplus is recorded, not silently dropped.
+    skipped = [o for o in run.outcomes if o.status == "not_selected_for_scored_work"]
+    assert len(skipped) == 1
+    assert "verified-candidate limit" in (skipped[0].error or "")
+    assert skipped[0].admitted is True
+
+    verified = [o for o in run.outcomes if o.status == "verified"]
+    assert len(verified) <= MAX_LAUNCH_VERIFIED_CANDIDATES
+
+
+def test_selection_rotates_so_the_surplus_is_not_starved(tmp_path: Path) -> None:
+    """Deterministic is not enough: a stable sort freezes the same tail out
+    forever. Selection rotates with source_epoch, so a miner skipped in one
+    epoch is scored in another."""
+    size = MAX_LAUNCH_VERIFIED_CANDIDATES + 1
+    skipped_per_epoch = []
+    for source_epoch in (1, 2):
+        sub = tmp_path / f"e{source_epoch}"
+        sub.mkdir()
+        runtime, _ledger, _ = _fleet(sub, size)
+        run = runtime.run_epoch(source_epoch, CANARY)
+        assert run.status == "complete"
+        skipped_per_epoch.append(
+            {o.hotkey for o in run.outcomes
+             if o.status == "not_selected_for_scored_work"}
+        )
+    assert skipped_per_epoch[0] and skipped_per_epoch[1]
+    assert skipped_per_epoch[0] != skipped_per_epoch[1], (
+        "the same miner was skipped in consecutive epochs; selection is not rotating"
+    )
