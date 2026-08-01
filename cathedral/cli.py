@@ -36,7 +36,7 @@ from pathlib import Path
 
 from cathedral import census as census_mod
 from cathedral.assurance import AssuranceDimension
-from cathedral.attest import collect_tdx_gpu
+from cathedral.attest import collect_snp, collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
@@ -1172,6 +1172,18 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
     if allow_customer_sat and getattr(args, "gpu_composite", False):
         raise ValueError("customer SAT is available only on the CPU worker path")
+    # Select the CPU TEE evidence collector. Default stays TDX so existing
+    # deployments are unchanged; --tee snp serves AMD SEV-SNP evidence, and
+    # --gpu-composite (TDX+GPU) is TDX-only by construction.
+    tee = getattr(args, "tee", "tdx")
+    if getattr(args, "gpu_composite", False) and tee != "tdx":
+        raise ValueError("--gpu-composite collects TDX+GPU and cannot combine with --tee snp")
+    if tee == "snp":
+        evidence_collector = collect_snp
+    elif getattr(args, "gpu_composite", False):
+        evidence_collector = collect_tdx_gpu
+    else:
+        evidence_collector = None
     with WorkerServer(
         args.host,
         args.port,
@@ -1179,7 +1191,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         bearer_token=token,
         channel_binding=channel_binding,
         tls_context=tls_context,
-        evidence_collector=(collect_tdx_gpu if getattr(args, "gpu_composite", False) else None),
+        evidence_collector=evidence_collector,
         allow_noncanonical_sat=allow_customer_sat,
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
@@ -3438,6 +3450,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "collect bound TDX plus confidential-GPU evidence; requires CATHEDRAL_GPU_COLLECT_CMD"
         ),
+    )
+    p_serve.add_argument(
+        "--tee",
+        choices=["tdx", "snp"],
+        default="tdx",
+        help="CPU TEE evidence class the worker collects (default: tdx)",
     )
     p_serve.add_argument(
         "--channel-binding-type",

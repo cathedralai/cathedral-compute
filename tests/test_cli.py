@@ -39,6 +39,7 @@ from cathedral.gpu import (
     GpuDeviceClaim,
     GpuIdentityRegistry,
 )
+from cathedral.attest import collect_snp
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
@@ -849,6 +850,86 @@ def test_worker_development_no_auth_is_explicit(monkeypatch):
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["bearer_token"] is None
+
+
+def test_worker_tee_defaults_to_tdx_and_accepts_snp():
+    parser = build_parser()
+    assert parser.parse_args(["worker", "serve", "--hotkey", "w"]).tee == "tdx"
+    assert (
+        parser.parse_args(["worker", "serve", "--hotkey", "w", "--tee", "snp"]).tee
+        == "snp"
+    )
+
+
+def test_worker_tee_snp_selects_snp_collector(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        ["worker", "serve", "--hotkey", "miner", "--development-no-auth", "--tee", "snp"]
+    )
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["evidence_collector"] is collect_snp
+
+
+def test_worker_default_tee_leaves_collector_unset(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        ["worker", "serve", "--hotkey", "miner", "--development-no-auth"]
+    )
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["evidence_collector"] is None
+
+
+def test_worker_tee_snp_conflicts_with_gpu_composite():
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--development-no-auth",
+            "--tee",
+            "snp",
+            "--gpu-composite",
+        ]
+    )
+    with pytest.raises(ValueError, match="gpu-composite"):
+        cmd_worker_serve(args)
 
 
 def test_worker_cli_builds_typed_channel_binding(monkeypatch):
