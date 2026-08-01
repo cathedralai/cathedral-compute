@@ -584,6 +584,52 @@ def _parse_instance(raw: object) -> SatInstance | None:
     return instance
 
 
+def _install_tls_accept(server: ThreadingHTTPServer, tls_context: "ssl.SSLContext",
+                        handshake_timeout: float) -> None:
+    """Do the TLS handshake in the WORKER thread, never in the accept loop.
+
+    Wrapping the LISTENING socket (`server.socket = ctx.wrap_socket(...)`) makes
+    `socket.accept()` perform the handshake, because `do_handshake_on_connect`
+    defaults to True. `serve_forever` is single-threaded up to that point, and the
+    listening socket has no timeout, so the accepted socket inherits None: one peer
+    that completes the TCP handshake and then sends nothing blocks every subsequent
+    request indefinitely, and ThreadingHTTPServer never gets to spawn a thread.
+
+    Measured trigger (#86): zero bytes, or a truncated ClientHello followed by
+    silence. A connect-then-close scan and a plaintext GET to the TLS port do NOT
+    wedge it -- the peer has to hold the connection open. So a network partition or
+    a client killed between connect() and ClientHello does it, no attacker needed.
+
+    Every bound the worker advertises -- MAX_CONCURRENT, the body cap, the deadline
+    reader/writer, connection.settimeout -- lives in the handler and was never
+    reached. This is the accept-path twin of #65, whose fix hardened the handler
+    path only.
+
+    So: accept plain, set a deadline on the accepted socket, and wrap with
+    do_handshake_on_connect=False. The handshake then happens on the first read,
+    which is inside the per-connection worker thread and under that deadline.
+    """
+    plain_accept = server.get_request
+
+    def get_request():  # type: ignore[no-untyped-def]
+        conn, addr = plain_accept()
+        try:
+            # Bounds the handshake itself. Without this the wrapped socket
+            # inherits the listener's None timeout and can block forever.
+            conn.settimeout(handshake_timeout)
+            tls_conn = tls_context.wrap_socket(
+                conn, server_side=True, do_handshake_on_connect=False
+            )
+        except OSError:
+            try:
+                conn.close()
+            finally:
+                raise
+        return tls_conn, addr
+
+    server.get_request = get_request  # type: ignore[method-assign]
+
+
 class WorkerServer:
     """Expose one miner identity over bounded HTTP or native TLS.
 
@@ -692,9 +738,7 @@ class WorkerServer:
         self._server = ThreadingHTTPServer((host, port), handler)
         self._tls_enabled = tls_context is not None
         if tls_context is not None:
-            self._server.socket = tls_context.wrap_socket(
-                self._server.socket, server_side=True
-            )
+            _install_tls_accept(self._server, tls_context, float(timeout))
 
     @property
     def port(self) -> int:
