@@ -272,8 +272,20 @@ def test_policy_revocation_is_offline_terminal_until_explicit_reenrollment(tmp_p
             LifecycleReason.ATTESTATION_VERIFIED,
         )
 
+    # #85: the miner must not be able to undo this ITSELF. `RegistryStore.enroll`
+    # calls reenroll_lifecycle whenever the endpoint URL changes, and the endpoint
+    # is entirely miner-supplied -- so re-enrolling on a different PORT returned a
+    # revoked worker to PENDING and to the refresh set, with no operator action.
+    # This test previously exercised only the direct reenroll_lifecycle call, not
+    # the enroll path that reaches it, which is why it passed throughout.
+    with pytest.raises(LifecycleError, match="cannot re-enroll itself"):
+        store.enroll("worker", "https://8.8.8.8:8444")
+    assert store.lifecycle_snapshot("worker").state is WorkerLifecycleState.REVOKED
+    assert store.due_refreshes(refresh_ahead_seconds=60) == ()
+
     clock.advance(1)
-    pending = store.reenroll_lifecycle("worker")
+    # the operator recovery -- a terminal worker cannot do this itself (#85)
+    pending = store.reenroll_lifecycle("worker", operator=True)
     assert pending.state is WorkerLifecycleState.PENDING
     assert pending.generation == revoked[0].generation + 1
 

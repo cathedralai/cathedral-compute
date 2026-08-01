@@ -1223,7 +1223,28 @@ class RegistryStore:
         reason: LifecycleReason = LifecycleReason.REENROLLED,
         at: datetime | None = None,
         connection: sqlite3.Connection | None = None,
+        operator: bool = False,
     ) -> LifecycleSnapshot:
+        """Return a worker to PENDING.
+
+        `operator=True` is required to bring a TERMINAL worker back, and defaults
+        to False so any caller that has not thought about it fails closed.
+
+        docs/LIFECYCLE.md: "failed, retired, and revoked do not resume
+        automatically. Recovery requires explicit reenrollment." This did an
+        unguarded UPDATE ... SET state='pending', unlike record_verdict and
+        retire_lifecycle which both check TERMINAL_STATES. `RegistryStore.enroll`
+        calls it whenever the endpoint URL changes, and the endpoint is entirely
+        miner-supplied -- so a revoked or retired miner could return itself to
+        PENDING and to the refresh set by re-enrolling on a different PORT, with
+        no operator action (#85).
+
+        That matters most for an operator-retired worker that is still
+        hardware-valid (it re-attests and is fully back, defeating
+        retire-without-firewall) and for an identity-conflict revoked claimant,
+        which can re-queue itself and take a chip once the honest binding lapses
+        -- the one-machine-one-UID sybil defence.
+        """
         if reason not in {LifecycleReason.REENROLLED, LifecycleReason.ENDPOINT_CHANGED}:
             raise LifecycleError("reenrollment lifecycle reason is invalid")
         def apply(conn: sqlite3.Connection, when: datetime) -> LifecycleSnapshot:
@@ -1231,6 +1252,11 @@ class RegistryStore:
             current = self._lifecycle_snapshot_from_row(
                 self._lifecycle_row(conn, hotkey)
             )
+            if current.state in TERMINAL_STATES and not operator:
+                raise LifecycleError(
+                    f"worker {hotkey!r} is {current.state.value}; a terminal worker "
+                    "cannot re-enroll itself. Recovery is an operator action: "
+                    "`cathedral lifecycle reenroll --hotkey <hotkey>`")
             generation = current.generation + 1
             occurred = canonical_utc(when)
             cursor = conn.execute(
@@ -2005,7 +2031,18 @@ class RegistryApp:
                     ),
                 )
 
-        self.store.enroll(hotkey, endpoint_url, nonce=nonce)
+        try:
+            self.store.enroll(hotkey, endpoint_url, nonce=nonce)
+        except LifecycleError as exc:
+            # A terminal worker (revoked / retired) may not re-enroll itself by
+            # changing its endpoint; recovery is an operator action (#85). 409:
+            # the request is well-formed and authenticated, it conflicts with
+            # durable state.
+            logger.info("enroll refused hotkey=%s reason=terminal_state", hotkey)
+            return self._reject(
+                start_response, 409, "terminal_state",
+                hotkey=hotkey, reason="terminal_state",
+            )
         logger.info("enroll accepted hotkey=%s", hotkey)
         return self._json(start_response, 200, {"status": "enrolled"})
 
