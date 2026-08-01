@@ -6,9 +6,11 @@ import os
 import hashlib
 import shutil
 import sqlite3
+import socket
 import ssl
 import subprocess
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 from pathlib import Path
@@ -281,10 +283,21 @@ def test_tls_spki_binding_round_trip_before_protected_work(tmp_path: Path):
 
 
 def test_native_tls_server_permits_non_loopback_bind(monkeypatch):
+    """Also pins the #86 invariant: the LISTENING socket is never wrapped.
+
+    Wrapping it puts the TLS handshake inside `accept()`, in the single-threaded
+    serve_forever loop, where one silent peer blocks every later request. The
+    handshake belongs in the per-connection worker thread.
+    """
     class FakeHttpServer:
         def __init__(self, address, _handler):
             self.server_address = address
             self.socket = object()
+            self.get_request_calls = 0
+
+        def get_request(self):
+            self.get_request_calls += 1
+            return ("plain-conn", ("1.2.3.4", 5))
 
         def shutdown(self):
             return None
@@ -292,15 +305,25 @@ def test_native_tls_server_permits_non_loopback_bind(monkeypatch):
         def server_close(self):
             return None
 
+    wrapped: list[dict] = []
+
     class FakeTlsContext(ssl.SSLContext):
         def __new__(cls):
             return super().__new__(cls, ssl.PROTOCOL_TLS_SERVER)
 
-        def wrap_socket(self, socket, *, server_side):
-            assert server_side is True
+        def wrap_socket(self, socket, **kwargs):
+            wrapped.append({"socket": socket, **kwargs})
             return ("tls", socket)
 
-    monkeypatch.setattr("cathedral.worker.ThreadingHTTPServer", FakeHttpServer)
+    made: list = []
+    original = FakeHttpServer
+
+    def _capture(address, handler):
+        server = original(address, handler)
+        made.append(server)
+        return server
+
+    monkeypatch.setattr("cathedral.worker.ThreadingHTTPServer", _capture)
 
     with WorkerServer(
         "0.0.0.0",
@@ -310,6 +333,71 @@ def test_native_tls_server_permits_non_loopback_bind(monkeypatch):
     ) as server:
         assert server.host == "0.0.0.0"
         assert server.base_url.startswith("https://")
+
+    fake = made[0]
+    # THE INVARIANT: constructing the server must not wrap the listener.
+    assert fake.socket is not None
+    assert not isinstance(fake.socket, tuple), "the listening socket was wrapped"
+    assert wrapped == [], "no handshake may happen at construction time"
+
+
+class _SilentPeer:
+    """Completes TCP, then holds the connection open sending nothing."""
+
+    def __init__(self, host, port):
+        self.sock = socket.create_connection((host, port), timeout=10)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def test_a_silent_tls_peer_does_not_wedge_the_worker(tmp_path: Path):
+    """#86: one peer that completes TCP and then sends nothing blocked every
+    subsequent request indefinitely, because the handshake ran inside accept().
+
+    Measured trigger, per the report: zero bytes held open. A connect-then-close
+    scan does NOT reproduce it, so this test holds the socket for its duration.
+    """
+    cert, key, certificate_der = _certificate_pair(tmp_path, "wedge-worker")
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    client_context = ssl.create_default_context(cafile=str(cert))
+
+    with WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_bound_evidence,
+        channel_binding=tls_spki_binding(certificate_der),
+        tls_context=server_context,
+        allow_noncanonical_sat=True,
+        bearer_token="protected-token",
+        timeout=5.0,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        remote = RemoteMiner(
+            server.base_url, HOTKEY,
+            bearer_token="protected-token", ssl_context=client_context,
+        )
+        # Establish the attested channel binding, then confirm healthy before.
+        evidence = remote.fetch_evidence(os.urandom(32))
+        remote.confirm_channel_binding(evidence)
+        assert remote.do_sat_work(_sat_item()).assigned_hotkey == HOTKEY
+
+        peer = _SilentPeer(server.host, server.port)
+        try:
+            # The wedge, if present, is unbounded; 20s is far beyond the ~0.0s a
+            # healthy round trip takes and well inside the old report's 45s.
+            started = time.monotonic()
+            certificate = remote.do_sat_work(_sat_item())
+            elapsed = time.monotonic() - started
+            assert certificate.assigned_hotkey == HOTKEY
+            assert elapsed < 20.0, (
+                f"a silent peer blocked a healthy request for {elapsed:.1f}s; "
+                "the handshake is back in the accept loop")
+        finally:
+            peer.close()
 
 
 def test_tls_worker_remote_round_trip_carries_exact_composite_bundle(tmp_path: Path):
