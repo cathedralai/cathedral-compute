@@ -47,6 +47,7 @@ from cathedral.common import (
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
+from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import CustomerJobLease, Ledger
 from cathedral.lifecycle import (
@@ -1229,6 +1230,53 @@ class ConfidentialRuntime:
                 )
                 continue
             eligible.append(result)
+
+        # Cap scored dispatch at the launch verified-candidate limit.
+        #
+        # `Ledger.complete_epoch` refuses to publish a report carrying more than
+        # MAX_LAUNCH_VERIFIED_CANDIDATES verified candidates. That refusal is
+        # deliberate, but nothing upstream bounded how many miners were given
+        # scored work -- so once that many succeeded, every epoch built the same
+        # over-cap report, raised, and rolled back. No report was frozen at all:
+        # not a partial one, not an all-zero one, not a burn vector. The next
+        # epoch reproduced it exactly, so it never self-cleared (#84).
+        #
+        # Capping here instead means the epoch always publishes. The surplus is
+        # recorded explicitly rather than dropped, so "why did I earn nothing"
+        # has a greppable answer.
+        #
+        # Selection is deterministic in (hotkey set, source_epoch) so two
+        # validators replaying the same epoch choose the same miners, and it
+        # ROTATES with source_epoch so the surplus is not permanently starved --
+        # a stable sort alone would freeze the same tail out forever.
+        if len(eligible) > MAX_LAUNCH_VERIFIED_CANDIDATES:
+            ordered = sorted(eligible, key=lambda r: r.target.hotkey)
+            start = source_epoch % len(ordered)
+            rotated = ordered[start:] + ordered[:start]
+            selected = rotated[:MAX_LAUNCH_VERIFIED_CANDIDATES]
+            chosen = {r.target.hotkey for r in selected}
+            for result in ordered:
+                if result.target.hotkey in chosen:
+                    continue
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "not_selected_for_scored_work",
+                    admitted=True,
+                    error=(
+                        "eligible but not selected this epoch: the fleet exceeds the "
+                        f"launch verified-candidate limit ({len(ordered)} eligible > "
+                        f"{MAX_LAUNCH_VERIFIED_CANDIDATES}); selection rotates by "
+                        "source_epoch, so this miner is scored in a later epoch"
+                    ),
+                    assurance=result.attested.assurance
+                    if result.attested is not None
+                    else None,
+                )
+            # Preserve the caller's original ordering among the selected, so the
+            # batching below behaves exactly as it did under the cap.
+            selected_set = chosen
+            eligible = [r for r in eligible if r.target.hotkey in selected_set]
 
         # Negotiate the deployment capability before touching the durable
         # queue. Customer SAT is intentionally worker-default-off; an honest
