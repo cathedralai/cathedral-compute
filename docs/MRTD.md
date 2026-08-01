@@ -58,14 +58,37 @@ because the two triggers behave differently for an operator:
 
 The stop/start result is worth stating explicitly because it is easy to assume
 otherwise: on GCP, cycling an instance does **not** by itself move the
-measurement. It lands on the same TDVF and everything holds.
+measurement.
+
+**Two independent stop/starts now**, both byte-identical, with `mr_td`, `rtmr0`
+and the TCB SVN constant across all three boots.
+
+A caution on how much that proves, because the obvious reading is wrong. Each
+boot came up with a **different external IP**, which looks like evidence of
+landing on different hosts — it is not. A GCP *ephemeral* external IP is
+released and reallocated on every full stop/start regardless of placement (this
+is the same mechanism as cathedral-compute#61, where it invalidated a worker's
+single-SAN certificate on every restart). So the IP changing is guaranteed by
+the stop/start itself and carries no information about the host or its firmware.
+
+What the two samples establish is narrower and still useful: **a stop/start does
+not itself move the measurement.** Neither sample demonstrates surviving an
+actual TDVF change, because none was observed — and a TDVF roll cannot be
+triggered on demand, so that case stays unexercised.
 
 That leaves exactly one uncontrollable trigger — a TDVF rollout underneath you —
-and it is occasional rather than routine. One observed stop/start holding does
-not prove TDVF never differs; it proves the common case is benign. So a frozen
-image plus re-approval on the rare firmware change is a workable posture, and
-the operational load is far lower than "any restart might de-approve you" would
-suggest. That bears directly on the open question below.
+and it is occasional rather than routine. So a frozen image plus re-approval on
+the rare firmware change is a workable posture, and the operational load is far
+lower than "any restart might de-approve you" would suggest.
+
+**The gap that follows from this, and it is not more sampling.** Because no TDVF
+roll has been observed, the re-approval path has never actually been run against
+a genuinely changed measurement — only reasoned about. The useful next step is to
+exercise `scripts/cathedral_measurement_approval.py approve` deliberately, before
+an incident needs it, rather than accumulating more stop/start samples that all
+test the same benign case. A second thing worth doing is recording the
+measurement plus `mr_td` and `rtmr0` on each boot, so that when a roll does
+happen it is *detected* rather than inferred from a provider dropping out.
 
 Freezing is the provider's half of it: mask `unattended-upgrades` and hold the
 boot-critical packages, so nothing regenerates initramfs without a decision.
