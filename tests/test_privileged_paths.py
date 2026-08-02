@@ -75,7 +75,9 @@ def tmp_path(tmp_path_factory):
     fallback: Path | None = None
     seen: set[Path] = set()
     fallback_bases = [
-        Path(os.environ[name]) for name in ("TMPDIR", "TEMP", "TMP") if os.environ.get(name)
+        Path(os.environ[name])
+        for name in ("CATHEDRAL_TEST_TMPDIR", "TMPDIR", "TEMP", "TMP")
+        if os.environ.get(name)
     ]
     fallback_bases.extend(
         [
