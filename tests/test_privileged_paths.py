@@ -246,18 +246,18 @@ def test_a_standard_venv_interpreter_symlink_chain_is_verified(tmp_path: Path, c
     if not interpreter.is_symlink():
         pytest.skip("this platform's standard venv copies the interpreter")
 
-    # Development and hosted-CI interpreters can live below platform-managed
-    # writable modes or ACLs. The production systemd example resolves into the
-    # OS-owned /usr tree. Keep the standard venv's bin/python link while putting
-    # the final test executable under tmp_path so this test exercises link
-    # resolution rather than policy for the host's interpreter installation.
-    versioned = environment / "bin" / f"python{sys.version_info.major}.{sys.version_info.minor}"
-    if versioned.is_symlink():
-        base = versioned.resolve(strict=True)
-        versioned.unlink()
-        shutil.copyfile(base, versioned)
-        versioned.chmod(0o755)
+    # Venv link layouts vary: hosted Linux points bin/python directly into a
+    # platform-managed writable tool cache, while local installs often use a
+    # versioned sibling link. Preserve bin/python as the symlink under test but
+    # give it a trusted local target so host-installation policy is out of scope.
+    base = interpreter.resolve(strict=True)
+    local_target = interpreter.with_name("python-local-target")
+    shutil.copyfile(base, local_target)
+    local_target.chmod(0o755)
+    interpreter.unlink()
+    interpreter.symlink_to(local_target.name)
     assert interpreter.is_symlink()
+    assert interpreter.resolve(strict=True) == local_target
 
     verdict = inspect_resolved_path(interpreter, trusted_uids=ACCEPT)
     assert verdict.trusted, verdict.violations
