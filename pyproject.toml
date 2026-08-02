@@ -19,8 +19,9 @@ dev = ["pytest>=8.0", "substrate-interface>=1.7.0"]
 cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
 cathedral-prober = "cathedral.prober:main"
-# Operator aliases for the worker and score-publication runtime.
-cathedral-validator = "cathedral.neuron.validator:main"
+# Operator aliases for the worker and score-publication runtime. Keep the
+# subnet validator's public command name reserved for cathedral-scaffold.
+cathedral-compute-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"
 
 [build-system]
