@@ -28,9 +28,12 @@ a measurement blindly. It
   2. records full provenance (endpoint, chip/platform id, TCB status, verifier,
      operator, UTC time, justification) into an append-only approval log;
   3. emits the next monotonic signed registry release adding exactly that one
-     measurement, preserving every prior profile/key transition time so the
-     registry's own anti-equivocation and unchanged-transition guards accept
-     it.
+     measurement to exactly the one profile the operator named, preserving
+     every prior profile/key transition time so the registry's own
+     anti-equivocation and unchanged-transition guards accept it.
+
+Profile selection is always explicit. A registry retains every prior profile
+after a rollover, so no command may infer its target from list position.
 
 It does not deploy. The operator reviews the emitted registry and approval
 record and installs it deliberately. Unknown measurements continue to fail
@@ -160,12 +163,87 @@ def _capture(endpoint: str, cacert: str, hotkey: str, verifier: str) -> dict:
     return {"measurement": measurement, "tcb_status": tcb, "chip_id": chip}
 
 
-def _bump_release(registry: dict, measurement: str, operator: str, reason: str) -> dict:
+def _select_active_profile(document: dict, profile_id: str) -> dict:
+    """Return the one profile *profile_id* names, verified active CPU-TDX.
+
+    A registry may legitimately carry several profiles at once (a rollover
+    appends the successor while retaining every prior profile for historical
+    verification), so positional selection is never safe: after a rollover,
+    ``profiles[0]`` is the legacy profile. Every mutation must name its
+    target explicitly and prove the target is a currently active CPU-TDX
+    profile before touching anything.
+    """
+    profiles = document.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        raise SystemExit("registry profiles are malformed")
+    matches = [
+        row for row in profiles if isinstance(row, dict) and row.get("id") == profile_id
+    ]
+    if not matches:
+        known = ", ".join(
+            sorted(str(row.get("id")) for row in profiles if isinstance(row, dict))
+        )
+        raise SystemExit(
+            f"profile {profile_id!r} is not in the registry (profiles: {known})"
+        )
+    if len(matches) > 1:
+        raise SystemExit(f"profile {profile_id!r} appears more than once in the registry")
+    profile = matches[0]
+    if profile.get("kind") != "cpu_tdx":
+        raise SystemExit(f"profile {profile_id!r} is not a CPU-TDX profile")
+    if profile.get("status") != "active":
+        raise SystemExit(f"profile {profile_id!r} is not active")
+    return profile
+
+
+def _assert_only_profile_changed(before: dict, after: dict, profile_id: str) -> None:
+    """Refuse to emit a release that touched any profile but *profile_id*.
+
+    The mutation itself already targets one named profile; this is the
+    independent check that the emitted document agrees, so a future edit to
+    the mutation path cannot silently widen its blast radius.
+    """
+
+    def by_id(document: dict) -> dict[str, str]:
+        rows = document.get("profiles")
+        if not isinstance(rows, list):
+            raise SystemExit("registry profiles are malformed")
+        indexed: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                raise SystemExit("registry profiles are malformed")
+            if row["id"] in indexed:
+                raise SystemExit(f"profile {row['id']!r} appears more than once")
+            indexed[row["id"]] = json.dumps(row, sort_keys=True)
+        return indexed
+
+    original = by_id(before)
+    emitted = by_id(after)
+    if set(original) != set(emitted):
+        raise SystemExit("approval must not add or remove a profile")
+    changed = {key for key in original if original[key] != emitted[key]}
+    if changed != {profile_id}:
+        unexpected = sorted(changed - {profile_id})
+        raise SystemExit(
+            "approval changed profiles it was not asked to change: "
+            + (", ".join(unexpected) if unexpected else f"{profile_id!r} was not modified")
+        )
+
+
+def _bump_release(
+    registry: dict, measurement: str, operator: str, reason: str, *, profile_id: str
+) -> dict:
     doc = {k: v for k, v in registry.items() if k not in ("signature", "signature_base64")}
+    # Detach from the caller's parsed registry: the dict comprehension is
+    # shallow, so without this the nested profile edit below would also
+    # rewrite the document the caller still holds as the "before" state.
+    doc = json.loads(json.dumps(doc, sort_keys=True))
     doc["release"] = int(doc["release"]) + 1
-    profile = doc["profiles"][0]
+    profile = _select_active_profile(doc, profile_id)
     if measurement in profile["measurements"]:
-        raise SystemExit("measurement already present in the registry; nothing to approve")
+        raise SystemExit(
+            f"measurement already present in profile {profile_id!r}; nothing to approve"
+        )
     profile["measurements"] = sorted(set(profile["measurements"]) | {measurement})
     # Publication time is now (a fresh release restores the 24-hour freshness
     # clock); validity windows and every transition time stay exactly as the
@@ -176,6 +254,7 @@ def _bump_release(registry: dict, measurement: str, operator: str, reason: str) 
     approvals = list(meta.get("measurement_approvals", []))
     approvals.append({
         "measurement": measurement,
+        "profile_id": profile_id,
         "operator": operator,
         "reason": reason,
         "approved_at": _now_iso(),
@@ -190,14 +269,25 @@ def cmd_show(args: argparse.Namespace) -> int:
     registry = parse_registry_json(
         _secure_read_bytes(args.registry, label="policy registry")
     )
-    profile = registry["profiles"][0]
-    print(f"release {registry['release']}  profile {profile['id']}")
+    profiles = registry.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        raise SystemExit("registry profiles are malformed")
+    print(f"release {registry['release']}")
     print(f"valid {registry['valid_from']} .. {registry['valid_until']}")
-    for measurement in profile["measurements"]:
-        print(f"  measurement {measurement}")
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            raise SystemExit("registry profiles are malformed")
+        print(
+            f"profile {profile.get('id')}  kind {profile.get('kind')}  "
+            f"status {profile.get('status')}"
+        )
+        measurements = profile.get("measurements")
+        for measurement in measurements if isinstance(measurements, list) else []:
+            print(f"  measurement {measurement}")
     for approval in registry.get("metadata", {}).get("measurement_approvals", []):
+        target = approval.get("profile_id", "(unrecorded profile)")
         print(f"  approval r{approval['release']} {approval['approved_at']} "
-              f"by {approval['operator']}: {approval['reason']}")
+              f"profile {target} by {approval['operator']}: {approval['reason']}")
     return 0
 
 
@@ -205,6 +295,10 @@ def cmd_approve(args: argparse.Namespace) -> int:
     registry = parse_registry_json(
         _secure_read_bytes(args.registry, label="policy registry")
     )
+    profile_id = _identifier(args.profile_id, "profile id")
+    # Prove the named profile exists and is an active CPU-TDX profile before
+    # the capture spends a live probe against the worker.
+    _select_active_profile(registry, profile_id)
     candidate = _capture(args.endpoint, args.cacert, args.hotkey, args.verifier)
     measurement = candidate["measurement"]
     print(
@@ -215,7 +309,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
     operator = _bounded_field(args.operator, "operator")
     reason = _bounded_field(args.reason, "reason")
-    doc = _bump_release(registry, measurement, operator, reason)
+    doc = _bump_release(registry, measurement, operator, reason, profile_id=profile_id)
+    _assert_only_profile_changed(registry, doc, profile_id)
     seed = _load_signing_seed(args.signing_key_file)
     signed = sign_registry(doc, seed)
     encoded = json.dumps(signed, separators=(",", ":"), sort_keys=True).encode()
@@ -230,6 +325,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         "at": _now_iso(),
         "action": "measurement_approved",
         "measurement": measurement,
+        "profile_id": profile_id,
         "tcb_status": candidate["tcb_status"],
         "chip_id": candidate["chip_id"],
         "endpoint": args.endpoint,
@@ -1087,6 +1183,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = sub.add_parser("approve", help="capture, record, and sign a new measurement release")
     approve.add_argument("--registry", required=True)
+    approve.add_argument(
+        "--profile-id",
+        required=True,
+        help=(
+            "id of the active CPU-TDX profile the measurement is added to. "
+            "Required and verified: a registry carries every prior profile "
+            "after a rollover, so the target is never inferred from position"
+        ),
+    )
     approve.add_argument("--signing-key-file", required=True)
     approve.add_argument("--endpoint", required=True)
     approve.add_argument("--cacert", required=True)

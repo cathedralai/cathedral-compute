@@ -65,6 +65,7 @@ def _argv(tmp_path: Path, registry: Path, key: Path, *, out: str = "registry.nex
     return [
         "approve",
         "--registry", str(registry),
+        "--profile-id", "cpu-tdx-sample-v1",
         "--signing-key-file", str(key),
         "--endpoint", "https://10.0.0.1:8443",
         "--cacert", str(registry),          # unused: _capture is stubbed
@@ -122,7 +123,7 @@ def test_approve_refuses_to_overwrite_an_existing_output(tmp_path, monkeypatch):
     monkeypatch.setattr(approval, "_capture", lambda *a, **k: _candidate())
     (tmp_path / "registry.next.json").write_text("do not clobber me")
 
-    with pytest.raises(BaseException):
+    with pytest.raises(FileExistsError):
         approval.main(_argv(tmp_path, registry, key))
     assert (tmp_path / "registry.next.json").read_text() == "do not clobber me"
 
@@ -142,7 +143,7 @@ def test_a_failed_approval_record_rolls_back_the_signed_registry(tmp_path, monke
 
     monkeypatch.setattr(approval, "_secure_append_line", _explode)
 
-    with pytest.raises(BaseException):
+    with pytest.raises(OSError, match="approval log is on a full disk"):
         approval.main(_argv(tmp_path, registry, key))
     assert not (tmp_path / "registry.next.json").exists(), (
         "a signed registry survived without its approval record")
