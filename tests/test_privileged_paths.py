@@ -30,6 +30,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import venv
 from pathlib import Path
 
@@ -50,6 +51,80 @@ OTHER = ME + 1  # a uid this process certainly is not
 # A realistic accepting set: the service account plus root, which owns the
 # system directories every temporary path is nested under.
 ACCEPT = {ME, 0}
+
+
+@pytest.fixture
+def tmp_path(tmp_path_factory):
+    """Provide a writable test root whose complete ancestor chain is trusted.
+
+    Pytest commonly roots ``tmp_path`` below world-writable ``/tmp`` on Linux.
+    That is correctly refused by the production checker, but it is the wrong
+    fixture for positive-path assertions. Prefer pytest's root when safe and
+    otherwise create a private directory below a trusted writable base.
+    """
+    candidate = tmp_path_factory.mktemp("privileged-paths")
+    candidate_verdict = inspect_path(
+        candidate,
+        trusted_uids=ACCEPT,
+        require_file=False,
+    )
+    if candidate_verdict.trusted:
+        yield candidate
+        return
+
+    fallback: Path | None = None
+    seen: set[Path] = set()
+    fallback_bases = [
+        Path(os.environ[name]) for name in ("TMPDIR", "TEMP", "TMP") if os.environ.get(name)
+    ]
+    fallback_bases.extend(
+        [
+            Path(tempfile.gettempdir()),
+            Path(__file__).resolve().parents[1],
+            Path.home(),
+        ]
+    )
+    for base in fallback_bases:
+        # Resolve platform aliases such as macOS /var -> /private/var, then
+        # inspect and use the exact resolved chain.
+        base = Path(os.path.realpath(base))
+        if base in seen or not base.is_dir() or not os.access(base, os.W_OK):
+            continue
+        seen.add(base)
+        base_verdict = inspect_path(
+            base,
+            trusted_uids=ACCEPT,
+            require_file=False,
+        )
+        if not base_verdict.trusted:
+            continue
+        trial = Path(tempfile.mkdtemp(prefix=".cathedral-path-test-", dir=base))
+        trial_verdict = inspect_path(
+            trial,
+            trusted_uids=ACCEPT,
+            require_file=False,
+        )
+        if trial_verdict.trusted:
+            fallback = trial
+            break
+        shutil.rmtree(trial)
+
+    if fallback is None:
+        pytest.fail(
+            "no writable trusted temporary root is available; pytest root: "
+            + "; ".join(candidate_verdict.violations)
+        )
+
+    try:
+        # This assertion is the regression boundary for every positive fixture.
+        assert inspect_path(
+            fallback,
+            trusted_uids=ACCEPT,
+            require_file=False,
+        ).trusted
+        yield fallback
+    finally:
+        shutil.rmtree(fallback)
 
 
 def _chain(tmp_path: Path, *, mode: int = 0o755) -> tuple[Path, Path]:
@@ -289,11 +364,19 @@ def test_an_extended_acl_is_refused_without_mode_bit_help(tmp_path: Path):
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         pytest.skip(f"host refused the ACL test fixture: {result.stderr.strip()}")
+    # Linux setfacl commonly widens the group mode bits through the ACL mask.
+    # Restore the original mode while retaining the named extended ACL, so the
+    # refusal below proves ACL inspection rather than ordinary mode checking.
+    target.chmod(before)
     assert target.stat().st_mode & 0o777 == before
+    if sys.platform.startswith("linux"):
+        names = {os.fsdecode(name) for name in os.listxattr(target, follow_symlinks=False)}
+        assert "system.posix_acl_access" in names
 
     verdict = inspect_path(target, trusted_uids=ACCEPT)
     assert not verdict.trusted
     assert any("ACL" in violation for violation in verdict.violations)
+    assert not any("writable" in violation for violation in verdict.violations)
 
 
 def test_acl_inspection_failure_is_not_treated_as_no_acl(tmp_path: Path, monkeypatch):
