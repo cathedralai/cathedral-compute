@@ -48,6 +48,37 @@ Runtime controls:
 --reattestation-retry-jitter-seconds 5
 ```
 
+## Standalone probe budgets
+
+`cathedral-prober --max-probes N` limits the targets selected in one pass.
+Interior `--new-worker-share` values reserve count capacity for both first
+probes and refreshes. `0` and `1` are explicit priority overrides for refreshes
+and first probes, respectively. Unused count capacity still spills to the other
+class.
+
+`--pass-deadline-seconds S` adds a finite positive dispatch deadline. The
+executor admits its first worker wave before applying the deadline to queued
+targets. With an interior share, that wave contains at least one first probe and
+one refresh. This requires at least two effective workers. Later targets that
+reach a worker after the deadline remain deferred without a verdict, lifecycle,
+or retry mutation. Probes admitted in the first wave follow their existing
+transport deadline and may finish after the dispatch deadline. The transport
+deadline is one absolute limit across connection setup, response headers, and
+the response body. A peer sending bytes slowly does not restart it.
+
+The configured share divides the count selection budget. A tight deadline may
+make the smaller first-wave worker count the binding limit, so the realized
+number of starts is quantized by `--workers`. The confidential GPU evidence
+working-set cap currently yields one effective worker. The default interior
+share plus a pass deadline is therefore rejected for GPU probing. Leave the
+deadline unset, or choose an explicit `0` or `1` priority override after
+accepting its single-class starvation tradeoff.
+
+These controls bound and fairly schedule work already marked due. They do not
+change the established re-attestation cadence. The standalone prober and epoch
+runtime retain the full-TTL due window, so a freshly verified worker remains
+eligible for re-attestation in the next cycle.
+
 ## Policy and concurrency safety
 
 A measurement removed from the active policy moves directly to `revoked`

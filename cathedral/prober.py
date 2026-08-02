@@ -8,6 +8,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import socket
 import threading
 import time
@@ -37,7 +38,7 @@ from cathedral.lifecycle import (
     LifecycleReason,
     WorkerLifecycleState,
 )
-from cathedral.remote import RemoteMiner
+from cathedral.remote import RemoteMiner, _deadline_response_class
 
 
 MAX_EVIDENCE_BYTES = 64 * 1024
@@ -53,9 +54,18 @@ class _PreResolvedHTTPConnection(http.client.HTTPConnection):
     be hijacked by DNS rebinding after enrollment-time validation.
     """
 
-    def __init__(self, host: str, *, resolved_addr: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        host: str,
+        *,
+        resolved_addr: str,
+        deadline: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._resolved_addr = resolved_addr
         super().__init__(host, **kwargs)
+        if deadline is not None:
+            self.response_class = _deadline_response_class(deadline)
 
     def connect(self) -> None:
         """Override socket connection to use the pre-resolved IP."""
@@ -74,9 +84,18 @@ class _PreResolvedHTTPSConnection(http.client.HTTPSConnection):
     Stores the original hostname for SNI and the resolved IP for the socket.
     """
 
-    def __init__(self, host: str, *, resolved_addr: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        host: str,
+        *,
+        resolved_addr: str,
+        deadline: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._resolved_addr = resolved_addr
         super().__init__(host, **kwargs)
+        if deadline is not None:
+            self.response_class = _deadline_response_class(deadline)
 
     def connect(self) -> None:
         """Override socket connection to use the pre-resolved IP."""
@@ -192,7 +211,11 @@ class _PreResolvedHTTPSHandler(http.client.HTTPSConnection):
         self.resolved_addr = resolved_addr
 
 
-def _build_pre_resolved_opener(resolved_addr: str) -> Any:
+def _build_pre_resolved_opener(
+    resolved_addr: str,
+    *,
+    deadline: float | None = None,
+) -> Any:
     """Build an opener that uses pre-resolved connection classes.
 
     The opener will instantiate _PreResolvedHTTPConnection and
@@ -204,18 +227,35 @@ def _build_pre_resolved_opener(resolved_addr: str) -> Any:
     class _ResolvedHTTPHandler(HTTPHandler):
         def http_open(self, req: Any) -> Any:
             return self.do_open(
-                lambda h, **kw: _PreResolvedHTTPConnection(h, resolved_addr=resolved_addr, **kw),
+                lambda h, **kw: _PreResolvedHTTPConnection(
+                    h,
+                    resolved_addr=resolved_addr,
+                    deadline=deadline,
+                    **kw,
+                ),
                 req,
             )
 
     class _ResolvedHTTPSHandler(HTTPSHandler):
         def https_open(self, req: Any) -> Any:
             return self.do_open(
-                lambda h, **kw: _PreResolvedHTTPSConnection(h, resolved_addr=resolved_addr, **kw),
+                lambda h, **kw: _PreResolvedHTTPSConnection(
+                    h,
+                    resolved_addr=resolved_addr,
+                    deadline=deadline,
+                    **kw,
+                ),
                 req,
             )
 
     return build_opener(NoRedirect, _ResolvedHTTPHandler(), _ResolvedHTTPSHandler())
+
+
+def _remaining_evidence_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("evidence request exceeded its total deadline")
+    return remaining
 
 
 def _read_capped(response: HTTPResponse, cap: int = MAX_EVIDENCE_BYTES) -> bytes:
@@ -279,6 +319,10 @@ def _request_evidence(
     resolved_addr = _resolve_endpoint(
         endpoint_url, resolver=resolver, production_mode=production_mode
     )
+    # Synchronous name resolution has no safe stdlib cancellation primitive.
+    # The request deadline starts after resolution. Production endpoints are
+    # IP literals, so production probing has no resolver step here.
+    deadline = time.monotonic() + TIMEOUT_SECONDS
 
     url = urljoin(endpoint_url.rstrip("/") + "/", "v1/evidence")
     payload = json.dumps({"nonce_hex": nonce.hex(), "hotkey": hotkey}).encode("utf-8")
@@ -292,11 +336,14 @@ def _request_evidence(
         # Build a custom opener that uses pre-resolved connections to prevent
         # a second (rebindable) DNS lookup.  When resolved_addr is None
         # (IP literal endpoint), the standard connection classes are used.
-        if resolved_addr is not None:
-            opener = _build_pre_resolved_opener(resolved_addr)
-        else:
-            opener = build_opener(NoRedirect)
-    with opener.open(req, timeout=TIMEOUT_SECONDS) as response:
+        parsed_host = urlparse(endpoint_url).hostname
+        if parsed_host is None:
+            raise ValueError("endpoint_url has no hostname")
+        opener = _build_pre_resolved_opener(
+            resolved_addr or parsed_host,
+            deadline=deadline,
+        )
+    with opener.open(req, timeout=_remaining_evidence_seconds(deadline)) as response:
         body = _read_capped(response)
     raw = json.loads(body.decode("utf-8"))
     if not isinstance(raw, dict):
@@ -392,11 +439,202 @@ def verify_cc_evidence_bundle(
     return None
 
 
+DEFAULT_NEW_WORKER_SHARE = 0.25
+
+
+def select_probe_targets(
+    due: list[tuple[Any, Any]],
+    *,
+    max_probes: int | None,
+    new_worker_share: float = DEFAULT_NEW_WORKER_SHARE,
+    deadline_active: bool = False,
+) -> tuple[list[tuple[Any, Any]], list[tuple[Any, Any]]]:
+    """Split the due set into this pass's targets and the deferred remainder.
+
+    A budget without an ordering is a starvation bug. ``due_refreshes``
+    returns rows ordered by hotkey, so truncating that list would probe the
+    same lexicographically smallest hotkeys every pass and never reach the
+    tail. Targets are therefore ordered **most overdue first**, which is both
+    fair and the order that minimises time spent outside a verdict.
+
+    The budget is also split across two classes, because a single queue lets
+    either class starve the other:
+
+    - workers with no verified evidence yet (a first probe), and
+    - workers with evidence due for refresh.
+
+    Open mode makes this load-bearing. If new workers always won, anyone
+    could enroll continuously and push already-attested miners past their
+    evidence expiry, turning an admission gate into a way to zero honest
+    supply. If refreshes always won, a full subnet would never admit anyone
+    new. An interior share reserves both classes and unused capacity spills to
+    the other, so the budget is never wasted on an empty class. The 0.0 and 1.0
+    endpoints are explicit single-class-priority modes.
+
+    Deferral is not failure. A deferred target keeps its verdict, its
+    lifecycle state, and its retry counter untouched; it is simply probed on
+    a later pass.
+
+    The ordering applies even when everything fits inside the budget, because
+    the pass deadline still decides who starts, and a set that fits in the
+    budget can still exceed the clock.
+    """
+    if not 0.0 <= new_worker_share <= 1.0:
+        raise ValueError("new_worker_share must be between 0.0 and 1.0")
+    if max_probes is None and not deadline_active:
+        return list(due), []
+    if max_probes is not None and max_probes < 1:
+        raise ValueError(f"max_probes must be at least 1, got {max_probes}")
+    if max_probes is not None and max_probes < 2 and 0.0 < new_worker_share < 1.0:
+        raise ValueError(
+            "max_probes must be at least 2 when new_worker_share reserves "
+            "capacity for both first probes and refreshes"
+        )
+
+    # A deadline can defer targets even without a count budget. In that mode
+    # every due target remains selected, but it must still use the fair order
+    # below. Otherwise the database's hotkey order lets the same low-sorting
+    # workers start first on every pass and starves the tail indefinitely.
+    if max_probes is None:
+        max_probes = len(due)
+        if max_probes == 0:
+            return [], []
+
+    def _epoch_seconds(value: Any) -> float | None:
+        try:
+            return value.timestamp()
+        except AttributeError:
+            return None
+
+    def overdue_key(target: tuple[Any, Any]) -> tuple[Any, ...]:
+        _enrollment, lifecycle = target
+        expires = _epoch_seconds(getattr(lifecycle, "evidence_expires_at", None))
+        verified = _epoch_seconds(getattr(lifecycle, "evidence_verified_at", None))
+        # A worker awaiting its first probe has neither timestamp, so without
+        # a third key the whole fresh class would collapse onto the hotkey
+        # tie-break — and an attacker who grinds a low-sorting ss58 would take
+        # the reserved share every pass, which is the starvation this ordering
+        # exists to prevent. state_changed_at makes the fresh class
+        # first-come-first-served, which key choice cannot influence.
+        waiting_since = _epoch_seconds(getattr(lifecycle, "state_changed_at", None))
+        return (
+            expires is not None,
+            expires if expires is not None else 0.0,
+            verified is not None,
+            verified if verified is not None else 0.0,
+            waiting_since is not None,
+            waiting_since if waiting_since is not None else 0.0,
+            lifecycle.hotkey,
+        )
+
+    fresh = sorted(
+        (t for t in due if getattr(t[1], "evidence_verified_at", None) is None),
+        key=overdue_key,
+    )
+    refresh = sorted(
+        (t for t in due if getattr(t[1], "evidence_verified_at", None) is not None),
+        key=overdue_key,
+    )
+
+    fresh_budget = min(len(fresh), int(max_probes * new_worker_share))
+    if fresh and fresh_budget == 0 and new_worker_share > 0:
+        # A share small enough to round to zero would silently mean "never
+        # admit anyone". An explicit 0.0 still means zero: that is a
+        # deliberate posture where newcomers get only leftover capacity.
+        fresh_budget = 1
+    refresh_budget = max_probes - fresh_budget
+    # Spill unused capacity both ways so a budget is never lost to an empty
+    # or short class.
+    if len(refresh) < refresh_budget:
+        fresh_budget = min(len(fresh), fresh_budget + (refresh_budget - len(refresh)))
+        refresh_budget = len(refresh)
+    elif len(fresh) < fresh_budget:
+        refresh_budget = min(len(refresh), refresh_budget + (fresh_budget - len(fresh)))
+        fresh_budget = len(fresh)
+
+    # Preserve refresh urgency in the selection result. When a deadline is
+    # active, probe_once separately makes the executor's first wave fair across
+    # both classes. Selection order alone cannot do that: a slow first class
+    # can occupy every worker until the deadline expires.
+    selected = refresh[:refresh_budget] + fresh[:fresh_budget]
+    chosen = {id(target) for target in selected}
+    return selected, [target for target in due if id(target) not in chosen]
+
+
+def _deadline_fair_dispatch_order(
+    targets: list[tuple[Any, Any]],
+    *,
+    worker_count: int,
+    new_worker_share: float,
+) -> list[tuple[Any, Any]]:
+    """Place both reserved classes in the executor's first worker wave.
+
+    A deadline is checked when a queued target starts. If every refresh is
+    queued before every first probe, slow refreshes occupy the whole pool and
+    the deadline discards the reserved first-probe capacity on every pass.
+    The first wave therefore contains at least one target from each nonempty
+    class and otherwise follows the selected class proportions.
+
+    The explicit 0.0 and 1.0 share endpoints keep their single-class priority.
+    One worker cannot provide two-class deadline fairness for an interior
+    share, so callers reject that configuration before reaching this helper.
+    """
+    if worker_count < 1:
+        raise ValueError("worker_count must be at least 1")
+    refresh = [
+        target for target in targets if getattr(target[1], "evidence_verified_at", None) is not None
+    ]
+    fresh = [
+        target for target in targets if getattr(target[1], "evidence_verified_at", None) is None
+    ]
+    if new_worker_share == 0.0:
+        return refresh + fresh
+    if new_worker_share == 1.0:
+        return fresh + refresh
+    if not refresh or not fresh:
+        return list(targets)
+    if worker_count < 2:
+        raise ValueError(
+            "deadline probing requires at least 2 effective workers when "
+            "capacity is reserved for first probes and refreshes"
+        )
+
+    first_wave_size = min(worker_count, len(targets))
+    proportional_fresh = int(first_wave_size * len(fresh) / len(targets))
+    fresh_slots = min(
+        len(fresh),
+        first_wave_size - 1,
+        max(1, proportional_fresh),
+    )
+    refresh_slots = min(len(refresh), first_wave_size - fresh_slots)
+
+    # Fill short-class capacity without losing the one-slot guarantee for
+    # either class.
+    unfilled = first_wave_size - fresh_slots - refresh_slots
+    if unfilled:
+        extra_fresh = min(len(fresh) - fresh_slots, unfilled)
+        fresh_slots += extra_fresh
+        unfilled -= extra_fresh
+    if unfilled:
+        refresh_slots += min(len(refresh) - refresh_slots, unfilled)
+
+    # Put one target from each class first. This minimises thread-start timing
+    # skew before the rest of the first wave is submitted.
+    first_wave = [refresh[0], fresh[0]]
+    first_wave.extend(refresh[1:refresh_slots])
+    first_wave.extend(fresh[1:fresh_slots])
+    remainder = refresh[refresh_slots:] + fresh[fresh_slots:]
+    return first_wave + remainder
+
+
 def probe_once(
     store: RegistryStore,
     policy: Policy,
     *,
     max_workers: int = 4,
+    max_probes: int | None = None,
+    new_worker_share: float = DEFAULT_NEW_WORKER_SHARE,
+    deadline_seconds: float | None = None,
     resolver: Any = None,
     opener: Any = None,
     production_mode: bool = False,
@@ -418,10 +656,26 @@ def probe_once(
         (recorded as a FAILED verdict for that hotkey, isolated from the
         rest of the pass). Matches the production enrollment-time policy in
         ``cathedral.enroll.validate_endpoint_url``.
+    :param max_probes: cap on targets probed in one pass. ``None`` (the
+        default) preserves the historical unbounded behaviour. Under open
+        enrollment this is what stops a large population from making a pass
+        unbounded in cost; see ``select_probe_targets`` for the fair
+        two-class ordering that keeps a cap from starving either class.
+    :param new_worker_share: fraction of *max_probes* reserved for workers
+        with no verified evidence yet.
+    :param deadline_seconds: wall-clock budget for the pass. Once it elapses,
+        targets that have not started are deferred rather than dispatched.
+        Probes already in flight are allowed to finish; their own transport
+        timeouts bound them. An interior two-class share requires at least two
+        effective workers so both classes enter the first dispatch wave.
     :raises ValueError: when *max_workers* is less than 1.
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be at least 1, got {max_workers}")
+    if deadline_seconds is not None and (
+        not math.isfinite(deadline_seconds) or deadline_seconds <= 0
+    ):
+        raise ValueError("deadline_seconds must be finite and positive")
     gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
     if expected_tier is Tier.CC_GPU and any(item is None for item in gpu_configuration):
         raise ValueError("GPU probing requires profile, verifier, and identity registry")
@@ -476,15 +730,48 @@ def probe_once(
             if not gpu_verifier.production_ready:
                 raise ValueError("production GPU probe requires a static verifier executable")
             gpu_verifier.preflight(gpu_profile)
+    effective_workers = (
+        min(max_workers, MAX_GPU_EVIDENCE_CONCURRENCY)
+        if expected_tier is Tier.CC_GPU
+        else max_workers
+    )
+    if deadline_seconds is not None and 0.0 < new_worker_share < 1.0 and effective_workers < 2:
+        raise ValueError(
+            "deadline probing requires at least 2 effective workers when "
+            "new_worker_share reserves first probes and refreshes"
+        )
     due_snapshots = {
         snapshot.hotkey: snapshot
         for snapshot in store.due_refreshes(refresh_ahead_seconds=store.verification_ttl_seconds)
     }
-    probe_targets = [
+    all_due = [
         (enrollment, due_snapshots[enrollment.hotkey])
         for enrollment in store.enrollments()
         if enrollment.hotkey in due_snapshots
     ]
+    probe_targets, deferred = select_probe_targets(
+        all_due,
+        max_probes=max_probes,
+        new_worker_share=new_worker_share,
+        deadline_active=deadline_seconds is not None,
+    )
+    if deadline_seconds is not None:
+        probe_targets = _deadline_fair_dispatch_order(
+            probe_targets,
+            worker_count=effective_workers,
+            new_worker_share=new_worker_share,
+        )
+    all_reached = True
+    if deferred:
+        LOGGER.info(
+            "probe budget %d reached: %d target(s) deferred to the next pass",
+            max_probes,
+            len(deferred),
+        )
+        # A pass that did not reach every due target has not verified every
+        # due target. Reporting success here would let `--once --max-probes N`
+        # tell a health check the fleet is fine after contacting N of M.
+        all_reached = False
     gpu_evidence_slots = threading.BoundedSemaphore(MAX_GPU_EVIDENCE_CONCURRENCY)
 
     def _probe_one(target: tuple[Any, Any]) -> bool:
@@ -652,14 +939,41 @@ def probe_once(
                 LOGGER.exception("failed to record probe failure for hotkey %s", enrollment.hotkey)
             return False
 
-    all_succeeded = True
-    effective_workers = (
-        min(max_workers, MAX_GPU_EVIDENCE_CONCURRENCY)
-        if expected_tier is Tier.CC_GPU
-        else max_workers
-    )
+    all_succeeded = all_reached
+    expires_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+
+    def _probe_within_deadline(
+        target: tuple[Any, Any],
+        admitted_first_wave: bool,
+    ) -> bool:
+        # Checked inside the worker, not at submit time: with a bounded pool
+        # the queue drains over the whole pass, so a target that would start
+        # after the deadline must be dropped when its turn comes rather than
+        # when it was queued. The first wave is admitted atomically into the
+        # available worker slots before this check. Treating those targets as
+        # in flight keeps thread-start jitter from defeating either class's
+        # reserved slot. Deferral leaves verdict and retry state untouched.
+        if not admitted_first_wave and expires_at is not None and time.monotonic() >= expires_at:
+            enrollment, _lifecycle = target
+            LOGGER.info(
+                "probe deadline reached; deferring hotkey=%s to the next pass",
+                enrollment.hotkey,
+            )
+            # Not a failure for the worker, but not a success for the pass:
+            # nothing was verified, so the pass must not claim it was.
+            return False
+        return _probe_one(target)
+
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        futures = [executor.submit(_probe_one, target) for target in probe_targets]
+        first_wave_size = min(effective_workers, len(probe_targets))
+        futures = [
+            executor.submit(
+                _probe_within_deadline,
+                target,
+                index < first_wave_size,
+            )
+            for index, target in enumerate(probe_targets)
+        ]
         for future in as_completed(futures):
             try:
                 if not future.result():
@@ -713,7 +1027,42 @@ def main() -> None:
         "--workers",
         type=int,
         default=4,
-        help="concurrent probe workers per pass (default: 4, must be ≥ 1)",
+        help=(
+            "concurrent probe workers per pass (default: 4, must be ≥ 1; "
+            "a two-class deadline share requires ≥ 2 effective workers)"
+        ),
+    )
+    parser.add_argument(
+        "--max-probes",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "cap targets probed per pass; the rest are deferred to the next "
+            "pass with their verdicts and retry counters untouched. Required "
+            "sizing under open enrollment (default: unbounded)"
+        ),
+    )
+    parser.add_argument(
+        "--new-worker-share",
+        type=float,
+        default=DEFAULT_NEW_WORKER_SHARE,
+        metavar="F",
+        help=(
+            "fraction of --max-probes reserved for workers with no verified "
+            "evidence yet; interior values reserve both classes, while 0 and "
+            "1 are explicit single-class-priority overrides (default: 0.25)"
+        ),
+    )
+    parser.add_argument(
+        "--pass-deadline-seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help=(
+            "finite positive wall-clock budget for one pass; targets that "
+            "have not started when it elapses are deferred (default: unbounded)"
+        ),
     )
     parser.add_argument(
         "--production-mode",
@@ -798,6 +1147,41 @@ def main() -> None:
             generation_anchor_path=args.gpu_identity_anchor_file,
         )
         expected_tier = Tier.CC_GPU
+
+    # Validated at startup, not on the first pass. probe_once raises for a bad
+    # budget, and the pass loop below swallows every exception and sleeps, so
+    # a typo would otherwise turn the prober into a silent no-op that logs
+    # once per interval while every worker's evidence quietly expires.
+    if args.max_probes is not None and args.max_probes < 1:
+        parser.error("--max-probes must be at least 1")
+    if not 0.0 <= args.new_worker_share <= 1.0:
+        parser.error("--new-worker-share must be between 0.0 and 1.0")
+    if args.max_probes is not None and args.max_probes < 2 and 0.0 < args.new_worker_share < 1.0:
+        parser.error(
+            "--max-probes must be at least 2 when --new-worker-share "
+            "reserves capacity for both first probes and refreshes"
+        )
+    if args.pass_deadline_seconds is not None and (
+        not math.isfinite(args.pass_deadline_seconds) or args.pass_deadline_seconds <= 0
+    ):
+        parser.error("--pass-deadline-seconds must be finite and positive")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    configured_effective_workers = (
+        min(args.workers, MAX_GPU_EVIDENCE_CONCURRENCY)
+        if args.gpu_profile_id is not None
+        else args.workers
+    )
+    if (
+        args.pass_deadline_seconds is not None
+        and 0.0 < args.new_worker_share < 1.0
+        and configured_effective_workers < 2
+    ):
+        parser.error(
+            "--pass-deadline-seconds with a two-class --new-worker-share "
+            "requires at least 2 effective --workers"
+        )
+
     while True:
         try:
             if args.policy_registry is not None:
@@ -809,6 +1193,9 @@ def main() -> None:
                 store,
                 policy,
                 max_workers=args.workers,
+                max_probes=args.max_probes,
+                new_worker_share=args.new_worker_share,
+                deadline_seconds=args.pass_deadline_seconds,
                 production_mode=args.production_mode,
                 policy_refresher=(
                     (lambda: refresh_registry_authority()[0])

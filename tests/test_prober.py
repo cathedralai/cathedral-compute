@@ -195,6 +195,75 @@ def _serve(handler_cls):
     return server
 
 
+@pytest.mark.parametrize("drip_phase", ["headers", "body"])
+def test_probe_executor_joins_after_one_total_transport_deadline(
+    drip_phase,
+    monkeypatch,
+    tmp_path,
+):
+    handler_done = threading.Event()
+    handler_saw_disconnect = threading.Event()
+    force_stop = threading.Event()
+
+    class DripHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            request_length = int(self.headers["Content-Length"])
+            self.rfile.read(request_length)
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 512\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            try:
+                if drip_phase == "body":
+                    self.connection.sendall(headers)
+                    dripping = b" " * 512
+                else:
+                    dripping = headers
+                for byte in dripping:
+                    self.connection.sendall(bytes((byte,)))
+                    if force_stop.wait(0.05):
+                        return
+            except OSError:
+                handler_saw_disconnect.set()
+            finally:
+                handler_done.set()
+
+        def log_message(self, *_args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), DripHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "D" * 47
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_address[1]}")
+    monkeypatch.setattr(prober_module, "TIMEOUT_SECONDS", 0.3)
+    try:
+        started = time.monotonic()
+        assert not probe_once(
+            store,
+            Policy(),
+            max_workers=1,
+            max_probes=1,
+            new_worker_share=1.0,
+        )
+        elapsed = time.monotonic() - started
+
+        assert 0.2 < elapsed < 1.25
+        assert store.lifecycle_snapshot(hotkey).retry_count == 1
+        assert handler_done.wait(1.0), "probe timeout left the drip handler running"
+        assert handler_saw_disconnect.is_set()
+    finally:
+        force_stop.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+
+    assert not server_thread.is_alive()
+
+
 def _fake_tdx_verify(evidence, nonce, policy):
     """Monkeypatched verifier: returns Attested(CC_CPU_TDX) for TDX evidence."""
     if evidence.kind is EvidenceKind.TDX:

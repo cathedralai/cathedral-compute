@@ -85,6 +85,66 @@ def test_remote_default_retains_cpu_specific_response_limit():
     assert MAX_RESPONSE_BODY == MAX_CPU_EVIDENCE_RESPONSE_BODY == 128 * 1024
 
 
+@pytest.mark.parametrize("drip_phase", ["headers", "body"])
+def test_remote_response_uses_one_total_deadline_and_closes_drip_connection(
+    drip_phase,
+):
+    handler_done = threading.Event()
+    handler_saw_disconnect = threading.Event()
+    force_stop = threading.Event()
+
+    class DripHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            request_length = int(self.headers["Content-Length"])
+            self.rfile.read(request_length)
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 512\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            try:
+                if drip_phase == "body":
+                    self.connection.sendall(headers)
+                    dripping = b" " * 512
+                else:
+                    dripping = headers
+                for byte in dripping:
+                    self.connection.sendall(bytes((byte,)))
+                    if force_stop.wait(0.05):
+                        return
+            except OSError:
+                handler_saw_disconnect.set()
+            finally:
+                handler_done.set()
+
+        def log_message(self, *_args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), DripHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        remote = RemoteMiner(endpoint, HOTKEY, timeout=0.3)
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as raised:
+            remote.supports_customer_sat()
+        elapsed = time.monotonic() - started
+
+        assert str(raised.value) == "worker request timed out"
+        assert 0.2 < elapsed < 1.25
+        assert handler_done.wait(1.0), "client timeout left the drip handler running"
+        assert handler_saw_disconnect.is_set()
+    finally:
+        force_stop.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+
+    assert not server_thread.is_alive()
+
+
 def _fake_evidence(nonce: bytes, hotkey: str) -> Evidence:
     """Deterministic mock collector — no hardware needed."""
     return Evidence(
@@ -809,9 +869,7 @@ def test_busy_returns_503():
 
 def test_declared_but_unsent_bodies_cannot_block_the_challenge_path():
     """Two stalled connections must not deny attestation to a real caller."""
-    payload = json.dumps(
-        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
-    ).encode()
+    payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
     with WorkerServer(
         evidence_collector=_fake_evidence,
         max_challenge_concurrent=1,
@@ -908,9 +966,7 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
             cert_chain=[b"fakecert"],
         )
 
-    payload = json.dumps(
-        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
-    ).encode()
+    payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
     with WorkerServer(
         evidence_collector=big_collector,
         max_challenge_concurrent=1,
@@ -928,8 +984,7 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
             stalled.sendall(
                 b"POST /v1/evidence HTTP/1.1\r\nHost: localhost\r\n"
                 b"Content-Type: application/json\r\n"
-                b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
-                + payload
+                b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
             )
             time.sleep(0.3)
             # Whether the handler is still blocked in send at this instant

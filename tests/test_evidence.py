@@ -832,7 +832,7 @@ def test_command_budget_enforces_deadline_bytes_and_artifacts():
 
 
 def test_dns_resolution_is_capped_by_the_command_deadline(monkeypatch):
-    """Defect-7 proof: a ~1ms budget with a 50ms resolver fails promptly."""
+    """Defect-7 proof: a ~1ms budget with a 250ms resolver fails promptly."""
     import socket
     import time
 
@@ -845,7 +845,10 @@ def test_dns_resolution_is_capped_by_the_command_deadline(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", slow_resolver)
     budget = _FetchBudget(deadline_seconds=0.001)
     started = time.monotonic()
-    with pytest.raises(ValueError, match="exceeded the command deadline"):
+    # On a loaded runner the command-wide budget can expire immediately before
+    # the resolver starts, or the bounded resolver can consume the remainder.
+    # Both are the same fail-closed deadline outcome.
+    with pytest.raises(ValueError, match=r"exceeded (?:the command|its total) deadline"):
         _resolved_public_address("example.com", 443, allow_private=False, budget=budget)
     elapsed = time.monotonic() - started
     # The failure lands at ~the 1ms budget, NOT after the 250ms resolver.
