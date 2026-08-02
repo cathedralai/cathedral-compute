@@ -27,19 +27,53 @@ The unit of trust is the whole chain, not the file:
 - the target **and every ancestor directory up to `/`** must be owned by a
   trusted uid;
 - no component may be writable by group or other;
-- no component may be a symlink.
+- no component may have an extended ACL;
+- regular-file and import-tree checks refuse symlinks;
+- executable symlinks are accepted only through `--resolve-symlinks`, which
+  checks every link object, every ancestor, and the eventual regular file.
 
 Ancestors matter because a root-owned file inside a user-writable directory
 can be replaced wholesale by renaming it. Checking only the leaf answers the
 wrong question.
 
-Symlinks are refused rather than followed, because a symlink is one more
-thing whose meaning can change between the check and the use.
+The tree check is bounded to 100,000 entries and 64 levels. It uses
+descriptor-relative `stat`, never follows a descendant symlink, refuses
+special files, and stops descending as soon as a directory fails. This checks
+the imported package files themselves. Checking only a `site-packages`
+directory misses an owner-writable `site-packages/cathedral/*.py` below it.
+
+On Linux, access and default POSIX ACL xattrs are refused. On Darwin, native
+ACL entries are refused. If ACL status cannot be inspected, the check fails
+closed. The supported policy is deliberately simple: trusted ownership and
+mode bits, with no extended ACL. `--allow-group-write` is an explicit escape
+hatch only for a group whose every member is trusted.
+
+## Install the checker trust anchor
+
+A checker imported from the venv or source tree it is checking is not a
+security boundary. A writable package could replace the checker before Python
+imports it. Install this file once as a root-owned standalone program, then
+run it with isolated OS Python and no site initialization:
+
+```bash
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
+sudo install -o root -g root -m 0755 \
+  cathedral/privileged_paths.py \
+  /usr/local/libexec/cathedral-privileged-paths.py
+```
+
+`/usr/bin/python3`, its standard library, and the installed checker are the
+bootstrap trust anchor. Their full ancestor chains must stay root-owned and
+non-writable by group or other. The example unit audits their current paths,
+but no program can establish its own integrity after an attacker has already
+replaced the program that is running. OS package integrity and root-only
+installation establish this first trust step.
 
 ## Checking
 
 ```bash
-python3 -m cathedral.privileged_paths /etc/cathedral/epoch.env.sh || exit 1
+/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+  /etc/cathedral/epoch.env.sh || exit 1
 set -a; . /etc/cathedral/epoch.env.sh; set +a
 ```
 
@@ -48,8 +82,30 @@ and exits 1. Defaults trust root alone; a service that legitimately runs
 under a dedicated system account passes that uid explicitly:
 
 ```bash
-python3 -m cathedral.privileged_paths --trusted-uid 0 --trusted-uid 991 /etc/cathedral/epoch.env.sh
+/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+  --trusted-uid 0 --trusted-uid 991 /etc/cathedral/epoch.env.sh
 ```
+
+A standard POSIX venv creates interpreter symlinks. Verify the complete link
+chain rather than rejecting the layout or following it blindly:
+
+```bash
+/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+  --resolve-symlinks /opt/cathedral-sn39/.venv/bin/python
+```
+
+Check every file below the two import roots used by the republisher:
+
+```bash
+/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+  --tree \
+  /opt/cathedral-sn39/cathedral \
+  /opt/cathedral-sn39/.venv/lib/python3.11/site-packages
+```
+
+The actual service runs Python with `-I`. This ignores `PYTHONPATH` and user
+site-packages, keeping imports inside the OS, venv, and source roots named by
+the unit.
 
 From Python:
 
@@ -64,24 +120,26 @@ operator everything to fix rather than one thing at a time.
 
 ## What it does not do
 
-**It only walks the target and its ancestors.** A sibling directory that the
-same process will later read is not covered. The important case is a
-virtualenv: `.venv/lib/python3.x/site-packages` is not an ancestor of
-`.venv/bin/python`, so checking the interpreter says nothing about the
-packages it imports — and site-packages is both where every `cathedral.*`
-module actually loads from and the directory `pip install` most often leaves
-owned by the deploying user. Name it explicitly, as the example unit does.
+The checker does not infer imports. The unit must name every import root and
+every separately read configuration or program file. The shipped example
+does so for the policy republisher: resolved OS and venv interpreters,
+`pyvenv.cfg`, the entry script, the Cathedral source tree, all venv
+site-packages, the registry, signing key, anti-rollback state, approval log,
+history directory, and the lock-file parent. The lock itself may not exist
+before the first run; the program opens it with `O_NOFOLLOW|O_CREAT` and checks
+the resulting inode. If the program starts using another import root or
+configuration file, the unit must add it.
 
-**The check runs on the interpreter it is checking.** If the chain is already
-loosened and exploited, the attacker's interpreter runs before the check can
-refuse. The preflight catches loosening, not an exploit already in place; the
-real mitigation is that the deployment root is root-owned in the first place.
+The standalone checker avoids importing from the inspected trees. It does not
+replace the OS trust anchor, package integrity, or root-only installation.
+Executing a checker after the checker or OS Python has already been replaced
+does not recover trust.
 
 It cannot close a time-of-check/time-of-use window that spans two processes:
 a shell that checks a path and then sources it has a gap no external checker
-can remove. What it is decisive about is the thing that actually matters
-here: a path that is **structurally** writable by an unprivileged user is
-refused every time, not only when someone happens to have modified it.
+can remove. Once every checked ancestor, file, tree entry, and ACL passes, an
+unprivileged user has no structural write path during that gap. A root change
+remains inside the trusted administrative boundary.
 
 For a real TOCTOU-free read inside one process, use the existing
 `_secure_read_bytes` helper in `scripts/cathedral_measurement_approval.py`,
@@ -94,10 +152,11 @@ which re-checks the descriptor after opening it.
    retains a home-directory `sys.prefix`.
 2. Move the environment file to `/etc/cathedral/`, `chown root:root`,
    `chmod 0600`.
-3. Add the preflight to the unit as `ExecStartPre`, not to a runbook. A check
+3. Install the standalone checker as the root-owned trust anchor above.
+4. Add the preflight to the unit as `ExecStartPre`, not to a runbook. A check
    an operator has to remember to run is a check that is not run.
-4. Re-run the preflight against every path the privileged unit touches,
-   including the interpreter itself.
+5. Check resolved interpreters, exact files, and complete import trees. Do not
+   substitute a parent-directory check for imported descendants.
 
 These are host operations. They are deliberately out of scope for the change
 that introduced this document, which ships the checker, its tests, and the

@@ -9,14 +9,17 @@ root-owned file inside a ``polaris``-writable directory can be replaced
 wholesale by renaming it.
 
 So the unit of trust is the **whole chain**: the target and every ancestor
-directory up to ``/`` must be owned by a trusted uid and must not be writable
-by group or other. Symlinks anywhere in the chain are refused rather than
-followed, because a symlink is one more thing whose meaning can change
-between the check and the use.
+directory up to ``/`` must be owned by a trusted uid, must not be writable by
+group or other, and must have no extended ACL. Regular-file and tree checks
+refuse symlinks. Executables use a separate resolved mode that checks every
+link object, each ancestor, and the eventual regular file.
 
-Usage from a privileged wrapper, before sourcing anything::
+Usage from a privileged wrapper, before sourcing anything, uses the
+root-installed standalone copy of this file rather than importing the package
+tree it is meant to inspect::
 
-    python3 -m cathedral.privileged_paths /etc/cathedral/epoch.env.sh || exit 1
+    /usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+        /etc/cathedral/epoch.env.sh || exit 1
     set -a; . /etc/cathedral/epoch.env.sh; set +a
 
 The check is advisory in the sense that it cannot close a TOCTOU window that
@@ -28,7 +31,9 @@ is refused every time, not just when someone happens to have modified it.
 from __future__ import annotations
 
 import os
+import re
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -36,6 +41,9 @@ from pathlib import Path, PurePath
 # Root only. An operator who deliberately runs a service under a dedicated
 # system account passes that account's uid explicitly.
 DEFAULT_TRUSTED_UIDS = frozenset({0})
+MAX_SYMLINKS = 40
+MAX_TREE_DEPTH = 64
+MAX_TREE_ENTRIES = 100_000
 
 
 class UntrustedPath(Exception):
@@ -75,12 +83,85 @@ def _chain(target: Path) -> list[Path]:
     return [absolute, *absolute.parents]
 
 
+def _acl_violations(target: Path) -> list[str]:
+    """Fail closed unless the path has no extended access-control list.
+
+    The privileged-path contract is deliberately narrower than attempting to
+    interpret every possible ACL: owner plus mode bits are the complete policy,
+    so any extended ACL is refused. Linux exposes POSIX access/default ACLs as
+    system xattrs. Darwin's ACLs are queried through the OS ``ls`` tool. An
+    unsupported platform or an inspection error is not treated as "no ACL".
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            names = {
+                os.fsdecode(name)
+                for name in os.listxattr(target, follow_symlinks=False)
+            }
+        except (AttributeError, OSError) as exc:
+            detail = getattr(exc, "strerror", None) or str(exc)
+            return [f"{target} ACL safety cannot be established ({detail})"]
+        acl_names = sorted(
+            name
+            for name in names
+            if name in {"system.posix_acl_access", "system.posix_acl_default"}
+        )
+        if acl_names:
+            return [
+                f"{target} has an extended POSIX ACL ({', '.join(acl_names)})"
+            ]
+        return []
+
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/bin/ls", "-lde", os.fspath(target)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return [f"{target} ACL safety cannot be established ({exc})"]
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"ls exited {result.returncode}"
+            return [f"{target} ACL safety cannot be established ({detail})"]
+        if any(re.match(r"^\s*\d+:\s", line) for line in result.stdout.splitlines()[1:]):
+            return [f"{target} has an extended Darwin ACL"]
+        return []
+
+    return [f"{target} ACL safety cannot be established on {sys.platform}"]
+
+
+def _mode_violations(
+    component: Path,
+    info: os.stat_result,
+    *,
+    trusted: frozenset[int],
+    allow_group_write: bool,
+    check_writable_bits: bool = True,
+    check_acl: bool = True,
+) -> list[str]:
+    violations: list[str] = []
+    if info.st_uid not in trusted:
+        violations.append(f"{component} is owned by {_describe_owner(info.st_uid)}")
+    writable_bits = stat.S_IWOTH if allow_group_write else (stat.S_IWGRP | stat.S_IWOTH)
+    if check_writable_bits and info.st_mode & writable_bits:
+        which = "group- or world-writable" if not allow_group_write else "world-writable"
+        violations.append(f"{component} is {which} (mode {info.st_mode & 0o7777:04o})")
+    if check_acl:
+        violations.extend(_acl_violations(component))
+    return violations
+
+
 def inspect_path(
     target: str | os.PathLike[str],
     *,
     trusted_uids: frozenset[int] | set[int] = DEFAULT_TRUSTED_UIDS,
     require_file: bool = True,
     allow_group_write: bool = False,
+    _allow_leaf_symlink: bool = False,
 ) -> PathVerdict:
     """Report every reason *target* is unsafe for a privileged process.
 
@@ -96,8 +177,6 @@ def inspect_path(
     absolute = Path(os.path.abspath(target))
     violations: list[str] = []
 
-    writable_bits = stat.S_IWOTH if allow_group_write else (stat.S_IWGRP | stat.S_IWOTH)
-
     for index, component in enumerate(_chain(absolute)):
         try:
             info = component.lstat()
@@ -109,25 +188,212 @@ def inspect_path(
             continue
 
         if stat.S_ISLNK(info.st_mode):
-            # Refused rather than resolved: a symlink is one more thing whose
-            # target can change between this check and the use.
-            violations.append(f"{component} is a symlink")
+            if index != 0 or not _allow_leaf_symlink:
+                violations.append(f"{component} is a symlink")
+            violations.extend(
+                _mode_violations(
+                    component,
+                    info,
+                    trusted=trusted,
+                    allow_group_write=allow_group_write,
+                    # Symlink mode bits are not access control. The parent
+                    # directory controls replacement of the link. Linux also
+                    # does not attach access ACLs to symlink objects.
+                    check_writable_bits=False,
+                    check_acl=False,
+                )
+            )
             continue
 
-        if info.st_uid not in trusted:
-            violations.append(f"{component} is owned by {_describe_owner(info.st_uid)}")
-
-        if info.st_mode & writable_bits:
-            which = "group- or world-writable" if not allow_group_write else "world-writable"
-            violations.append(f"{component} is {which} (mode {info.st_mode & 0o7777:04o})")
+        violations.extend(
+            _mode_violations(
+                component,
+                info,
+                trusted=trusted,
+                allow_group_write=allow_group_write,
+            )
+        )
 
         if index == 0:
             if require_file and not stat.S_ISREG(info.st_mode):
                 violations.append(f"{component} is not a regular file")
+            elif not require_file and not stat.S_ISDIR(info.st_mode):
+                violations.append(f"{component} is not a directory")
         elif not stat.S_ISDIR(info.st_mode):
             violations.append(f"{component} is not a directory")
 
     return PathVerdict(target=str(absolute), violations=tuple(violations))
+
+
+def _first_symlink(target: Path) -> tuple[Path, tuple[str, ...]] | None:
+    """Return the first symlink and the unresolved tail beneath it."""
+    absolute = Path(os.path.abspath(target))
+    parts = absolute.parts
+    current = Path(parts[0])
+    for index, part in enumerate(parts[1:], 1):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return current, tuple(parts[index + 1 :])
+    return None
+
+
+def inspect_resolved_path(
+    target: str | os.PathLike[str],
+    *,
+    trusted_uids: frozenset[int] | set[int] = DEFAULT_TRUSTED_UIDS,
+    allow_group_write: bool = False,
+) -> PathVerdict:
+    """Inspect a standard executable symlink chain and its final file.
+
+    Every link object, each link's ancestor chain, and the eventual regular
+    file are checked. This supports the symlinks created by a normal POSIX
+    virtualenv without treating an unchecked redirect as trusted.
+    """
+    if not isinstance(target, (str, PurePath, os.PathLike)):
+        raise TypeError("target must be a path")
+    trusted = frozenset(trusted_uids)
+    if not trusted:
+        raise ValueError("at least one trusted uid is required")
+
+    original = Path(os.path.abspath(target))
+    current = original
+    seen: set[str] = set()
+    violations: list[str] = []
+    for _ in range(MAX_SYMLINKS + 1):
+        found = _first_symlink(current)
+        if found is None:
+            final = inspect_path(
+                current,
+                trusted_uids=trusted,
+                allow_group_write=allow_group_write,
+            )
+            violations.extend(final.violations)
+            return PathVerdict(target=str(original), violations=tuple(dict.fromkeys(violations)))
+
+        link, tail = found
+        key = str(link)
+        if key in seen:
+            violations.append(f"{link} forms a symlink cycle")
+            return PathVerdict(target=str(original), violations=tuple(dict.fromkeys(violations)))
+        seen.add(key)
+
+        link_verdict = inspect_path(
+            link,
+            trusted_uids=trusted,
+            require_file=False,
+            allow_group_write=allow_group_write,
+            _allow_leaf_symlink=True,
+        )
+        violations.extend(link_verdict.violations)
+        try:
+            destination = Path(os.readlink(link))
+        except OSError as exc:
+            violations.append(f"{link} cannot be read ({exc.strerror})")
+            return PathVerdict(target=str(original), violations=tuple(dict.fromkeys(violations)))
+        if not destination.is_absolute():
+            destination = link.parent / destination
+        current = Path(os.path.abspath(destination.joinpath(*tail)))
+
+    violations.append(f"{original} exceeds the {MAX_SYMLINKS}-link safety limit")
+    return PathVerdict(target=str(original), violations=tuple(dict.fromkeys(violations)))
+
+
+def inspect_tree(
+    target: str | os.PathLike[str],
+    *,
+    trusted_uids: frozenset[int] | set[int] = DEFAULT_TRUSTED_UIDS,
+    allow_group_write: bool = False,
+    max_entries: int = MAX_TREE_ENTRIES,
+    max_depth: int = MAX_TREE_DEPTH,
+) -> PathVerdict:
+    """Inspect a complete import/source tree with bounded descriptor walking.
+
+    The tree root first has to pass the normal ancestor check. The walk then
+    uses ``os.fwalk`` and descriptor-relative ``stat`` calls, never follows a
+    symlink, refuses special files, and stops rather than descending into an
+    already-untrusted directory. Entry and depth limits make a hostile or
+    accidental giant tree a refusal instead of unbounded preflight work.
+    """
+    if not isinstance(target, (str, PurePath, os.PathLike)):
+        raise TypeError("target must be a path")
+    trusted = frozenset(trusted_uids)
+    if not trusted:
+        raise ValueError("at least one trusted uid is required")
+    if max_entries < 1 or max_depth < 0:
+        raise ValueError("tree limits must be positive")
+
+    root = Path(os.path.abspath(target))
+    root_verdict = inspect_path(
+        root,
+        trusted_uids=trusted,
+        require_file=False,
+        allow_group_write=allow_group_write,
+    )
+    violations = list(root_verdict.violations)
+    if violations:
+        return PathVerdict(target=str(root), violations=tuple(dict.fromkeys(violations)))
+
+    entries = 0
+    try:
+        walker = os.fwalk(root, topdown=True, follow_symlinks=False)
+        for directory, dirnames, filenames, descriptor in walker:
+            relative = Path(directory).relative_to(root)
+            depth = 0 if relative == Path(".") else len(relative.parts)
+            if depth > max_depth:
+                violations.append(f"{directory} exceeds the tree depth limit {max_depth}")
+                dirnames[:] = []
+                continue
+
+            for name, expected_directory in [
+                *((name, True) for name in sorted(dirnames)),
+                *((name, False) for name in sorted(filenames)),
+            ]:
+                entries += 1
+                path = Path(directory) / name
+                if entries > max_entries:
+                    violations.append(f"{root} exceeds the tree entry limit {max_entries}")
+                    dirnames[:] = []
+                    return PathVerdict(
+                        target=str(root), violations=tuple(dict.fromkeys(violations))
+                    )
+                try:
+                    info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except OSError as exc:
+                    violations.append(f"{path} cannot be inspected ({exc.strerror})")
+                    if expected_directory and name in dirnames:
+                        dirnames.remove(name)
+                    continue
+
+                if stat.S_ISLNK(info.st_mode):
+                    violations.append(f"{path} is a symlink")
+                    if expected_directory and name in dirnames:
+                        dirnames.remove(name)
+                    continue
+
+                item_violations = _mode_violations(
+                    path,
+                    info,
+                    trusted=trusted,
+                    allow_group_write=allow_group_write,
+                )
+                if expected_directory:
+                    if not stat.S_ISDIR(info.st_mode):
+                        item_violations.append(f"{path} is not a directory")
+                    if item_violations and name in dirnames:
+                        # One untrusted directory is enough to refuse the tree;
+                        # do not continue walking content its owner controls.
+                        dirnames.remove(name)
+                elif not stat.S_ISREG(info.st_mode):
+                    item_violations.append(f"{path} is not a regular file")
+                violations.extend(item_violations)
+    except OSError as exc:
+        violations.append(f"{root} cannot be walked safely ({exc.strerror})")
+
+    return PathVerdict(target=str(root), violations=tuple(dict.fromkeys(violations)))
 
 
 def require_trusted_path(
@@ -153,11 +419,12 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="python -m cathedral.privileged_paths",
+        prog="cathedral-privileged-paths",
         description=(
             "Refuse a path that a privileged process must not read or execute. "
             "Exits 0 when the target and every ancestor directory are owned by "
-            "a trusted uid and are not writable by group or other."
+            "a trusted uid, are not writable by group or other, and have no "
+            "extended ACL."
         ),
     )
     parser.add_argument("path", nargs="+", help="paths to check")
@@ -174,6 +441,16 @@ def main(argv: list[str] | None = None) -> int:
         help="the target is a directory rather than a regular file",
     )
     parser.add_argument(
+        "--resolve-symlinks",
+        action="store_true",
+        help="verify every link and the final regular file in an executable symlink chain",
+    )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="verify a bounded directory tree, including every imported descendant",
+    )
+    parser.add_argument(
         "--allow-group-write",
         action="store_true",
         help=(
@@ -183,15 +460,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    selected_modes = sum(
+        bool(value) for value in (args.directory, args.resolve_symlinks, args.tree)
+    )
+    if selected_modes > 1:
+        parser.error("--directory, --resolve-symlinks, and --tree are mutually exclusive")
+
     trusted = frozenset(args.trusted_uid) if args.trusted_uid else DEFAULT_TRUSTED_UIDS
     failed = False
     for candidate in args.path:
-        verdict = inspect_path(
-            candidate,
-            trusted_uids=trusted,
-            require_file=not args.directory,
-            allow_group_write=args.allow_group_write,
-        )
+        if args.resolve_symlinks:
+            verdict = inspect_resolved_path(
+                candidate,
+                trusted_uids=trusted,
+                allow_group_write=args.allow_group_write,
+            )
+        elif args.tree:
+            verdict = inspect_tree(
+                candidate,
+                trusted_uids=trusted,
+                allow_group_write=args.allow_group_write,
+            )
+        else:
+            verdict = inspect_path(
+                candidate,
+                trusted_uids=trusted,
+                require_file=not args.directory,
+                allow_group_write=args.allow_group_write,
+            )
         if verdict.trusted:
             print(f"ok {verdict.target}")
             continue

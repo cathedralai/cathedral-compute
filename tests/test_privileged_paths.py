@@ -11,17 +11,24 @@ Covers:
   2. A file owned by another user is refused even at mode 0600.
   3. A trusted file inside an untrusted or writable directory is refused,
      anywhere up the chain.
-  4. Symlinks are refused rather than followed.
+  4. Ordinary symlinks are refused; a standard venv executable chain is
+     accepted only after every link and final file pass.
   5. Group- and world-writable components are refused; --allow-group-write
      narrows to world-writable only.
-  6. Missing, non-regular, and non-directory components are refused.
-  7. Every violation is reported at once, and the CLI exits non-zero.
+  6. Extended ACLs and ACL-inspection failures are refused.
+  7. Every imported tree descendant is checked without following links.
+  8. Missing, non-regular, and non-directory components are refused.
+  9. Every violation is reported at once, and the CLI exits non-zero.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
+import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -29,6 +36,8 @@ import pytest
 from cathedral.privileged_paths import (
     UntrustedPath,
     inspect_path,
+    inspect_resolved_path,
+    inspect_tree,
     main,
     require_trusted_path,
 )
@@ -149,6 +158,37 @@ def test_a_symlinked_ancestor_is_refused(tmp_path: Path):
     assert any("is a symlink" in violation for violation in verdict.violations)
 
 
+def test_a_standard_venv_interpreter_symlink_chain_is_verified(tmp_path: Path, capsys):
+    """The example unit must not reject the layout Python creates by default."""
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    interpreter = environment / "bin" / "python"
+    if not interpreter.is_symlink():
+        pytest.skip("this platform's standard venv copies the interpreter")
+
+    # Homebrew's base interpreter lives below a macOS home-directory ACL. The
+    # production systemd example resolves into the OS-owned /usr tree. Keep the
+    # standard venv's bin/python link while putting the final test executable
+    # under tmp_path so this test exercises link resolution, not local Homebrew
+    # policy.
+    versioned = environment / "bin" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    if sys.platform == "darwin" and versioned.is_symlink():
+        base = versioned.resolve(strict=True)
+        versioned.unlink()
+        shutil.copy2(base, versioned)
+        versioned.chmod(0o755)
+
+    verdict = inspect_resolved_path(interpreter, trusted_uids=ACCEPT)
+    assert verdict.trusted, verdict.violations
+    assert main([
+        "--resolve-symlinks",
+        "--trusted-uid", str(ME),
+        "--trusted-uid", "0",
+        str(interpreter),
+    ]) == 0
+    assert "ok " in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # 5. Writability
 # ---------------------------------------------------------------------------
@@ -179,8 +219,78 @@ def test_the_default_refuses_group_write(tmp_path: Path):
     assert not inspect_path(target, trusted_uids=ACCEPT).trusted
 
 
+def test_an_extended_acl_is_refused_without_mode_bit_help(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    before = target.stat().st_mode & 0o777
+
+    if sys.platform == "darwin":
+        command = ["/bin/chmod", "+a", "everyone allow write", str(target)]
+    elif sys.platform.startswith("linux") and shutil.which("setfacl"):
+        command = [shutil.which("setfacl") or "setfacl", "-m", "u:nobody:rw", str(target)]
+    else:
+        pytest.skip("no supported ACL grant tool on this host")
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.skip(f"host refused the ACL test fixture: {result.stderr.strip()}")
+    assert target.stat().st_mode & 0o777 == before
+
+    verdict = inspect_path(target, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("ACL" in violation for violation in verdict.violations)
+
+
+def test_acl_inspection_failure_is_not_treated_as_no_acl(tmp_path: Path, monkeypatch):
+    _, target = _chain(tmp_path)
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("ACL backend unavailable")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "listxattr", unavailable, raising=False)
+    verdict = inspect_path(target, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any("ACL safety cannot be established" in item for item in verdict.violations)
+
+
 # ---------------------------------------------------------------------------
-# 6. Shape
+# 6. Complete import trees
+# ---------------------------------------------------------------------------
+
+def test_tree_refuses_a_writable_imported_package_file(tmp_path: Path):
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "cathedral"
+    package.mkdir(parents=True)
+    module = package / "policy_registry.py"
+    module.write_text("ATTACKER_CONTROLLED = True\n")
+    module.chmod(0o666)
+
+    verdict = inspect_tree(site_packages, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any(
+        str(module) in violation and "writable" in violation
+        for violation in verdict.violations
+    )
+
+
+def test_tree_refuses_descendant_symlinks_without_following_them(tmp_path: Path):
+    source = tmp_path / "cathedral"
+    source.mkdir()
+    real = source / "common.py"
+    real.write_text("VALUE = 1\n")
+    link = source / "policy.py"
+    link.symlink_to(real)
+
+    verdict = inspect_tree(source, trusted_uids=ACCEPT)
+    assert not verdict.trusted
+    assert any(
+        str(link) in violation and "symlink" in violation
+        for violation in verdict.violations
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Shape
 # ---------------------------------------------------------------------------
 
 def test_a_missing_target_is_refused(tmp_path: Path):
@@ -194,6 +304,13 @@ def test_a_directory_where_a_file_was_expected_is_refused(tmp_path: Path):
     verdict = inspect_path(directory, trusted_uids=ACCEPT)
     assert not verdict.trusted
     assert any("not a regular file" in violation for violation in verdict.violations)
+
+
+def test_a_file_where_a_directory_was_expected_is_refused(tmp_path: Path):
+    _, target = _chain(tmp_path)
+    verdict = inspect_path(target, trusted_uids=ACCEPT, require_file=False)
+    assert not verdict.trusted
+    assert any("not a directory" in violation for violation in verdict.violations)
 
 
 def test_a_fifo_is_refused(tmp_path: Path):
@@ -213,7 +330,7 @@ def test_invalid_arguments_are_rejected(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 7. CLI
+# 8. CLI and service integration
 # ---------------------------------------------------------------------------
 
 def test_cli_accepts_a_trusted_chain(tmp_path: Path, capsys):
@@ -249,3 +366,23 @@ def test_cli_defaults_to_root_only(tmp_path: Path, capsys):
     # is refused. This is the shape the deployed wrapper needed.
     assert main([str(target)]) == 1
     assert "is owned by" in capsys.readouterr().err
+
+
+def test_example_unit_uses_a_standalone_checker_and_complete_import_trees():
+    unit = (
+        Path(__file__).resolve().parents[1]
+        / "examples/systemd/cathedral-sn39-policy-republisher.service"
+    ).read_text()
+
+    assert "/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py" in unit
+    assert "-m cathedral.privileged_paths" not in unit
+    assert "--resolve-symlinks" in unit
+    assert "/opt/cathedral-sn39/.venv/pyvenv.cfg" in unit
+    assert "--tree" in unit
+    assert "/opt/cathedral-sn39/cathedral" in unit
+    assert "/opt/cathedral-sn39/.venv/lib/python3.11/site-packages" in unit
+    assert "/var/lib/cathedral-confidential-sn39/policy-state.sqlite" in unit
+    assert "/var/lib/cathedral-confidential-sn39/policy-republication.jsonl" in unit
+    assert "--directory" in unit
+    assert "/var/lib/cathedral-confidential-sn39/policy-history" in unit
+    assert "ExecStart=/opt/cathedral-sn39/.venv/bin/python -I " in unit
