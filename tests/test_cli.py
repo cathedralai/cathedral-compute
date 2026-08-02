@@ -9,6 +9,7 @@ from pathlib import Path
 
 import argparse
 import importlib
+import tomllib
 
 import pytest
 from cryptography import x509
@@ -42,6 +43,14 @@ from cathedral.gpu import (
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
+
+
+def test_compute_package_does_not_claim_subnet_validator_command():
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    scripts = pyproject["project"]["scripts"]
+
+    assert "cathedral-validator" not in scripts
+    assert scripts["cathedral-compute-validator"] == "cathedral.neuron.validator:main"
 
 
 def _tls_material(tmp_path: Path) -> tuple[Path, Path]:
