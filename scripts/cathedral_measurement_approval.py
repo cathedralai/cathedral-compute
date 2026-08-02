@@ -60,7 +60,10 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# The production -I -S bootstrap preloads the checked Cathedral package by
+# exact path. Development invocations keep the repository import behavior.
+if not sys.flags.no_site:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cathedral.common import evidence_report_data
 from cathedral.policy_registry import parse_registry_json, sign_registry, verify_registry

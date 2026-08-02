@@ -12,7 +12,56 @@ Group=root
 UMask=0077
 Restart=on-failure
 RestartSec=5min
-ExecStart=/home/polaris/cathedral-sn39/.venv/bin/python /home/polaris/cathedral-sn39/scripts/cathedral_measurement_approval.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
+
+# This unit runs as root, so every path it executes must be root-owned all
+# the way up. An interpreter or script under a user-writable directory is
+# that user's code running as root at the next timer firing, whatever the
+# file's own mode says. ProtectHome=read-only does not help: it stops this
+# service writing /home, not the owner of /home writing it first.
+#
+# The checker is a standalone, root-installed trust anchor. Do not import it
+# from the venv or source tree it is inspecting. -I -S keeps its imports in
+# the OS Python standard library. See docs/PRIVILEGED_PATHS.md for the install
+# command and the precise trust boundary.
+#
+# A standard POSIX venv uses interpreter symlinks. --resolve-symlinks verifies
+# every link object, every ancestor, and the final interpreter rather than
+# rejecting the standard layout or following it without inspection.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --resolve-symlinks \
+    /usr/bin/python3 \
+    /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-sn39/.venv/bin/python
+# These are the exact regular config and program files read by the service.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-sn39/.venv/pyvenv.cfg \
+    /opt/cathedral-sn39/scripts/cathedral_isolated_republisher.py \
+    /opt/cathedral-sn39/scripts/cathedral_measurement_approval.py \
+    /etc/cathedral/policy-registry-sn39.json \
+    /etc/cathedral/policy-signing-sn39.key \
+    /var/lib/cathedral-confidential-sn39/policy-state.sqlite
+# The approval log and lock may not exist before the first run. Existing leaves
+# must pass the complete file check. Missing leaves are accepted only when their
+# parent chain is trusted; the program then uses O_NOFOLLOW|O_CREAT and validates
+# the opened inode.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --creatable-file \
+    /var/lib/cathedral-confidential-sn39/policy-republication.jsonl \
+    /var/lib/cathedral-confidential-sn39/policy-writer.lock
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --directory \
+    /var/lib/cathedral-confidential-sn39 \
+    /var/lib/cathedral-confidential-sn39/policy-history
+# The bootstrap loads Cathedral by exact package path and imports third-party
+# wheels from the venv. Checking only the two root directories would miss a
+# writable cathedral/*.py or wheel file. --tree checks every descendant with
+# a bounded, no-symlink descriptor walk. The service also uses -S; its bootstrap
+# loads only these checked roots, so .pth redirects and sitecustomize are not
+# processed during startup. Adjust python3.11 to match the venv.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --tree \
+    /opt/cathedral-sn39/cathedral \
+    /opt/cathedral-sn39/.venv/lib/python3.11/site-packages
+# -I ignores Python environment and user-site inputs. -S prevents site from
+# executing .pth and sitecustomize. The stdlib-only bootstrap adds the checked
+# venv tree directly and loads Cathedral by exact checked package path.
+ExecStart=/opt/cathedral-sn39/.venv/bin/python -I -S /opt/cathedral-sn39/scripts/cathedral_isolated_republisher.py republish-install --registry /etc/cathedral/policy-registry-sn39.json --signing-key-file /etc/cathedral/policy-signing-sn39.key --state /var/lib/cathedral-confidential-sn39/policy-state.sqlite --operator cathedral-sn39-systemd --reason "scheduled bounded 24-hour freshness reissue" --approval-log /var/lib/cathedral-confidential-sn39/policy-republication.jsonl --history-dir /var/lib/cathedral-confidential-sn39/policy-history --lock-file /var/lib/cathedral-confidential-sn39/policy-writer.lock
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 DevicePolicy=closed
