@@ -1,12 +1,15 @@
 """Typed, bounded HTTPS-by-default client for a Cathedral miner worker."""
+
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import math
 import socket
 import ssl
 import string
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,9 +41,7 @@ _EVIDENCE_V2_RESPONSE_KEYS = _EVIDENCE_RESPONSE_KEYS | frozenset(
     {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
 )
 _EVIDENCE_BUNDLE_RESPONSE_KEYS = frozenset({"evidence"})
-_EVIDENCE_BUNDLE_ITEM_KEYS = _EVIDENCE_V2_RESPONSE_KEYS | frozenset(
-    {"composite_jwt"}
-)
+_EVIDENCE_BUNDLE_ITEM_KEYS = _EVIDENCE_V2_RESPONSE_KEYS | frozenset({"composite_jwt"})
 _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
 )
@@ -55,6 +56,83 @@ class RemoteError(Exception):
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         return None
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Read one socket response against an absolute deadline."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._deadline = deadline
+        self._raw = sock.makefile("rb", buffering=0)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request exceeded its total deadline")
+        self._sock.settimeout(remaining)
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._raw.close()
+            finally:
+                super().close()
+
+
+class _DeadlineSocketProxy:
+    """Give HTTPResponse a file whose receives share one deadline."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def settimeout(self, timeout: float) -> None:
+        self._sock.settimeout(timeout)
+
+    def makefile(
+        self,
+        mode: str = "r",
+        buffering: int | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        if mode not in {"r", "rb"}:
+            raise ValueError("deadline socket proxy is read-only")
+        raw = _DeadlineSocketReader(self._sock, self._deadline)
+        if buffering is None or buffering < 0:
+            buffering = io.DEFAULT_BUFFER_SIZE
+        if buffering == 0:
+            return raw
+        return io.BufferedReader(raw, buffering)
+
+
+def _deadline_response_class(deadline: float) -> type[http.client.HTTPResponse]:
+    class _DeadlineHTTPResponse(http.client.HTTPResponse):
+        def __init__(self, sock: socket.socket, *args: Any, **kwargs: Any) -> None:
+            super().__init__(_DeadlineSocketProxy(sock, deadline), *args, **kwargs)
+
+    return _DeadlineHTTPResponse
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    """Build one HTTP connection whose response shares one deadline."""
+
+    def __init__(self, deadline: float) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: Any) -> Any:
+        def connection_factory(host: str, **kwargs: Any) -> http.client.HTTPConnection:
+            connection = http.client.HTTPConnection(host, **kwargs)
+            connection.response_class = _deadline_response_class(self._deadline)
+            return connection
+
+        return self.do_open(connection_factory, req)
 
 
 class RemoteMiner:
@@ -103,8 +181,7 @@ class RemoteMiner:
         if ssl_context is not None and not isinstance(ssl_context, ssl.SSLContext):
             raise ValueError("ssl_context must be an SSLContext")
         if ssl_context is not None and (
-            ssl_context.verify_mode != ssl.CERT_REQUIRED
-            or not ssl_context.check_hostname
+            ssl_context.verify_mode != ssl.CERT_REQUIRED or not ssl_context.check_hostname
         ):
             raise ValueError("ssl_context must verify certificates and hostnames")
 
@@ -116,7 +193,6 @@ class RemoteMiner:
         self._bearer_token = bearer_token
         self._timeout = float(timeout)
         self._max_response_body = max_response_body
-        self._opener = urllib.request.build_opener(_RejectRedirects())
         self._ssl_context = ssl_context
         self._pending_binding: ChannelBinding | None = None
         self._trusted_binding: ChannelBinding | None = None
@@ -191,9 +267,7 @@ class RemoteMiner:
             return evidences
 
         expected = (
-            _EVIDENCE_V2_RESPONSE_KEYS
-            if self._scheme == "https"
-            else _EVIDENCE_RESPONSE_KEYS
+            _EVIDENCE_V2_RESPONSE_KEYS if self._scheme == "https" else _EVIDENCE_RESPONSE_KEYS
         )
         _check_exact_keys(response, expected, "evidence response")
         binding = observed_binding if self._scheme == "https" else None
@@ -324,9 +398,7 @@ class RemoteMiner:
     ) -> dict[str, Any]:
         response_body_limit = min(
             self._max_response_body,
-            self._max_response_body
-            if response_body_limit is None
-            else response_body_limit,
+            self._max_response_body if response_body_limit is None else response_body_limit,
         )
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
@@ -338,17 +410,17 @@ class RemoteMiner:
         if include_auth and self._bearer_token:
             request.add_header("Authorization", f"Bearer {self._bearer_token}")
 
+        deadline = time.monotonic() + self._timeout
+        opener = urllib.request.build_opener(
+            _RejectRedirects(),
+            _DeadlineHTTPHandler(deadline),
+        )
         try:
-            with self._opener.open(request, timeout=self._timeout) as response:
-                declared = response.headers.get("Content-Length")
-                if declared is not None:
-                    if not declared.isascii() or not declared.isdecimal():
-                        raise RemoteError("worker response has invalid length")
-                    if int(declared) > response_body_limit:
-                        raise RemoteError("worker response exceeds body limit")
-                raw = response.read(response_body_limit + 1)
-                if len(raw) > response_body_limit:
-                    raise RemoteError("worker response exceeds body limit")
+            with opener.open(
+                request,
+                timeout=_remaining_request_seconds(deadline),
+            ) as response:
+                raw = _read_response(response, response_body_limit)
         except RemoteError:
             raise
         except urllib.error.HTTPError as exc:
@@ -385,20 +457,21 @@ class RemoteMiner:
     ) -> tuple[dict[str, Any], ChannelBinding]:
         response_body_limit = min(
             self._max_response_body,
-            self._max_response_body
-            if response_body_limit is None
-            else response_body_limit,
+            self._max_response_body if response_body_limit is None else response_body_limit,
         )
+        deadline = time.monotonic() + self._timeout
         connection = http.client.HTTPSConnection(
             self._host,
             self._port,
-            timeout=self._timeout,
+            timeout=_remaining_request_seconds(deadline),
             context=self._ssl_context,
         )
+        connection.response_class = _deadline_response_class(deadline)
         try:
             connection.connect()
             if connection.sock is None:
                 raise RemoteError("worker TLS channel unavailable")
+            connection.sock.settimeout(_remaining_request_seconds(deadline))
             certificate = connection.sock.getpeercert(binary_form=True)
             try:
                 observed = tls_spki_binding(certificate)
@@ -408,13 +481,13 @@ class RemoteMiner:
                 self._trusted_binding = None
                 raise RemoteError("worker channel key changed")
 
-            body = json.dumps(
-                payload_factory(observed), separators=(",", ":")
-            ).encode("utf-8")
+            body = json.dumps(payload_factory(observed), separators=(",", ":")).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             if include_auth and self._bearer_token:
                 headers["Authorization"] = f"Bearer {self._bearer_token}"
+            connection.sock.settimeout(_remaining_request_seconds(deadline))
             connection.request("POST", path, body=body, headers=headers)
+            connection.sock.settimeout(_remaining_request_seconds(deadline))
             response = connection.getresponse()
             if 300 <= response.status < 400:
                 raise RemoteError("worker redirect rejected")
@@ -435,13 +508,26 @@ class RemoteMiner:
         return _decode_response(raw), observed
 
 
-def _read_response(response: http.client.HTTPResponse, cap: int) -> bytes:
-    declared = response.getheader("Content-Length")
+def _remaining_request_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RemoteError("worker request timed out")
+    return remaining
+
+
+def _read_response(response: Any, cap: int) -> bytes:
+    getheader = getattr(response, "getheader", None)
+    declared = (
+        getheader("Content-Length")
+        if callable(getheader)
+        else response.headers.get("Content-Length")
+    )
     if declared is not None:
         if not declared.isascii() or not declared.isdecimal():
             raise RemoteError("worker response has invalid length")
         if int(declared) > cap:
             raise RemoteError("worker response exceeds body limit")
+
     raw = response.read(cap + 1)
     if len(raw) > cap:
         raise RemoteError("worker response exceeds body limit")
@@ -482,9 +568,7 @@ def _evidence_from_response(
         _EVIDENCE_BUNDLE_ITEM_KEYS
         if bundle_item
         else (
-            _EVIDENCE_V2_RESPONSE_KEYS
-            if expected_binding is not None
-            else _EVIDENCE_RESPONSE_KEYS
+            _EVIDENCE_V2_RESPONSE_KEYS if expected_binding is not None else _EVIDENCE_RESPONSE_KEYS
         )
     )
     _check_exact_keys(response, expected_keys, "evidence component")
@@ -508,15 +592,10 @@ def _evidence_from_response(
         or len(quote_raw) > 2 * MAX_EVIDENCE_QUOTE_BYTES
     ):
         raise RemoteError("evidence response has invalid quote or kind")
-    if (
-        not isinstance(chain_raw, list)
-        or len(chain_raw) > MAX_EVIDENCE_CERTIFICATES
-    ):
+    if not isinstance(chain_raw, list) or len(chain_raw) > MAX_EVIDENCE_CERTIFICATES:
         raise RemoteError("evidence response has invalid certificate chain")
     if any(
-        not _is_hex(value)
-        or not value
-        or len(value) > 2 * MAX_EVIDENCE_CERTIFICATE_BYTES
+        not _is_hex(value) or not value or len(value) > 2 * MAX_EVIDENCE_CERTIFICATE_BYTES
         for value in chain_raw
     ):
         raise RemoteError("evidence response has invalid certificate chain")

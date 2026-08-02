@@ -9,8 +9,8 @@ pass and never reaches the tail.
 Covers:
   1. No budget preserves the historical unbounded behaviour exactly.
   2. Under a budget, the most overdue targets go first.
-  3. Neither class starves: new workers cannot push attested workers past
-     their evidence expiry, and a full subnet still admits newcomers.
+  3. Interior shares prevent either class from starving. The 0 and 1 endpoints
+     preserve their explicit single-class priority.
   4. Unused capacity spills between classes rather than being wasted.
   5. Deferral is not failure: no verdict, lifecycle state, or retry counter
      changes for a deferred target.
@@ -45,6 +45,8 @@ class FakeLifecycle:
     evidence_verified_at: datetime | None = None
     evidence_expires_at: datetime | None = None
     state_changed_at: datetime | None = None
+    generation: int = 1
+    revision: int = 1
 
 
 def new_worker(name: str) -> tuple[FakeEnrollment, FakeLifecycle]:
@@ -71,6 +73,7 @@ def names(targets: list[tuple[FakeEnrollment, FakeLifecycle]]) -> list[str]:
 # 1. No budget
 # ---------------------------------------------------------------------------
 
+
 def test_no_budget_keeps_every_target_in_the_original_order():
     due = [new_worker("5C"), attested("5A", expires_in=timedelta(minutes=1)), new_worker("5B")]
     selected, deferred = select_probe_targets(due, max_probes=None)
@@ -88,6 +91,7 @@ def test_a_budget_larger_than_the_due_set_defers_nothing():
 # ---------------------------------------------------------------------------
 # 2. Most overdue first
 # ---------------------------------------------------------------------------
+
 
 def test_the_most_overdue_refreshes_go_first_not_the_lowest_hotkeys():
     """The regression a naive truncation would cause."""
@@ -116,6 +120,7 @@ def test_ordering_is_deterministic_for_equally_overdue_targets():
 # 3. Neither class starves
 # ---------------------------------------------------------------------------
 
+
 def test_a_flood_of_new_workers_cannot_starve_attested_refreshes():
     """Open mode's sharpest abuse: zeroing honest supply by enrolling.
 
@@ -123,7 +128,9 @@ def test_a_flood_of_new_workers_cannot_starve_attested_refreshes():
     already-attested miners past their evidence expiry.
     """
     due = [new_worker(f"5N{index:03d}") for index in range(100)]
-    due += [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(4)]
+    due += [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(4)
+    ]
 
     selected, _ = select_probe_targets(due, max_probes=8, new_worker_share=0.25)
 
@@ -133,7 +140,9 @@ def test_a_flood_of_new_workers_cannot_starve_attested_refreshes():
 
 
 def test_a_full_subnet_of_refreshes_still_admits_new_workers():
-    due = [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(100)]
+    due = [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(100)
+    ]
     due += [new_worker("5NEW1"), new_worker("5NEW2")]
 
     selected, _ = select_probe_targets(due, max_probes=8, new_worker_share=0.25)
@@ -142,7 +151,9 @@ def test_a_full_subnet_of_refreshes_still_admits_new_workers():
 
 
 def test_a_share_that_rounds_to_zero_still_reserves_one_slot():
-    due = [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(20)]
+    due = [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(20)
+    ]
     due += [new_worker("5NEW1")]
 
     selected, _ = select_probe_targets(due, max_probes=3, new_worker_share=0.01)
@@ -150,7 +161,9 @@ def test_a_share_that_rounds_to_zero_still_reserves_one_slot():
 
 
 def test_a_zero_share_gives_new_workers_nothing_when_refreshes_fill_the_budget():
-    due = [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(10)]
+    due = [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(10)
+    ]
     due += [new_worker("5NEW1")]
 
     selected, deferred = select_probe_targets(due, max_probes=4, new_worker_share=0.0)
@@ -172,6 +185,7 @@ def test_a_one_slot_mixed_budget_is_rejected_instead_of_starving_refreshes():
 # 4. Spill
 # ---------------------------------------------------------------------------
 
+
 def test_unused_refresh_capacity_spills_to_new_workers():
     due = [new_worker(f"5N{index:03d}") for index in range(10)]
     due += [attested("5R001", expires_in=timedelta(minutes=1))]
@@ -184,7 +198,9 @@ def test_unused_refresh_capacity_spills_to_new_workers():
 
 
 def test_unused_new_worker_capacity_spills_to_refreshes():
-    due = [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(10)]
+    due = [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(10)
+    ]
     due += [new_worker("5NEW1")]
 
     selected, _ = select_probe_targets(due, max_probes=6, new_worker_share=0.25)
@@ -208,9 +224,12 @@ def test_selected_and_deferred_partition_the_due_set_exactly():
 # 5. Deferral is not failure
 # ---------------------------------------------------------------------------
 
+
 def test_deferred_targets_are_returned_untouched_not_marked_failed():
     """The function returns the same objects; it never mutates a verdict."""
-    due = [attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(6)]
+    due = [
+        attested(f"5R{index:03d}", expires_in=timedelta(minutes=index + 1)) for index in range(6)
+    ]
     before = [(enrollment, lifecycle) for enrollment, lifecycle in due]
 
     _, deferred = select_probe_targets(due, max_probes=2, new_worker_share=0.0)
@@ -224,6 +243,7 @@ def test_deferred_targets_are_returned_untouched_not_marked_failed():
 # ---------------------------------------------------------------------------
 # 6 & 7. Validation
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("budget", [0, -1])
 def test_a_non_positive_budget_is_rejected(budget: int):
@@ -249,6 +269,7 @@ def test_the_default_share_reserves_a_quarter():
 # ---------------------------------------------------------------------------
 # 8. Fairness inside the fresh class, and dispatch order under a deadline
 # ---------------------------------------------------------------------------
+
 
 def waiting(name: str, *, since: timedelta) -> tuple[FakeEnrollment, FakeLifecycle]:
     """A worker awaiting its first probe, enrolled *since* ago."""
@@ -280,19 +301,12 @@ def test_a_ground_low_sorting_hotkey_cannot_jump_the_fresh_queue():
     honest = [waiting(f"5H{index:03d}", since=timedelta(hours=2)) for index in range(4)]
     attacker = [waiting(f"1A{index:03d}", since=timedelta(seconds=1)) for index in range(20)]
 
-    selected, _ = select_probe_targets(
-        honest + attacker, max_probes=4, new_worker_share=1.0
-    )
+    selected, _ = select_probe_targets(honest + attacker, max_probes=4, new_worker_share=1.0)
     assert all(name.startswith("5H") for name in names(selected))
 
 
-def test_refreshes_are_dispatched_before_first_probes():
-    """The deadline drops what has not started, so order decides who loses.
-
-    A first probe that waits for the next pass loses nothing it had. An
-    attested worker that misses its refresh loses its evidence, and with it
-    its place in the scored set.
-    """
+def test_selection_preserves_refresh_priority_before_deadline_reordering():
+    """Selection stays refresh-first; probe_once makes the first wave fair."""
     due = [waiting(f"5N{index}", since=timedelta(hours=1)) for index in range(4)]
     due += [attested(f"5R{index}", expires_in=timedelta(minutes=index + 1)) for index in range(4)]
 
@@ -319,27 +333,238 @@ def test_deadline_without_count_budget_still_uses_the_fair_order():
     assert deferred == []
 
 
-def test_deadline_deferral_does_not_mutate_lifecycle_or_retry_state(
-    monkeypatch, tmp_path
-):
+def test_deadline_deferral_does_not_mutate_lifecycle_or_retry_state(monkeypatch, tmp_path):
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
-    hotkey = "5" + "D" * 47
-    store.enroll(hotkey, "http://127.0.0.1:9")
-    before = store.lifecycle_snapshot(hotkey)
+    hotkeys = ["5" + letter * 47 for letter in ("A", "B", "D")]
+    for index, hotkey in enumerate(hotkeys):
+        store.enroll(hotkey, f"http://127.0.0.1:{9000 + index}")
+    deferred_hotkey = hotkeys[-1]
+    before = store.lifecycle_snapshot(deferred_hotkey)
     monotonic_values = iter((0.0, 2.0))
-    monkeypatch.setattr(prober_module.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(
-        prober_module,
-        "_request_evidence",
-        lambda *_args, **_kwargs: pytest.fail("a deferred target performed network I/O"),
-    )
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return next(monotonic_values)
+
+    monkeypatch.setattr(prober_module, "time", FakeTime())
+    starts: list[str] = []
+
+    def fail_started_probe(_url, hotkey, _nonce, **_kwargs):
+        starts.append(hotkey)
+        raise OSError("synthetic first-wave failure")
+
+    monkeypatch.setattr(prober_module, "_request_evidence", fail_started_probe)
 
     assert not prober_module.probe_once(
         store,
         Policy(),
-        max_probes=2,
+        max_workers=2,
+        max_probes=3,
+        new_worker_share=1.0,
         deadline_seconds=1.0,
     )
 
-    after = store.lifecycle_snapshot(hotkey)
+    after = store.lifecycle_snapshot(deferred_hotkey)
+    assert deferred_hotkey not in starts
     assert after == before
+
+
+def test_a_two_class_deadline_rejects_one_effective_worker(tmp_path):
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+
+    with pytest.raises(ValueError, match="at least 2 effective workers"):
+        prober_module.probe_once(
+            store,
+            Policy(),
+            max_workers=1,
+            max_probes=2,
+            new_worker_share=0.25,
+            deadline_seconds=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("new_worker_share", "expected_prefix"),
+    [(0.0, "5REFRESH"), (1.0, "5FRESH")],
+)
+def test_deadline_endpoint_shares_keep_their_single_class_priority(
+    new_worker_share: float,
+    expected_prefix: str,
+):
+    due = [
+        attested(f"5REFRESH{index}", expires_in=timedelta(minutes=index + 1)) for index in range(3)
+    ]
+    due += [waiting(f"5FRESH{index}", since=timedelta(hours=3 - index)) for index in range(3)]
+    selected, _deferred = select_probe_targets(
+        due,
+        max_probes=4,
+        new_worker_share=new_worker_share,
+        deadline_active=True,
+    )
+
+    ordered = prober_module._deadline_fair_dispatch_order(
+        selected,
+        worker_count=1,
+        new_worker_share=new_worker_share,
+    )
+
+    assert ordered[0][0].hotkey.startswith(expected_prefix)
+
+
+def test_slow_refreshes_cannot_consume_the_fresh_reservation_across_passes(
+    monkeypatch,
+):
+    due = [
+        attested(f"5REFRESH{index}", expires_in=timedelta(minutes=index + 1)) for index in range(3)
+    ]
+    due.append(waiting("5FRESH", since=timedelta(hours=2)))
+    starts: list[str] = []
+
+    class FakeStore:
+        verification_ttl_seconds = 3600
+
+        def due_refreshes(self, **_kwargs):
+            return tuple(lifecycle for _enrollment, lifecycle in due)
+
+        def enrollments(self):
+            return tuple(enrollment for enrollment, _lifecycle in due)
+
+        def record_verdict(self, *_args, **_kwargs):
+            return None
+
+        def record_probe_failure(self, *_args, **_kwargs):
+            return None
+
+    # Per pass: compute expiry at 0, admit the two-worker first wave, then
+    # expire the deadline before the remaining two start. With the old
+    # refresh-first queue, both admitted starts were refreshes forever.
+    monotonic_values = iter((0.0, 2.0, 2.0) * 4)
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return next(monotonic_values)
+
+    # Replace only the prober's module reference. Patching the process-wide
+    # time.monotonic would also perturb ThreadPoolExecutor's own scheduling.
+    monkeypatch.setattr(prober_module, "time", FakeTime())
+
+    def record_start(_url, hotkey, _nonce, **_kwargs):
+        starts.append(hotkey)
+        return []
+
+    monkeypatch.setattr(prober_module, "_request_evidence", record_start)
+    monkeypatch.setattr(
+        prober_module,
+        "verify_cc_evidence_bundle",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    store = FakeStore()
+    for pass_number in range(4):
+        before = len(starts)
+        assert not prober_module.probe_once(
+            store,
+            Policy(),
+            max_workers=2,
+            max_probes=4,
+            new_worker_share=0.25,
+            deadline_seconds=1.0,
+        )
+        assert "5FRESH" in starts[before:], f"fresh class starved in pass {pass_number + 1}"
+
+    assert starts.count("5FRESH") == 4
+
+
+def test_successful_first_waves_rotate_through_both_class_tails():
+    @dataclass
+    class MutableLifecycle:
+        hotkey: str
+        evidence_verified_at: datetime | None = None
+        evidence_expires_at: datetime | None = None
+        state_changed_at: datetime | None = None
+
+    due: list[tuple[FakeEnrollment, MutableLifecycle]] = []
+    for index in range(3):
+        name = f"5REFRESH{index}"
+        due.append(
+            (
+                FakeEnrollment(name),
+                MutableLifecycle(
+                    name,
+                    evidence_verified_at=NOW - timedelta(hours=1),
+                    evidence_expires_at=NOW + timedelta(minutes=index + 1),
+                    state_changed_at=NOW - timedelta(hours=1),
+                ),
+            )
+        )
+    for index in range(3):
+        name = f"5FRESH{index}"
+        due.append(
+            (
+                FakeEnrollment(name),
+                MutableLifecycle(
+                    name,
+                    state_changed_at=NOW - timedelta(hours=3 - index),
+                ),
+            )
+        )
+
+    started: list[str] = []
+    for pass_number in range(3):
+        selected, _deferred = select_probe_targets(
+            due,
+            max_probes=4,
+            new_worker_share=0.25,
+            deadline_active=True,
+        )
+        first_wave = prober_module._deadline_fair_dispatch_order(
+            selected,
+            worker_count=2,
+            new_worker_share=0.25,
+        )[:2]
+        for _enrollment, lifecycle in first_wave:
+            started.append(lifecycle.hotkey)
+            lifecycle.evidence_verified_at = NOW + timedelta(seconds=pass_number + 1)
+            lifecycle.evidence_expires_at = NOW + timedelta(hours=1, seconds=pass_number + 1)
+
+    assert {f"5REFRESH{index}" for index in range(3)} <= set(started)
+    assert {f"5FRESH{index}" for index in range(3)} <= set(started)
+
+
+@pytest.mark.parametrize("deadline", [float("nan"), float("inf")])
+def test_non_finite_deadlines_are_rejected(deadline: float, tmp_path):
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        prober_module.probe_once(
+            store,
+            Policy(),
+            deadline_seconds=deadline,
+        )
+
+
+@pytest.mark.parametrize("raw_deadline", ["nan", "inf"])
+def test_cli_rejects_non_finite_deadlines(
+    raw_deadline: str,
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cathedral-prober",
+            "--once",
+            "--db",
+            str(tmp_path / "registry.sqlite"),
+            "--pass-deadline-seconds",
+            raw_deadline,
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        prober_module.main()
+
+    assert "finite and positive" in capsys.readouterr().err
