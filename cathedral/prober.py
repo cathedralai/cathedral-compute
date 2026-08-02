@@ -400,6 +400,7 @@ def select_probe_targets(
     *,
     max_probes: int | None,
     new_worker_share: float = DEFAULT_NEW_WORKER_SHARE,
+    deadline_active: bool = False,
 ) -> tuple[list[tuple[Any, Any]], list[tuple[Any, Any]]]:
     """Split the due set into this pass's targets and the deferred remainder.
 
@@ -430,12 +431,30 @@ def select_probe_targets(
     the pass deadline still decides who starts, and a set that fits in the
     budget can still exceed the clock.
     """
-    if max_probes is None:
-        return list(due), []
-    if max_probes < 1:
-        raise ValueError(f"max_probes must be at least 1, got {max_probes}")
     if not 0.0 <= new_worker_share <= 1.0:
         raise ValueError("new_worker_share must be between 0.0 and 1.0")
+    if max_probes is None and not deadline_active:
+        return list(due), []
+    if max_probes is not None and max_probes < 1:
+        raise ValueError(f"max_probes must be at least 1, got {max_probes}")
+    if (
+        max_probes is not None
+        and max_probes < 2
+        and 0.0 < new_worker_share < 1.0
+    ):
+        raise ValueError(
+            "max_probes must be at least 2 when new_worker_share reserves "
+            "capacity for both first probes and refreshes"
+        )
+
+    # A deadline can defer targets even without a count budget. In that mode
+    # every due target remains selected, but it must still use the fair order
+    # below. Otherwise the database's hotkey order lets the same low-sorting
+    # workers start first on every pass and starves the tail indefinitely.
+    if max_probes is None:
+        max_probes = len(due)
+        if max_probes == 0:
+            return [], []
 
     def _epoch_seconds(value: Any) -> float | None:
         try:
@@ -612,6 +631,7 @@ def probe_once(
         all_due,
         max_probes=max_probes,
         new_worker_share=new_worker_share,
+        deadline_active=deadline_seconds is not None,
     )
     all_reached = True
     if deferred:
@@ -999,6 +1019,15 @@ def main() -> None:
         parser.error("--max-probes must be at least 1")
     if not 0.0 <= args.new_worker_share <= 1.0:
         parser.error("--new-worker-share must be between 0.0 and 1.0")
+    if (
+        args.max_probes is not None
+        and args.max_probes < 2
+        and 0.0 < args.new_worker_share < 1.0
+    ):
+        parser.error(
+            "--max-probes must be at least 2 when --new-worker-share "
+            "reserves capacity for both first probes and refreshes"
+        )
     if args.pass_deadline_seconds is not None and args.pass_deadline_seconds <= 0:
         parser.error("--pass-deadline-seconds must be positive")
     if args.workers < 1:

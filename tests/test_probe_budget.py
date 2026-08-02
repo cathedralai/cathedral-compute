@@ -23,8 +23,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import cathedral.prober as prober_module
 import pytest
 
+from cathedral.common import Policy
+from cathedral.enroll import RegistryStore
 from cathedral.prober import DEFAULT_NEW_WORKER_SHARE, select_probe_targets
 
 NOW = datetime.now(UTC).replace(microsecond=0)
@@ -153,6 +156,16 @@ def test_a_zero_share_gives_new_workers_nothing_when_refreshes_fill_the_budget()
     selected, deferred = select_probe_targets(due, max_probes=4, new_worker_share=0.0)
     assert "5NEW1" not in names(selected)
     assert "5NEW1" in names(deferred)
+
+
+def test_a_one_slot_mixed_budget_is_rejected_instead_of_starving_refreshes():
+    due = [
+        waiting("5NEW", since=timedelta(hours=1)),
+        attested("5REFRESH", expires_in=timedelta(minutes=1)),
+    ]
+
+    with pytest.raises(ValueError, match="at least 2"):
+        select_probe_targets(due, max_probes=1, new_worker_share=0.25)
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +300,46 @@ def test_refreshes_are_dispatched_before_first_probes():
     dispatched = names(selected)
     assert all(name.startswith("5R") for name in dispatched[:4])
     assert all(name.startswith("5N") for name in dispatched[4:])
+
+
+def test_deadline_without_count_budget_still_uses_the_fair_order():
+    due = [
+        waiting("5AAA_newest", since=timedelta(minutes=1)),
+        waiting("5ZZZ_oldest", since=timedelta(hours=3)),
+        attested("5REFRESH", expires_in=timedelta(minutes=1)),
+    ]
+
+    selected, deferred = select_probe_targets(
+        due,
+        max_probes=None,
+        deadline_active=True,
+    )
+
+    assert names(selected) == ["5REFRESH", "5ZZZ_oldest", "5AAA_newest"]
+    assert deferred == []
+
+
+def test_deadline_deferral_does_not_mutate_lifecycle_or_retry_state(
+    monkeypatch, tmp_path
+):
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "D" * 47
+    store.enroll(hotkey, "http://127.0.0.1:9")
+    before = store.lifecycle_snapshot(hotkey)
+    monotonic_values = iter((0.0, 2.0))
+    monkeypatch.setattr(prober_module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(
+        prober_module,
+        "_request_evidence",
+        lambda *_args, **_kwargs: pytest.fail("a deferred target performed network I/O"),
+    )
+
+    assert not prober_module.probe_once(
+        store,
+        Policy(),
+        max_probes=2,
+        deadline_seconds=1.0,
+    )
+
+    after = store.lifecycle_snapshot(hotkey)
+    assert after == before
