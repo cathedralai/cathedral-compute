@@ -225,6 +225,42 @@ def inspect_path(
     return PathVerdict(target=str(absolute), violations=tuple(violations))
 
 
+def inspect_creatable_file(
+    target: str | os.PathLike[str],
+    *,
+    trusted_uids: frozenset[int] | set[int] = DEFAULT_TRUSTED_UIDS,
+    allow_group_write: bool = False,
+) -> PathVerdict:
+    """Inspect an existing file, or its directory when first-run creation is safe.
+
+    A missing leaf is safe to create only when its complete parent chain is
+    trusted. If the leaf already exists, it must pass the ordinary regular-file
+    check, including ownership, mode, symlink, and ACL rules. The parent check
+    also makes a create-after-check race unavailable to an untrusted user.
+    """
+    if not isinstance(target, (str, PurePath, os.PathLike)):
+        raise TypeError("target must be a path")
+    absolute = Path(os.path.abspath(target))
+    try:
+        absolute.lstat()
+    except FileNotFoundError:
+        parent = inspect_path(
+            absolute.parent,
+            trusted_uids=trusted_uids,
+            require_file=False,
+            allow_group_write=allow_group_write,
+        )
+        return PathVerdict(target=str(absolute), violations=parent.violations)
+    except OSError:
+        # Let inspect_path preserve its detailed fail-closed diagnostic.
+        pass
+    return inspect_path(
+        absolute,
+        trusted_uids=trusted_uids,
+        allow_group_write=allow_group_write,
+    )
+
+
 def _first_symlink(target: Path) -> tuple[Path, tuple[str, ...]] | None:
     """Return the first symlink and the unresolved tail beneath it."""
     absolute = Path(os.path.abspath(target))
@@ -317,6 +353,9 @@ def inspect_tree(
     symlink, refuses special files, and stops rather than descending into an
     already-untrusted directory. Entry and depth limits make a hostile or
     accidental giant tree a refusal instead of unbounded preflight work.
+    This inspects one named tree; it deliberately does not execute or infer
+    external redirects from ``.pth`` contents. Privileged Python startup must
+    disable site initialization or name and check those roots separately.
     """
     if not isinstance(target, (str, PurePath, os.PathLike)):
         raise TypeError("target must be a path")
@@ -448,7 +487,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tree",
         action="store_true",
-        help="verify a bounded directory tree, including every imported descendant",
+        help="verify every descendant under one bounded, named import tree",
+    )
+    parser.add_argument(
+        "--creatable-file",
+        action="store_true",
+        help=(
+            "verify an existing regular file, or its complete parent chain when "
+            "the leaf does not exist yet"
+        ),
     )
     parser.add_argument(
         "--allow-group-write",
@@ -461,15 +508,30 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     selected_modes = sum(
-        bool(value) for value in (args.directory, args.resolve_symlinks, args.tree)
+        bool(value)
+        for value in (
+            args.directory,
+            args.resolve_symlinks,
+            args.tree,
+            args.creatable_file,
+        )
     )
     if selected_modes > 1:
-        parser.error("--directory, --resolve-symlinks, and --tree are mutually exclusive")
+        parser.error(
+            "--directory, --resolve-symlinks, --tree, and --creatable-file "
+            "are mutually exclusive"
+        )
 
     trusted = frozenset(args.trusted_uid) if args.trusted_uid else DEFAULT_TRUSTED_UIDS
     failed = False
     for candidate in args.path:
-        if args.resolve_symlinks:
+        if args.creatable_file:
+            verdict = inspect_creatable_file(
+                candidate,
+                trusted_uids=trusted,
+                allow_group_write=args.allow_group_write,
+            )
+        elif args.resolve_symlinks:
             verdict = inspect_resolved_path(
                 candidate,
                 trusted_uids=trusted,

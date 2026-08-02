@@ -41,6 +41,11 @@ descriptor-relative `stat`, never follows a descendant symlink, refuses
 special files, and stops descending as soon as a directory fails. This checks
 the imported package files themselves. Checking only a `site-packages`
 directory misses an owner-writable `site-packages/cathedral/*.py` below it.
+The tree check does not interpret `.pth` contents. Python site initialization
+does, and a trusted `.pth` file can redirect imports or execute a line from an
+unchecked, user-writable tree. The republisher therefore runs with `-S`; a
+stdlib-only bootstrap adds the checked venv tree directly and loads Cathedral
+by exact checked package path.
 
 On Linux, access and default POSIX ACL xattrs are refused. On Darwin, native
 ACL entries are refused. If ACL status cannot be inspected, the check fails
@@ -103,9 +108,21 @@ Check every file below the two import roots used by the republisher:
   /opt/cathedral-sn39/.venv/lib/python3.11/site-packages
 ```
 
-The actual service runs Python with `-I`. This ignores `PYTHONPATH` and user
-site-packages, keeping imports inside the OS, venv, and source roots named by
-the unit.
+For a file that the program securely creates on first use, check the existing
+leaf when present or its complete parent chain when absent:
+
+```bash
+/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+  --creatable-file \
+  /var/lib/cathedral-confidential-sn39/policy-republication.jsonl \
+  /var/lib/cathedral-confidential-sn39/policy-writer.lock
+```
+
+The actual service runs Python with `-I -S`. `-I` ignores Python environment
+and user-site inputs. `-S` prevents `site` from processing `.pth` redirects or
+`sitecustomize`. The stdlib-only `cathedral_isolated_republisher.py` bootstrap
+then adds the checked venv `site-packages` tree without `site.addsitedir` and
+loads Cathedral from its exact checked package path.
 
 From Python:
 
@@ -123,12 +140,15 @@ operator everything to fix rather than one thing at a time.
 The checker does not infer imports. The unit must name every import root and
 every separately read configuration or program file. The shipped example
 does so for the policy republisher: resolved OS and venv interpreters,
-`pyvenv.cfg`, the entry script, the Cathedral source tree, all venv
-site-packages, the registry, signing key, anti-rollback state, approval log,
-history directory, and the lock-file parent. The lock itself may not exist
-before the first run; the program opens it with `O_NOFOLLOW|O_CREAT` and checks
-the resulting inode. If the program starts using another import root or
-configuration file, the unit must add it.
+`pyvenv.cfg`, the isolated bootstrap, the entry script, the Cathedral source
+tree, all venv site-packages, the registry, signing key, anti-rollback state,
+approval log, history directory, and lock file. The approval log and lock may
+not exist before the first run. `--creatable-file` checks their complete parent
+chain when absent and their full leaf checks when present; the program then
+opens each with `O_NOFOLLOW|O_CREAT` and validates the resulting inode. If the
+program starts using another import root or configuration file, the unit must
+add it. Any other privileged Python service that leaves site initialization
+enabled must separately audit every `.pth` redirect and executable line.
 
 The standalone checker avoids importing from the inspected trees. It does not
 replace the OS trust anchor, package integrity, or root-only installation.
@@ -156,8 +176,9 @@ which re-checks the descriptor after opening it.
 4. Add the preflight to the unit as `ExecStartPre`, not to a runbook. A check
    an operator has to remember to run is a check that is not run.
 5. Check resolved interpreters, exact files, and complete import trees. Do not
-   substitute a parent-directory check for imported descendants.
+   substitute a parent-directory check for imported descendants. Keep the
+   service on the checked `-I -S` bootstrap so `.pth` redirects never activate.
 
 These are host operations. They are deliberately out of scope for the change
-that introduced this document, which ships the checker, its tests, and the
-corrected example unit only.
+that introduced this document, which ships the checker, isolated bootstrap,
+tests, and corrected example unit only.

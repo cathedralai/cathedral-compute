@@ -16,8 +16,10 @@ Covers:
   5. Group- and world-writable components are refused; --allow-group-write
      narrows to world-writable only.
   6. Extended ACLs and ACL-inspection failures are refused.
-  7. Every imported tree descendant is checked without following links.
-  8. Missing, non-regular, and non-directory components are refused.
+  7. Every descendant under a named import root is checked without following
+     links; privileged startup disables unchecked .pth redirects.
+  8. Missing, non-regular, and non-directory components are refused, while a
+     securely creatable first-run leaf checks its complete parent chain.
   9. Every violation is reported at once, and the CLI exits non-zero.
 """
 
@@ -35,6 +37,7 @@ import pytest
 
 from cathedral.privileged_paths import (
     UntrustedPath,
+    inspect_creatable_file,
     inspect_path,
     inspect_resolved_path,
     inspect_tree,
@@ -189,6 +192,59 @@ def test_a_standard_venv_interpreter_symlink_chain_is_verified(tmp_path: Path, c
     assert "ok " in capsys.readouterr().out
 
 
+def test_no_site_blocks_a_trusted_pth_redirect_to_user_writable_sitecustomize(
+    tmp_path: Path,
+):
+    """-I alone still executes site hooks reached through a trusted .pth file."""
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    interpreter = environment / "bin" / "python"
+    site_packages = (
+        environment
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    assert site_packages.is_dir()
+
+    attacker_tree = tmp_path / "attacker-code"
+    attacker_tree.mkdir()
+    marker = tmp_path / "sitecustomize-ran"
+    (attacker_tree / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed as service user\\n')\n"
+    )
+    attacker_tree.chmod(0o777)
+    redirect = site_packages / "trusted-editable-redirect.pth"
+    redirect.write_text(
+        f"{attacker_tree}\n"
+        f"import runpy; runpy.run_path({str(attacker_tree / 'sitecustomize.py')!r})\n"
+    )
+    redirect.chmod(0o644)
+
+    # The .pth file itself is inside the trusted, recursively checked tree.
+    # Its path target is not. This is the exact gap -S closes for the service.
+    assert inspect_tree(site_packages, trusted_uids=ACCEPT).trusted
+    with_site = subprocess.run(
+        [interpreter, "-I", "-c", "pass"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert with_site.returncode == 0, with_site.stderr
+    assert marker.exists(), with_site.stdout + with_site.stderr
+
+    marker.unlink()
+    without_site = subprocess.run(
+        [interpreter, "-I", "-S", "-c", "pass"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert without_site.returncode == 0, without_site.stderr
+    assert not marker.exists()
+
+
 # ---------------------------------------------------------------------------
 # 5. Writability
 # ---------------------------------------------------------------------------
@@ -322,6 +378,28 @@ def test_a_fifo_is_refused(tmp_path: Path):
     assert stat.S_ISFIFO(fifo.lstat().st_mode)
 
 
+def test_a_creatable_file_checks_existing_leaf_or_missing_leaf_parent(tmp_path: Path):
+    directory = tmp_path / "state"
+    directory.mkdir()
+    candidate = directory / "approval.jsonl"
+
+    assert inspect_creatable_file(candidate, trusted_uids=ACCEPT).trusted
+    assert main([
+        "--creatable-file",
+        "--trusted-uid", str(ME),
+        "--trusted-uid", "0",
+        str(candidate),
+    ]) == 0
+
+    candidate.write_text("")
+    candidate.chmod(0o666)
+    assert not inspect_creatable_file(candidate, trusted_uids=ACCEPT).trusted
+
+    candidate.unlink()
+    directory.chmod(0o777)
+    assert not inspect_creatable_file(candidate, trusted_uids=ACCEPT).trusted
+
+
 def test_invalid_arguments_are_rejected(tmp_path: Path):
     with pytest.raises(ValueError, match="at least one trusted uid"):
         inspect_path(tmp_path, trusted_uids=set())
@@ -378,11 +456,66 @@ def test_example_unit_uses_a_standalone_checker_and_complete_import_trees():
     assert "-m cathedral.privileged_paths" not in unit
     assert "--resolve-symlinks" in unit
     assert "/opt/cathedral-sn39/.venv/pyvenv.cfg" in unit
+    assert "/opt/cathedral-sn39/scripts/cathedral_isolated_republisher.py" in unit
     assert "--tree" in unit
     assert "/opt/cathedral-sn39/cathedral" in unit
     assert "/opt/cathedral-sn39/.venv/lib/python3.11/site-packages" in unit
     assert "/var/lib/cathedral-confidential-sn39/policy-state.sqlite" in unit
     assert "/var/lib/cathedral-confidential-sn39/policy-republication.jsonl" in unit
+    assert "/var/lib/cathedral-confidential-sn39/policy-writer.lock" in unit
+    assert "--creatable-file" in unit
     assert "--directory" in unit
     assert "/var/lib/cathedral-confidential-sn39/policy-history" in unit
-    assert "ExecStart=/opt/cathedral-sn39/.venv/bin/python -I " in unit
+    assert "ExecStart=/opt/cathedral-sn39/.venv/bin/python -I -S " in unit
+
+
+def test_isolated_bootstrap_imports_checked_packages_without_running_pth(tmp_path: Path):
+    deployment = tmp_path / "deployment"
+    scripts = deployment / "scripts"
+    site_packages = (
+        deployment
+        / ".venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    source_package = deployment / "cathedral"
+    source_package.mkdir()
+    (source_package / "__init__.py").write_text("VALUE = 'checked source ok'\n")
+    bootstrap_source = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/cathedral_isolated_republisher.py"
+    )
+    bootstrap = scripts / bootstrap_source.name
+    shutil.copy2(bootstrap_source, bootstrap)
+    (site_packages / "required_dependency.py").write_text("VALUE = 'required import ok'\n")
+
+    attacker_tree = tmp_path / "attacker-bootstrap-code"
+    attacker_tree.mkdir()
+    marker = tmp_path / "bootstrap-sitecustomize-ran"
+    (attacker_tree / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('unexpected execution\\n')\n"
+    )
+    attacker_tree.chmod(0o777)
+    (site_packages / "editable-redirect.pth").write_text(
+        f"{attacker_tree}\nimport sitecustomize\n"
+    )
+    target = scripts / "cathedral_measurement_approval.py"
+    target.write_text(
+        "from cathedral import VALUE as SOURCE_VALUE\n"
+        "from required_dependency import VALUE\n"
+        "print(VALUE + '; ' + SOURCE_VALUE)\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", bootstrap],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "required import ok; checked source ok"
+    assert not marker.exists()
