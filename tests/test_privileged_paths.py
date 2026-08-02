@@ -246,17 +246,18 @@ def test_a_standard_venv_interpreter_symlink_chain_is_verified(tmp_path: Path, c
     if not interpreter.is_symlink():
         pytest.skip("this platform's standard venv copies the interpreter")
 
-    # Homebrew's base interpreter lives below a macOS home-directory ACL. The
-    # production systemd example resolves into the OS-owned /usr tree. Keep the
-    # standard venv's bin/python link while putting the final test executable
-    # under tmp_path so this test exercises link resolution, not local Homebrew
-    # policy.
+    # Development and hosted-CI interpreters can live below platform-managed
+    # writable modes or ACLs. The production systemd example resolves into the
+    # OS-owned /usr tree. Keep the standard venv's bin/python link while putting
+    # the final test executable under tmp_path so this test exercises link
+    # resolution rather than policy for the host's interpreter installation.
     versioned = environment / "bin" / f"python{sys.version_info.major}.{sys.version_info.minor}"
-    if sys.platform == "darwin" and versioned.is_symlink():
+    if versioned.is_symlink():
         base = versioned.resolve(strict=True)
         versioned.unlink()
-        shutil.copy2(base, versioned)
+        shutil.copyfile(base, versioned)
         versioned.chmod(0o755)
+    assert interpreter.is_symlink()
 
     verdict = inspect_resolved_path(interpreter, trusted_uids=ACCEPT)
     assert verdict.trusted, verdict.violations
