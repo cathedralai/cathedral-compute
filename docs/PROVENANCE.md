@@ -11,13 +11,15 @@ evidence — and exactly what each outcome means.
 > supported release, and clean outside-operator reproduction remain launch
 > gates. Locally green code and a signed receipt chain are not substitutes.
 
-> **Current compatibility: `FAIL` (audited 2026-07-25).** The deployed signed
-> vector currently advertises contract v1 and `verified_gpu_allocation`, and
-> does not carry `external_scores.latest_body_sha256`. This verifier requires
-> the v2 `fixed_burn_allocation` contract and exact body binding. Therefore the
-> current public vector cannot pass this repository's end-to-end comparison.
-> Publisher, validator, verifier, and release pins must converge before
-> independent reproduction can be claimed.
+> **Current compatibility: `FAIL` (audited 2026-08-04).** The public evidence
+> index and receipt chain verified for source epoch `1785815391`, but the signed
+> vector was bound to external-score epoch `1785815080`. Its signed
+> `latest_body_sha256` (`ab439625d96864b164977ed2e9ff3e48ef6501a84a1e0077897a7060c272452d`)
+> also differs from the verified manifest's authenticated report-body digest
+> (`4af4af51d615d93f0589175fb4c2002495177e2e5b995b292542cdf9e96e7e61`).
+> Therefore the current public vector cannot pass this repository's end-to-end
+> comparison. Publisher, validator, verifier, and release pins must converge
+> before independent reproduction can be claimed.
 
 ## Reproduction contract
 

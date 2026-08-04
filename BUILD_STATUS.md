@@ -19,12 +19,19 @@ verified for signature, freshness, policy, and provenance. A report with no
 positive entries must resolve fail-closed; it must not inherit this document's
 historical positive worker.
 
-**Current public contract comparison: `FAIL` (2026-07-25 audit).** The deployed
-vector advertises the v1 validated-supply shape, including
-`verified_gpu_allocation`, and omits `external_scores.latest_body_sha256`; the
-current verifier requires the v2 `fixed_burn_allocation` and exact body binding.
-The publisher, validator, verifier, and immutable release must converge before
-the public path can claim independent end-to-end reproduction.
+**Current public contract comparison: `FAIL` (2026-08-04 audit).** The
+read-only verifier accepted the latest signed evidence index and recomputed
+source epoch `1785815391`, but the signed public vector was still bound to
+ingested source epoch `1785815080`. Its
+`external_scores.latest_body_sha256`
+(`ab439625d96864b164977ed2e9ff3e48ef6501a84a1e0077897a7060c272452d`)
+also differed from the verified manifest's exact authenticated report-body
+digest
+(`4af4af51d615d93f0589175fb4c2002495177e2e5b995b292542cdf9e96e7e61`).
+Matching proportions cannot establish agreement across different source epochs
+or report bytes. The publisher, validator, verifier, and immutable release
+must converge before the public path can claim independent end-to-end
+reproduction.
 
 Testnet SN292 remains the non-paying dry-run integration lane.
 
@@ -61,7 +68,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 1484 tests collected. (Collected, not passing: the
+- Repository test suite: 1436 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)
