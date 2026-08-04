@@ -294,6 +294,7 @@ def run_proof(validator_repo: Path) -> dict[str, Any]:
     from cathedral_thin.e2e import run_e2e
     from cathedral_thin.score_classes import (
         AssignmentPolicy,
+        COMPUTE_REPORT_SCHEMA_V2,
         ExternalClassPolicy,
         canonical_json as validator_canonical_json,
         verify_report,
@@ -320,6 +321,7 @@ def run_proof(validator_repo: Path) -> dict[str, Any]:
                 required_reason_codes=("receipt_verified", "work_verified"),
                 required_evidence_kinds=("cathedral_assurance_receipt_v2",),
             ),
+            report_schema=COMPUTE_REPORT_SCHEMA_V2,
         )
         verified = verify_report(
             report,
@@ -355,6 +357,7 @@ def run_proof(validator_repo: Path) -> dict[str, Any]:
             run_e2e(
                 external_report_raw=report,
                 external_public_key=public_key,
+                external_report_schema=COMPUTE_REPORT_SCHEMA_V2,
             )
         )
         observed_receipts = validator["score_classes"]["receipt_evidence_ids"]

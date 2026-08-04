@@ -76,5 +76,5 @@ print('admitted', r.admitted); print('weights', r.weights); print('burn', r.burn
 
 - `cathedral` — operator CLI, including offline `customer-receipt verify`
 - `cathedral-census` — the CC capability probe
-- `cathedral-compute-validator` — compatibility wrapper for `cathedral runtime ...`
+- `cathedral-compute-runtime` — non-authoritative wrapper for `cathedral runtime ...`
 - `cathedral-miner` — compatibility wrapper for `cathedral worker ...`

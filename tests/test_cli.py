@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 from datetime import UTC, datetime, timedelta
@@ -45,12 +46,43 @@ from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
 
 
-def test_compute_package_does_not_claim_subnet_validator_command():
+def test_compute_package_exposes_only_a_non_authoritative_runtime_command():
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
     scripts = pyproject["project"]["scripts"]
 
     assert "cathedral-validator" not in scripts
-    assert scripts["cathedral-compute-validator"] == "cathedral.neuron.validator:main"
+    assert "cathedral-compute-validator" not in scripts
+    assert scripts["cathedral-compute-runtime"] == "cathedral.neuron.validator:main"
+
+
+def test_compute_runtime_entrypoint_has_no_chain_writer() -> None:
+    source = (Path(__file__).parents[1] / "cathedral/neuron/validator.py").read_text()
+    tree = ast.parse(source)
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    called_attributes = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    called_names = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert not any(module == "bittensor" or module.startswith("bittensor.") for module in imported_modules)
+    assert {"set_weights", "set_weights_extrinsic", "submit_weights"}.isdisjoint(
+        called_attributes | called_names
+    )
 
 
 def _tls_material(tmp_path: Path) -> tuple[Path, Path]:
@@ -1110,7 +1142,7 @@ def test_miner_wrapper_help_uses_worker_parser(capsys):
 def _tls_pair(tmp_path):
     """A throwaway self-signed cert so tls_enabled is genuinely true."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.x509.oid import NameOID
     from datetime import datetime, timedelta, UTC
