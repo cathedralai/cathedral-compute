@@ -39,6 +39,8 @@ NETWORK = "local"
 NETUID = 1
 SOURCE_EPOCH = 7
 CURRENT_BLOCK = 70
+ANCHOR_BLOCK = CURRENT_BLOCK
+ANCHOR_HASH = "0x" + hashlib.sha256(b"cathedral-thin-e2e-anchor-v1").hexdigest()
 HOTKEY_UNITS = {"honest-a": 1.0, "honest-a2": 1.0, "honest-b": 2.0}
 REGISTRY_SEED = hashlib.sha256(b"cathedral-thin-e2e-registry").digest()
 RECEIPT_SEED = hashlib.sha256(b"cathedral-thin-e2e-receipts").digest()
@@ -170,6 +172,10 @@ def _build_report(repo: Path, directory: Path) -> tuple[bytes, bytes, list[str],
         SOURCE_EPOCH,
         policy_registry_release=snapshot.release,
         policy_registry_digest=snapshot.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
     )
     receipt_ids: list[str] = []
     for hotkey, units in HOTKEY_UNITS.items():
@@ -250,6 +256,14 @@ def _build_report(repo: Path, directory: Path) -> tuple[bytes, bytes, list[str],
         score_netuid=NETUID,
     )
     verifier_digest = _verifier_digest(repo)
+    candidate_snapshot = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": NETWORK,
+        "netuid": NETUID,
+        "block": ANCHOR_BLOCK,
+        "block_hash": ANCHOR_HASH,
+        "hotkeys": sorted(HOTKEY_UNITS),
+    }
     report = export_score_class_report(
         ledger,
         epoch_id,
@@ -264,6 +278,7 @@ def _build_report(repo: Path, directory: Path) -> tuple[bytes, bytes, list[str],
         valid_from_block=CURRENT_BLOCK,
         valid_until_block=CURRENT_BLOCK + 10,
         verifier_digest=verifier_digest,
+        candidate_snapshot=candidate_snapshot,
         evidence_base_uri="https://evidence.local/receipts/",
     )
     return report, _public(SCORE_SEED), sorted(receipt_ids), verifier_digest
