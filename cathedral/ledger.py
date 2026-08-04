@@ -2178,6 +2178,44 @@ class Ledger:
             ).fetchone()
         return MappingProxyType(dict(row)) if row is not None else None
 
+    def work_evidence_for_receipt(
+        self, receipt: Mapping[str, object]
+    ) -> Mapping[str, str]:
+        """Export the immutable work sidecar bound to an issued receipt.
+
+        Artifacts are persisted before receipt issuance.  This method preserves
+        that ordering at the cross-repository boundary: it refuses a receipt
+        unless the durable row names the same challenge and receipt id, then
+        delegates digest binding to the versioned transport encoder.
+        """
+        if not isinstance(receipt, Mapping):
+            raise LedgerError("receipt is invalid")
+        receipt_id = receipt.get("receipt_id")
+        work = receipt.get("work")
+        if not isinstance(receipt_id, str) or not isinstance(work, Mapping):
+            raise LedgerError("receipt is invalid")
+        challenge_id = work.get("challenge_id")
+        if not isinstance(challenge_id, str) or not challenge_id:
+            raise LedgerError("receipt challenge is invalid")
+        recorded = self.receipt_for_challenge(challenge_id)
+        if recorded is None or recorded.get("receipt_id") != receipt_id:
+            raise LedgerError("receipt is not the durable record for its challenge")
+        artifacts = self.work_artifacts_for_challenge(challenge_id)
+        if artifacts is None:
+            raise LedgerError("receipt has no durable work artifacts")
+        from cathedral.work_evidence import WorkEvidenceError, build_work_evidence
+
+        try:
+            return MappingProxyType(
+                build_work_evidence(
+                    receipt,
+                    bytes(artifacts["work_item_body"]),
+                    bytes(artifacts["result_body"]),
+                )
+            )
+        except (KeyError, WorkEvidenceError) as exc:
+            raise LedgerError(f"receipt work artifacts are inconsistent: {exc}") from exc
+
     def receipt_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
         with self._lock:
             row = self._connection.execute(

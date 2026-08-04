@@ -11,7 +11,9 @@ create compatibility. Each leg is proved or refused with a concrete reason:
     is issuer output, not a test-assembled document: only the malformed blocks
     below are hand-assembled, because the issuer refuses to emit them;
   * the same receipt reaches the validator seam's `verify_lane_receipt` as a
-    PASS contribution;
+    PASS contribution only with its receipt-id-bound replayable work evidence;
+  * missing, substituted, or unit-inflating evidence is refused before either
+    consumer can credit the receipt;
   * the same receipt without `platform` still verifies here, and is refused by
     distill's compute lane on schema grounds (its `platform` is required), so
     the legacy behavior is explicit rather than assumed;
@@ -32,6 +34,7 @@ compatibility signal.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import importlib
 import json
 import os
@@ -41,9 +44,18 @@ from datetime import UTC, datetime
 
 import pytest
 
+from cathedral.lanes.sat import (
+    _canonical_instance,
+    _compute_challenge_id,
+    derived_work_units,
+    solve_sat,
+)
+from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.policy_registry import canonical_json
 from cathedral.receipt import ReceiptError, verify_receipt
 from cathedral.receipt_bridge import AnchoredReceiptKeyResolver
+from cathedral.runtime import _sat_manifest_bytes, _sat_result_bytes
+from cathedral.work_evidence import build_work_evidence
 
 from tests.test_receipt import (
     RECEIPT_SEED_1,
@@ -104,14 +116,46 @@ SOURCE_EPOCH = 11
 LANE_CPU = "cathedral_confidential_tdx"
 
 
+def _work_artifacts(subject: str = "public-hotkey") -> tuple[SatWorkItem, bytes, bytes]:
+    """Real canonical SAT bytes accepted by the Compute producer contract."""
+    seed = 7
+    instance = _canonical_instance(seed)
+    item = SatWorkItem(
+        instance=instance,
+        seed=seed,
+        challenge_id=_compute_challenge_id(instance, seed),
+    )
+    assignment = solve_sat(instance)
+    assert assignment is not None
+    certificate = SatCertificate(
+        satisfiable=True,
+        assignment=assignment,
+        # The raw miner claim remains part of the result digest but never sets
+        # the value that earns; the consumer derives it from the work item.
+        work_units=10.0**300,
+        challenge_id=item.challenge_id,
+        assigned_hotkey=subject,
+    )
+    return item, _sat_manifest_bytes(item), _sat_result_bytes(item, certificate)
+
+
 def _cross_repo_receipt(platform: object | None = CPU_PLATFORM, **issue_kwargs):
     """Issuer output: the real `ReceiptIssuer.issue()` path, with or without the
     optional platform block. This is what makes the compatibility claim about
     the production path rather than about a hand-built document."""
+    item, manifest_bytes, result_bytes = _work_artifacts()
+    issue_kwargs.setdefault("challenge_id", item.challenge_id)
+    issue_kwargs.setdefault(
+        "manifest_digest", "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    )
+    issue_kwargs.setdefault("work_result_bytes", result_bytes)
+    issue_kwargs.setdefault("work_units", float(derived_work_units(item)))
     snapshot, _policy, _claims, receipt = _issued_receipt(
         measurement=CROSS_MEASUREMENT, platform=platform, **issue_kwargs
     )
-    return snapshot, json.loads(receipt.receipt_bytes), receipt.receipt_bytes
+    document = json.loads(receipt.receipt_bytes)
+    evidence = build_work_evidence(document, manifest_bytes, result_bytes)
+    return snapshot, document, receipt.receipt_bytes, evidence
 
 
 def _assembled_receipt(platform: object):
@@ -139,11 +183,24 @@ def _distill_verify(document, snapshot, **overrides):
     return compute_receipt.verify_receipt(document, _resolver(snapshot), **kwargs)
 
 
+def _distill_lane_decision(document, snapshot, *, work_evidence):
+    return integrated_feed.verify_lane_receipt(
+        integrated_feed.KIND_COMPUTE_CPU,
+        document,
+        lane=LANE_CPU,
+        key_registry=_resolver(snapshot),
+        source_epoch=SOURCE_EPOCH,
+        now_iso=NOW_ISO,
+        consumption_ledger=integrated_feed.NO_REPLAY_LEDGER,
+        work_evidence=work_evidence,
+    )
+
+
 # --- leg (a) / audit minimum test 4 ---------------------------------------- #
 
 
 def test_extended_cathedral_receipt_verifies_in_the_distill_compute_lane():
-    snapshot, document, receipt_bytes = _cross_repo_receipt()
+    snapshot, document, receipt_bytes, evidence = _cross_repo_receipt()
     # Issuer output, unmodified: this is what ReceiptIssuer.issue() emits when a
     # caller supplies the optional platform block, so the compatibility claim is
     # about the production path and not about a document a test assembled.
@@ -156,15 +213,39 @@ def test_extended_cathedral_receipt_verifies_in_the_distill_compute_lane():
     assert compute_receipt.lane_contribution(verified) == {
         "miner_hotkey": "public-hotkey",
         "receipt_id": document["receipt_id"],
-        "work_units": "3.5",
+        "work_units": "20",
     }
+    assert _distill_lane_decision(document, snapshot, work_evidence=evidence).verdict == "PASS"
+
+
+def test_a_compute_receipt_without_replayable_work_evidence_is_refused():
+    snapshot, document, _bytes, _evidence = _cross_repo_receipt()
+    decision = _distill_lane_decision(document, snapshot, work_evidence=None)
+    assert decision.verdict == "FAIL"
+    assert "work evidence must be an object" in decision.detail
+    out = _validator_preview(document, snapshot)
+    assert out["audit"]["verdicts"]["pass"] == 0, out["audit"]
+    assert out["audit"]["verdicts"]["fail"] == 1, out["audit"]
+
+
+def test_work_evidence_cannot_be_reused_for_a_different_receipt():
+    snapshot, _document, _bytes, evidence = _cross_repo_receipt()
+    other_snapshot, other_document, _other_bytes, _other_evidence = _cross_repo_receipt(
+        epoch_id=8
+    )
+    assert snapshot.digest == other_snapshot.digest
+    decision = _distill_lane_decision(
+        other_document, other_snapshot, work_evidence=evidence
+    )
+    assert decision.verdict == "FAIL"
+    assert "different receipt" in decision.detail
 
 
 def test_distill_refuses_the_extended_receipt_when_the_key_is_not_anchored():
     # The adapter is the trust boundary, not a convenience: a registry that
     # does not carry the receipt's key resolves nothing, so the receipt is
     # refused even though its body is well formed.
-    snapshot, document, _bytes = _cross_repo_receipt()
+    snapshot, document, _bytes, _evidence = _cross_repo_receipt()
     other = _snapshot(
         receipt_keys=[_receipt_key("receipt-other-1", bytes(range(96, 128)))],
         measurement=CROSS_MEASUREMENT,
@@ -179,7 +260,7 @@ def test_distill_refuses_the_extended_receipt_when_the_key_is_not_anchored():
 
 
 def test_distill_refuses_the_extended_receipt_when_the_key_is_revoked():
-    snapshot, document, _bytes = _cross_repo_receipt()
+    snapshot, document, _bytes, _evidence = _cross_repo_receipt()
     revoked = _snapshot(
         receipt_keys=[
             _receipt_key(
@@ -217,7 +298,7 @@ def test_the_adapter_refuses_an_unauthenticated_registry_snapshot():
 
 
 def test_the_same_receipt_without_platform_still_verifies_here():
-    snapshot, _document, receipt_bytes = _cross_repo_receipt(platform=None)
+    snapshot, _document, receipt_bytes, _evidence = _cross_repo_receipt(platform=None)
     verified = verify_receipt(receipt_bytes, snapshot)
     assert "platform" not in verified.document
     assert verified.receipt_bytes == receipt_bytes
@@ -228,7 +309,7 @@ def test_a_platform_less_cathedral_receipt_is_refused_by_distill_on_schema_groun
     # `platform`, so the refusal is a missing-key schema refusal, not a key or
     # signature failure. Stated here so nobody reads leg (a) as "any Cathedral
     # receipt is admissible".
-    snapshot, document, _bytes = _cross_repo_receipt(platform=None)
+    snapshot, document, _bytes, _evidence = _cross_repo_receipt(platform=None)
     with pytest.raises(compute_receipt.ComputeReceiptError, match="platform"):
         _distill_verify(document, snapshot)
 
@@ -237,7 +318,7 @@ def test_a_platform_less_cathedral_receipt_is_refused_by_distill_on_schema_groun
 
 
 def test_platform_plus_an_unknown_top_level_key_is_rejected_on_both_sides():
-    snapshot, document, receipt_bytes = _cross_repo_receipt()
+    snapshot, document, receipt_bytes, _evidence = _cross_repo_receipt()
     document["evaluation"] = {"schema": distill_receipt.EVALUATION_SCHEMA}
     extended = _resign(document)
     with pytest.raises(ReceiptError, match="missing, unknown, or unsupported"):
@@ -326,7 +407,7 @@ class _CompositeResolver:
             return self._config_registry.resolve(key_id, at=at)
 
 
-def _validator_preview(document, snapshot, *, lane_receipts=None):
+def _validator_preview(document, snapshot, *, work_evidence=None, lane_receipts=None):
     fixtures = distill_testing.IntegrationFixtures(
         source_epoch=SOURCE_EPOCH,
         config_generated_at="2026-07-17T12:00:00Z",
@@ -338,7 +419,7 @@ def _validator_preview(document, snapshot, *, lane_receipts=None):
         if lane_receipts is not None
         else [
             thin_integration.LaneReceipt(
-                integrated_feed.KIND_COMPUTE_CPU, LANE_CPU, document
+                integrated_feed.KIND_COMPUTE_CPU, LANE_CPU, document, work_evidence
             )
         ]
     )
@@ -373,8 +454,8 @@ def _validator_preview(document, snapshot, *, lane_receipts=None):
 
 
 def test_the_extended_receipt_reaches_the_validator_preview_as_pass():
-    snapshot, document, _bytes = _cross_repo_receipt()
-    out = _validator_preview(document, snapshot)
+    snapshot, document, _bytes, evidence = _cross_repo_receipt()
+    out = _validator_preview(document, snapshot, work_evidence=evidence)
     audit = out["audit"]
     assert audit["verdicts"]["pass"] == 1, audit
     assert audit["verdicts"]["fail"] == 0
@@ -384,30 +465,24 @@ def test_the_extended_receipt_reaches_the_validator_preview_as_pass():
     assert lane["contributing"] is True
 
 
-def test_signer_asserted_work_units_cross_the_boundary_unchecked():
-    # The open cross-repo question, stated as behavior rather than prose: an
-    # extended receipt whose signed units were never derived is still admitted
-    # by distill's compute lane and still credited by the validator preview,
-    # because neither consumer requires the work artifacts this repo replays
-    # in FULL provenance (cathedral/workproof.py). See docs/RECEIPTS.md,
-    # "What work units bind", DECISION NEEDED.
-    # Issuer output again: the issuer signs the units it is handed, so this
-    # receipt is exactly what the production path emits for an undeserved
-    # number, not a hand-edited document.
-    snapshot, document, receipt_bytes = _cross_repo_receipt(work_units=999.0)
-    # This repo accepts it too: the receipt boundary checks canonical decimal,
-    # not derivation.
+def test_signer_asserted_work_units_are_refused_across_the_boundary():
+    # The source parser accepts a canonical signed number.  The Distill lane and
+    # validator must also replay the exact sidecar artifacts, so this receipt
+    # cannot earn an inflated value across repositories.
+    snapshot, document, receipt_bytes, evidence = _cross_repo_receipt(work_units=999.0)
     assert verify_receipt(receipt_bytes, snapshot).document["work"]["work_units"] == "999"
-    verified = _distill_verify(document, snapshot)
-    assert compute_receipt.lane_contribution(verified)["work_units"] == "999"
-    out = _validator_preview(document, snapshot)
-    assert out["audit"]["verdicts"]["pass"] == 1
+    decision = _distill_lane_decision(document, snapshot, work_evidence=evidence)
+    assert decision.verdict == "FAIL"
+    assert "sat_work_units_v1" in decision.detail
+    out = _validator_preview(document, snapshot, work_evidence=evidence)
+    assert out["audit"]["verdicts"]["pass"] == 0, out["audit"]
+    assert out["audit"]["verdicts"]["fail"] == 1, out["audit"]
 
 
 def test_a_platform_less_receipt_is_not_credited_by_the_validator_preview():
     # The same seam, the legacy receipt shape: no contribution, and the lane
     # allocation goes to burn rather than crediting unverified work.
-    snapshot, document, _bytes = _cross_repo_receipt(platform=None)
+    snapshot, document, _bytes, _evidence = _cross_repo_receipt(platform=None)
     out = _validator_preview(document, snapshot)
     audit = out["audit"]
     assert audit["verdicts"]["pass"] == 0, audit

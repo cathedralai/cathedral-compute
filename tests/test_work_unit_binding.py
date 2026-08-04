@@ -170,6 +170,23 @@ def test_independent_replay_rejects_correctly_signed_inflated_units():
         _replay(receipt, manifest_bytes, result_bytes)
 
 
+def test_durable_ledger_exports_receipt_bound_work_evidence(tmp_path):
+    """The cross-repository sidecar comes from immutable producer artifacts."""
+    from tests.test_evidence import CHALLENGE_ID as evidence_challenge_id
+    from tests.test_evidence import _completed_fresh_epoch
+
+    ledger, _epoch_id = _completed_fresh_epoch(tmp_path)
+    try:
+        row = ledger.receipt_for_challenge(evidence_challenge_id)
+        assert row is not None
+        receipt = json.loads(bytes(row["receipt_body"]))
+        evidence = ledger.work_evidence_for_receipt(receipt)
+        assert evidence["receipt_id"] == receipt["receipt_id"]
+        assert evidence["schema"] == "cathedral_compute_work_evidence_v1"
+    finally:
+        ledger.close()
+
+
 def test_the_miner_claim_inside_the_result_bytes_is_never_the_derivation():
     # The certificate the miner returned claims 1e300 units. It is bound into
     # the signed result digest for auditability, and the derivation ignores it.

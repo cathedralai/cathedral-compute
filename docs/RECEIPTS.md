@@ -130,31 +130,32 @@ That gap is why the durable work artifacts exist, and why FULL provenance
 requires them. It is pinned as executable behavior in
 [`tests/test_work_unit_binding.py`](../tests/test_work_unit_binding.py).
 
-### DECISION NEEDED: the cross-repo derivation contract
+### Cross-repository derivation contract
 
-Consumers in other repositories currently accept the signed units verbatim.
-The cathedral-distill compute lane validates decimal syntax, forwards the
-value as the lane contribution, and composition normalizes it; the validator
-seam that drives it credits the result. Neither requires the work artifacts,
-so across repository boundaries Compute units are signer-asserted. This is
-pinned in
+The Compute lane is creditable across repositories only with a
+`cathedral_compute_work_evidence_v1` sidecar. It carries the exact canonical
+SAT work-item and result bytes as canonical base64 and names the receipt id.
+The receipt already signs both artifact digests, so consumers verify all of:
+
+1. the sidecar's schema and exact field set;
+2. the sidecar receipt id equals the verified receipt id;
+3. the decoded bytes equal the receipt's signed manifest and result digests;
+4. the SAT instance, challenge id, miner assignment, and satisfying witness;
+5. the signed `work.work_units` equals the independent
+   `sat_work_units_v1` derivation.
+
+The producer exports this sidecar from the durable artifact record through
+[`cathedral/work_evidence.py`](../cathedral/work_evidence.py). The Distill
+compute lane performs the standalone replay before producing any lane
+contribution, and the validator forwards the same sidecar in its versioned
+receipt transport. A missing, substituted, oversized, noncanonical, or
+receipt-id-mismatched sidecar earns nothing.
+
+The signed receipt alone remains useful for historical receipt verification,
+but it is deliberately insufficient for cross-repository credit. The required
+end-to-end behavior, including rejection of a correctly signed inflated unit
+count, is pinned in
 [`tests/test_cross_repo_receipt_v2_contract.py`](../tests/test_cross_repo_receipt_v2_contract.py).
-
-Resolving it is an owner decision, not something this repository can close
-unilaterally, because it determines what a Compute contribution means to every
-consumer. The safe options are:
-
-1. independent derivation: require the published manifest and result artifacts
-   at the consumer and re-derive units there, exactly as FULL provenance does
-   here, so a receipt without replayable artifacts earns nothing;
-2. a versioned derivation or cap rule the consumer applies: the receipt names
-   its unit rule, and the consumer enforces that rule's bound before crediting,
-   so an out-of-rule number is refused rather than trusted;
-3. an explicit owner decision to keep the trusted-issuer model for Compute,
-   with the contract copy corrected everywhere to say that units are asserted
-   by an authorized signer rather than independently derived.
-
-No option is adopted here, and no unit economics are implied by this document.
 
 ## Canonical bytes and durable storage
 

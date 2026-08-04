@@ -167,7 +167,12 @@ def _snapshot(
     )
 
 
-def _claims(policy: Policy, *, work_status: ClaimStatus = ClaimStatus.PASSED):
+def _claims(
+    policy: Policy,
+    *,
+    work_status: ClaimStatus = ClaimStatus.PASSED,
+    work_result_bytes: bytes = b"work-result-material",
+):
     claims = attestation_claims(b"raw-quote-secret", policy, verified_at=ISSUED_TEXT)
     claims = with_verified_channel(
         claims,
@@ -176,7 +181,7 @@ def _claims(policy: Policy, *, work_status: ClaimStatus = ClaimStatus.PASSED):
     )
     work = evaluated_claim(
         work_status,
-        b"work-result-material",
+        work_result_bytes,
         SAT_WORK_POLICY_DIGEST,
         verified_at=ISSUED_TEXT,
         reason=(None if work_status is ClaimStatus.PASSED else ReasonCategory.WORK_INVALID),
@@ -232,10 +237,16 @@ def _issued_receipt(
     measurement: str = MEASUREMENT,
     platform: dict[str, object] | None = None,
     tier: Tier = Tier.CC_CPU_TDX,
+    manifest_digest: str = MANIFEST_DIGEST,
+    work_result_bytes: bytes = b"work-result-material",
 ):
     snapshot = _snapshot(measurement=measurement)
     policy = snapshot.to_policy(at=ISSUED)
-    claims = _claims(policy, work_status=work_status)
+    claims = _claims(
+        policy,
+        work_status=work_status,
+        work_result_bytes=work_result_bytes,
+    )
     attested = replace(_attested(claims, measurement=measurement), tier=tier)
     receipt = ReceiptIssuer(snapshot, "receipt-test-1", RECEIPT_SEED_1).issue(
         epoch_id=epoch_id,
@@ -248,7 +259,7 @@ def _issued_receipt(
             policy, claims, subject_hotkey, measurement=measurement
         ),
         challenge_id=challenge_id,
-        manifest_digest=MANIFEST_DIGEST,
+        manifest_digest=manifest_digest,
         work_units=(
             work_units
             if work_units is not None
