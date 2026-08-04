@@ -59,7 +59,7 @@ from cathedral.lifecycle import (
     WorkerLifecycleState,
 )
 from cathedral.poster import Poster
-from cathedral.receipt import ReceiptIssuer
+from cathedral.receipt import CPU_TEE_TDX, PLATFORM_CLASS_CPU, ReceiptIssuer
 from cathedral.remote import RemoteMiner
 from cathedral.score_audience import validate_score_audience
 from cathedral.verify import preflight_tdx_verifier, verify
@@ -1477,6 +1477,14 @@ class ConfidentialRuntime:
             challenge_id=item.challenge_id,
             manifest_digest=_sat_manifest_digest(item),
             work_units=work_units,
+            # Receipt issuance is disabled for the GPU runtime, and the CPU
+            # runtime only admits TDX attestation. Bind that verified identity
+            # into the signed receipt so downstream lanes can apply their
+            # CPU-TDX evidence grammar instead of trusting an untyped claim.
+            platform={
+                "class": PLATFORM_CLASS_CPU,
+                "cpu_tee": CPU_TEE_TDX,
+            },
         )
         issued_at = receipt.document["issued_at"]
         assert isinstance(issued_at, str)

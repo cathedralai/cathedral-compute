@@ -456,17 +456,13 @@ class ReceiptIssuer:
     ) -> AssuranceReceipt:
         """Issue one signed receipt.
 
-        `platform` is the optional cross-repo extension block and defaults to
-        None, so nothing is emitted unless a caller explicitly asks for it and
-        no existing caller's bytes change. When supplied it is validated by the
-        same `_validate_platform` the verifier applies, cross-checked against
-        the attested hardware so a non-TDX attestation can never be labeled
-        `intel_tdx`, and included in the document BEFORE the receipt id is
-        derived, so the id and signature cover it.
-
-        Whether the production runtime should start supplying it is a separate
-        deployment decision: verifiers of earlier releases reject any receipt
-        that carries the key, so acceptance has to ship everywhere first.
+        `platform` is the cross-repo extension block. It remains optional for
+        direct callers that need to inspect legacy receipt history; the live
+        CPU-TDX runtime always supplies it. When supplied it is validated by
+        the same `_validate_platform` the verifier applies, cross-checked
+        against the attested hardware so a non-TDX attestation can never be
+        labeled `intel_tdx`, and included in the document BEFORE the receipt
+        id is derived, so the id and signature cover it.
         """
         when_text = _format_time(issued_at if issued_at is not None else self._clock())
         when = _timestamp(when_text)

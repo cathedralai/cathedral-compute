@@ -14,9 +14,10 @@ create compatibility. Each leg is proved or refused with a concrete reason:
     PASS contribution only with its receipt-id-bound replayable work evidence;
   * missing, substituted, or unit-inflating evidence is refused before either
     consumer can credit the receipt;
-  * the same receipt without `platform` still verifies here, and is refused by
-    distill's compute lane on schema grounds (its `platform` is required), so
-    the legacy behavior is explicit rather than assumed;
+  * a legacy, platform-less receipt still verifies in this parser, and is
+    refused by distill's compute lane on schema grounds (its `platform` is
+    required), so backwards inspection behavior is explicit rather than
+    assumed;
   * a distill-shaped receipt does NOT verify here, and the structural gaps are
     asserted directly, so "the reverse direction is a rewrite" is a checked
     fact rather than a claim about an exception;
@@ -140,9 +141,11 @@ def _work_artifacts(subject: str = "public-hotkey") -> tuple[SatWorkItem, bytes,
 
 
 def _cross_repo_receipt(platform: object | None = CPU_PLATFORM, **issue_kwargs):
-    """Issuer output: the real `ReceiptIssuer.issue()` path, with or without the
-    optional platform block. This is what makes the compatibility claim about
-    the production path rather than about a hand-built document."""
+    """Real issuer output, with an explicit modern or legacy platform shape.
+
+    The live CPU-TDX runtime supplies the modern shape. Direct issuer calls
+    retain the legacy case solely to pin backward-inspection behavior.
+    """
     item, manifest_bytes, result_bytes = _work_artifacts()
     issue_kwargs.setdefault("challenge_id", item.challenge_id)
     issue_kwargs.setdefault(
@@ -201,9 +204,8 @@ def _distill_lane_decision(document, snapshot, *, work_evidence):
 
 def test_extended_cathedral_receipt_verifies_in_the_distill_compute_lane():
     snapshot, document, receipt_bytes, evidence = _cross_repo_receipt()
-    # Issuer output, unmodified: this is what ReceiptIssuer.issue() emits when a
-    # caller supplies the optional platform block, so the compatibility claim is
-    # about the production path and not about a document a test assembled.
+    # Issuer output, unmodified. The Runtime's CPU-TDX receipt path supplies
+    # this same signed platform block (covered in test_runtime.py).
     assert document["platform"] == CPU_PLATFORM
     assert verify_receipt(receipt_bytes, snapshot).document["platform"] == CPU_PLATFORM
     # And it verifies in distill through the authenticated registry adapter.
@@ -305,10 +307,10 @@ def test_the_same_receipt_without_platform_still_verifies_here():
 
 
 def test_a_platform_less_cathedral_receipt_is_refused_by_distill_on_schema_grounds():
-    # The legacy shape this runtime actually emits today. distill requires
-    # `platform`, so the refusal is a missing-key schema refusal, not a key or
-    # signature failure. Stated here so nobody reads leg (a) as "any Cathedral
-    # receipt is admissible".
+    # A legacy ReceiptIssuer call can still intentionally omit `platform` for
+    # backward inspection. Distill requires it, so the refusal is a missing-key
+    # schema refusal, not a key or signature failure. Stated here so nobody
+    # reads leg (a) as "any Cathedral receipt is admissible".
     snapshot, document, _bytes, _evidence = _cross_repo_receipt(platform=None)
     with pytest.raises(compute_receipt.ComputeReceiptError, match="platform"):
         _distill_verify(document, snapshot)

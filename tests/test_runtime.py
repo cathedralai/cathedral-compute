@@ -30,7 +30,7 @@ from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
-from cathedral.receipt import ReceiptIssuer, verify_receipt
+from cathedral.receipt import CPU_TEE_TDX, PLATFORM_CLASS_CPU, ReceiptIssuer, verify_receipt
 from cathedral.remote import RemoteError
 from cathedral.runtime import (
     SAT_WORK_POLICY_DIGEST,
@@ -656,6 +656,10 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
     assert verified.document["epoch_id"] == run.epoch_id
     assert verified.document["source_epoch"] == 11
     assert verified.document["subject_hotkey"] == "miner"
+    assert verified.document["platform"] == {
+        "class": PLATFORM_CLASS_CPU,
+        "cpu_tee": CPU_TEE_TDX,
+    }
     assert verified.document["work"]["challenge_id"] == outcome.challenge_id
     assert outcome.status == expected_outcome
     assert verified.document["work"]["status"] == expected_claim
