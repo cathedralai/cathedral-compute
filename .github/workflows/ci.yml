@@ -45,13 +45,17 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: cathedralai/cathedral-distill
-          ref: d5ce1485ccbf43dafa174da40988c88d4c357cf1
+          # Replayable Compute work evidence is required for cross-repository
+          # credit. Keep this immutable pin aligned with the reviewed contract.
+          ref: a80119cb21c2e1ba4da4d05a500387f2d8ca0e4b
           path: distill
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: cathedralai/cathedral-validator
-          ref: 9346c62dacc6cdfe95764e3cfdd7f4d85f732eee
+          # This pin includes policy-bound Compute v2 score reports; a v1
+          # fallback must never be mistaken for the current boundary.
+          ref: 77157996c51193a531149f538c581ea788054fbf
           path: validator
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
