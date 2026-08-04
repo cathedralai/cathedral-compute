@@ -11,15 +11,17 @@ evidence — and exactly what each outcome means.
 > supported release, and clean outside-operator reproduction remain launch
 > gates. Locally green code and a signed receipt chain are not substitutes.
 
-> **Current compatibility: `FAIL` (audited 2026-08-04).** The public evidence
-> index and receipt chain verified for source epoch `1785815391`, but the signed
-> vector was bound to external-score epoch `1785815080`. Its signed
-> `latest_body_sha256` (`ab439625d96864b164977ed2e9ff3e48ef6501a84a1e0077897a7060c272452d`)
-> also differs from the verified manifest's authenticated report-body digest
-> (`4af4af51d615d93f0589175fb4c2002495177e2e5b995b292542cdf9e96e7e61`).
-> Therefore the current public vector cannot pass this repository's end-to-end
-> comparison. Publisher, validator, verifier, and release pins must converge
-> before independent reproduction can be claimed.
+> **Current compatibility: `AGREE` at receipts-only assurance (audited
+> 2026-08-04).** A captured signed public vector and its declared evidence epoch
+> `1785816326` verified together. The vector's signed
+> `latest_body_sha256` and the evidence manifest's authenticated report-body
+> digest both equal
+> `8645ec79485cc38a78aff2040c450dc5fae1f87d4f92cff5680b4d1c7ae827b6`.
+> This proves the exact public vector/evidence contract, not FULL launch
+> provenance: raw controlled evidence and an independent candidate oracle are
+> still required for that separate assurance level. Capture the signed vector
+> and use `--vector-file` with its declared source epoch to avoid a harmless
+> race between the independently advancing index and live vector endpoints.
 
 ## Reproduction contract
 
@@ -52,6 +54,24 @@ cathedral provenance verify \
   --state-file ./verifier-state.json \
   --jsonl audit.jsonl --audit-out audit.json
 ```
+
+For an exact comparison against a moving public feed, first save the signed
+vector bytes and read its signed
+`policy_metadata.external_scores.latest_epoch`. Verify that exact epoch with
+the captured bytes rather than fetching the endpoint a second time:
+
+```bash
+curl --fail --silent --show-error \
+  https://api.cathedral.computer/v1/validator/weights/next > vector.json
+
+cathedral provenance verify ... \
+  --source-epoch <vector latest_epoch> \
+  --vector-file vector.json
+```
+
+`--vector-file` is bounded, rejects symlinks, and still verifies the vector's
+canonical JSON and pinned Ed25519 signature. It only removes the feed-update
+race; it does not relax evidence, epoch, report-body, or policy binding.
 
 Every pin (key digests, verifier implementation digest, source revision)
 comes from the release notes — never from anything the evidence surface

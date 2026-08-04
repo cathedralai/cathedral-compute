@@ -19,19 +19,20 @@ verified for signature, freshness, policy, and provenance. A report with no
 positive entries must resolve fail-closed; it must not inherit this document's
 historical positive worker.
 
-**Current public contract comparison: `FAIL` (2026-08-04 audit).** The
-read-only verifier accepted the latest signed evidence index and recomputed
-source epoch `1785815391`, but the signed public vector was still bound to
-ingested source epoch `1785815080`. Its
-`external_scores.latest_body_sha256`
-(`ab439625d96864b164977ed2e9ff3e48ef6501a84a1e0077897a7060c272452d`)
-also differed from the verified manifest's exact authenticated report-body
-digest
-(`4af4af51d615d93f0589175fb4c2002495177e2e5b995b292542cdf9e96e7e61`).
-Matching proportions cannot establish agreement across different source epochs
-or report bytes. The publisher, validator, verifier, and immutable release
-must converge before the public path can claim independent end-to-end
-reproduction.
+**Current public contract comparison: `AGREE` (2026-08-04 snapshot audit).**
+The read-only verifier captured a signed public vector, then verified its
+declared source epoch `1785816326` against the retained signed evidence
+manifest. Both the vector's `external_scores.latest_body_sha256` and the
+manifest's exact authenticated report-body digest were
+`8645ec79485cc38a78aff2040c450dc5fae1f87d4f92cff5680b4d1c7ae827b6`.
+The evidence chain and vector therefore agree for the exact published bytes.
+The result remains `NOT_PROVEN` at `receipts_only` assurance: it is an
+independent public E2E contract proof, not a FULL raw-evidence launch proof.
+
+The index and live vector endpoint advance independently. A verifier that
+fetches each at different times can correctly reject a cross-epoch comparison;
+use `cathedral provenance verify --source-epoch <vector epoch> --vector-file
+<captured-vector>` to verify one immutable signed vector/evidence pair.
 
 Testnet SN292 remains the non-paying dry-run integration lane.
 
@@ -68,7 +69,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 1436 tests collected. (Collected, not passing: the
+- Repository test suite: 1437 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)

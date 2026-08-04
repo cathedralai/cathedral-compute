@@ -37,6 +37,8 @@ from cathedral.evidence import (
     verify_index,
 )
 from cathedral.ledger import Ledger
+from cathedral.lanes.sat import _compute_challenge_id
+from cathedral.lanes.sat_types import SatInstance as _SatInstance
 from cathedral.lifecycle import (
     LifecycleReason,
     LifecycleSnapshot,
@@ -51,9 +53,6 @@ REGISTRY_SEED = bytes(range(32))
 RECEIPT_SEED = bytes(range(32, 64))
 REPORT_SEED = bytes(range(64, 96))
 INDEX_SEED = bytes(range(96, 128))
-
-from cathedral.lanes.sat import _compute_challenge_id
-from cathedral.lanes.sat_types import SatInstance as _SatInstance
 
 NOW = datetime.now(UTC).replace(microsecond=0)
 WINDOW_FROM = NOW - timedelta(hours=1)
@@ -2258,6 +2257,62 @@ def test_vector_mismatch_stays_fail_and_never_reserves_fences(
     assert events[-1]["status"] == "NOT_PROVEN"
     assert state_path.exists()
     assert real_fetch is not cli_module._bounded_https_fetch
+
+
+def test_signed_vector_snapshot_avoids_a_moving_publisher_race(
+    tmp_path: Path, exported_evidence, capsys, monkeypatch
+):
+    """A captured signed vector is verified against its exact evidence epoch.
+
+    The index and publisher feed can legitimately advance between two HTTP
+    reads.  A local snapshot closes that TOCTOU window, but still passes through
+    the same bounded read, strict parse, signature, and vector-comparison path.
+    """
+    import cathedral.cli as cli_module
+
+    evidence_dir, _summary = exported_evidence
+    store = EvidenceStore(evidence_dir)
+    index = json.loads((evidence_dir / "index.json").read_bytes())
+    manifest = parse_manifest(store.get_blob(index["latest"]["manifest"]))
+    public_hex = (
+        Ed25519PrivateKey.from_private_bytes(VECTOR_SEED)
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+    vector_path = tmp_path / "signed-vector.json"
+    vector_path.write_bytes(
+        _signed_wire_vector(
+            [_vector_row("public-hotkey", 1.0)],
+            body_sha256=manifest["wire_report_sha256"],
+        )
+    )
+    audit_path = tmp_path / "audit-snapshot.json"
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("vector snapshot verification reached the network")
+
+    monkeypatch.setattr(cli_module, "_bounded_https_fetch", no_network)
+    code = cli_main(
+        _verify_cli_args(tmp_path, evidence_dir)
+        + [
+            "--vector-file",
+            str(vector_path),
+            "--weight-policy-public-key-hex",
+            public_hex,
+            "--audit-out",
+            str(audit_path),
+            "--allow-receipts-only",
+        ]
+    )
+    events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    audit = json.loads(audit_path.read_text())
+
+    assert code == 0
+    assert audit["result"] == "NOT_PROVEN"
+    assert audit["vector_source"] == "snapshot"
+    assert audit["vector_agrees"] is True
+    assert any(event["event"] == "VECTOR_COMPARE_AGREES" for event in events)
 
 
 def test_bounded_local_reads_charge_the_shared_budget(tmp_path: Path):

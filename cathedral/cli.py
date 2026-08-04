@@ -2553,9 +2553,10 @@ def _reserve_fences(
 def cmd_provenance_verify(args: argparse.Namespace) -> int:
     """Independently verify the published evidence chain and recompute weights.
 
-    Exit 0 only when every stage PASSes (and, when a publisher URL is given,
-    the recomputation matches Cathedral's signed vector). Any failure is
-    fail-closed: exit 1 with a FAIL/NOT_PROVEN event naming the broken link.
+    Exit 0 only when every stage PASSes (and, when a publisher URL or signed
+    vector snapshot is given, the recomputation matches that vector). Any
+    failure is fail-closed: exit 1 with a FAIL/NOT_PROVEN event naming the
+    broken link.
     """
     import time as time_mod
 
@@ -2973,14 +2974,22 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             "recomputed_hotkey_weights": result.recomputed_hotkey_weights,
         }
 
-        if args.publisher_url:
+        vector_file = getattr(args, "vector_file", None)
+        if args.publisher_url or vector_file:
             started = time_mod.monotonic()
-            vector_bytes = _bounded_https_fetch(
-                args.publisher_url.rstrip("/") + "/v1/validator/weights/next",
-                max_bytes=MAX_VECTOR_ARTIFACT_BYTES,
-                allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
-                budget=command_budget,
-            )
+            if vector_file:
+                vector_bytes = _read_local_artifact(
+                    vector_file, MAX_VECTOR_ARTIFACT_BYTES, "weight vector snapshot"
+                )
+                vector_source = "snapshot"
+            else:
+                vector_bytes = _bounded_https_fetch(
+                    args.publisher_url.rstrip("/") + "/v1/validator/weights/next",
+                    max_bytes=MAX_VECTOR_ARTIFACT_BYTES,
+                    allow_private=bool(getattr(args, "allow_private_evidence_host", False)),
+                    budget=command_budget,
+                )
+                vector_source = "publisher"
             vector = _strict_json_object(vector_bytes, "weight vector")
             _verify_wire_vector(
                 vector,
@@ -2999,6 +3008,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 else None
             ) or {}
             audit["vector_id"] = vector.get("vector_id")
+            audit["vector_source"] = vector_source
             audit["vector_agrees"] = agree
             audit["vector_discrepancies"] = discrepancies
             # The SIGNED binding the agreement was checked against, for the
@@ -3923,13 +3933,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="reject a registry whose publication (generated_at) is older "
         "than this many seconds (default 24 hours, fail closed)",
     )
-    p_prov_verify.add_argument(
-        "--publisher-url", help="also fetch Cathedral's signed vector and compare"
+    vector = p_prov_verify.add_mutually_exclusive_group()
+    vector.add_argument("--publisher-url", help="fetch Cathedral's signed vector and compare")
+    vector.add_argument(
+        "--vector-file",
+        help="bounded local signed vector snapshot to verify without a moving-feed race",
     )
     p_prov_verify.add_argument(
         "--weight-policy-public-key-hex",
         default=os.environ.get("CATHEDRAL_WEIGHT_POLICY_PUBLIC_KEY", ""),
-        help="pinned weight-vector signing key (hex) for --publisher-url comparison",
+        help="pinned weight-vector signing key (hex) for vector comparison",
     )
     p_prov_verify.add_argument("--weight-policy-key-id", default="cathedral-weight-policy")
     p_prov_verify.add_argument("--jsonl", help="append JSONL events to this file")

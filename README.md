@@ -59,7 +59,7 @@ eligibility.
 | Validator-dispatched bounded SAT work | Current scored-work path |
 | Complete signed score reports with explicit zero revocation | Implemented |
 | Public evidence index | Deployed |
-| Deployed vector vs independent verifier | **Not converged.** The 2026-08-04 verifier accepted fresh evidence for epoch `1785815391` but the signed vector remained bound to epoch `1785815080`, so it failed closed. [BUILD_STATUS.md](BUILD_STATUS.md) is the dated evidence record |
+| Deployed vector vs independent verifier | **Agrees at receipts-only assurance.** On 2026-08-04, a captured signed vector and its source epoch `1785816326` matched the independently verified evidence manifest exactly. [BUILD_STATUS.md](BUILD_STATUS.md) records the separate FULL-provenance launch gate |
 | Mainnet SN39 | Live testing, operator-assisted |
 | Testnet SN292 | Non-paying integration lane |
 | Self-service miner enrollment | Not deployed; onboarding is maintainer-assisted |
