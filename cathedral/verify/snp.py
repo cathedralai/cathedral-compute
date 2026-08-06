@@ -2,7 +2,7 @@
 
 The verifier owns Cathedral policy and nonce binding. AMD owns the signature
 chain: when ``snpguest`` is available, this module shells out to it instead of
-hand-rolling vendor crypto. See docs/DESIGN.md §6 and HANDOFF.md §4.
+hand-rolling vendor crypto. See docs/DESIGN.md §6 and docs/history/HANDOFF.md §4.
 """
 
 from __future__ import annotations
