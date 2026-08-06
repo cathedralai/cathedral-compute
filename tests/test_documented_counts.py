@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # claim; the test then holds it to the same number.
 CLAIM = re.compile(r"(\d[\d,]*)\s*(?:passing\s+)?(tests|passed)\b", re.IGNORECASE)
 DOCUMENTED = (
+    "README.md",
     "BUILD_STATUS.md",
     "docs/LAUNCH_CANDIDATE.md",
 )

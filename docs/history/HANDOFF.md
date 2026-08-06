@@ -60,7 +60,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-python -m pytest -q             # expect the current full suite count from RUNTEST.md
+python -m pytest -q             # expect the current full suite count from ../TESTING.md
 python scripts/demo_sat.py      # expect: ... PASS
 python -m cathedral.census      # prints CC capability of THIS box (exit 1 if none)
 cathedral-compute-validator --help  # compatibility wrapper -> cathedral runtime ...
@@ -72,7 +72,7 @@ the SAT solve→verify→reject-forgery→reject-contradiction loop,
 emission-conserving economics (the current mechanism passes a zero floor), the work queue /
 tier-gated allocator, mock attestation with `chip_id` sybil dedup, TDX verifier
 adapter policy checks, and a full validator epoch (admit → run SAT → weights sum
-to ~1.0). See `RUNTEST.md` for the per-command breakdown.
+to ~1.0). See `../TESTING.md` for the per-command breakdown.
 
 If Track A is green, the subnet's logic is sound. Everything below is about
 swapping the *mock* attestation for the *real* thing.
@@ -260,7 +260,7 @@ produces weights. That is the first real proof the subnet gates on hardware.
 
 Track A (any box):
 - [ ] `pip install -e '.[dev]'` succeeds
-- [ ] `python -m pytest -q` matches the current count in `RUNTEST.md`
+- [ ] `python -m pytest -q` matches the current count in `../TESTING.md`
 - [ ] `python scripts/demo_sat.py` → **PASS**
 
 Track B (SNP box):
@@ -278,8 +278,8 @@ Track B (SNP box):
 
 ```
 docs/DESIGN.md            the founding design (products, lanes, emissions, attestation)
-HANDOFF.md                this file
-RUNTEST.md                per-command test breakdown
+HANDOFF.md                this file (historical)
+../TESTING.md             per-command test breakdown
 BUILD_SPEC.md             module responsibilities / file ownership from the build
 proto/evidence.proto      TEE evidence wire schema (SNP | TDX | GPU_CC)
 
@@ -348,4 +348,4 @@ build, point them at: this file §4, the two swap-in files
 `cathedral/common.py`, and `docs/DESIGN.md §6`. The task is bounded and the
 interface is frozen — it is "make `test_attest_snp_hw.py` green on the box
 without changing the existing hardware-free suite" (current count in
-`RUNTEST.md`).
+`../TESTING.md`).

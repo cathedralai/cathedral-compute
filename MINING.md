@@ -10,6 +10,60 @@ Cathedral SN39.
 > non-paying. Apply before registering or provisioning a new paid machine so a
 > maintainer can confirm current capacity and the supported release.
 
+## What a miner actually runs
+
+Read this section for the shape of the thing. Do not register a hotkey or buy a
+machine from it: the approval gate below decides whether any of it can earn, and
+step 3 is the first point at which registering is the right move.
+
+A compute miner earns on the TDX lane by doing attested confidential compute. It
+runs a worker **inside an Intel TDX confidential VM**, serves a fresh attestation
+quote bound to the validator's channel, and then does lane work. The validator
+verifies the quote and only then sends work. No SSH, and no trust in the host.
+
+This lane is hardware-gated. Production evidence must come from a real Intel TDX
+confidential VM, and the worker's TLS key must terminate *inside* the measured
+guest. A plain server cannot produce a valid channel claim.
+
+```bash
+git clone https://github.com/cathedralai/cathedral-compute.git
+cd cathedral-compute
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .
+```
+
+That installs the `cathedral` operator CLI. Inside the TDX VM, terminate TLS in
+the measured guest and serve the worker bound to that channel:
+
+```bash
+export MINER_HOTKEY=<your-hotkey-ss58>
+export TLS_SPKI_SHA256=<sha256 of your in-guest TLS SPKI>   # public, not a secret
+
+cathedral worker serve \
+  --hotkey "$MINER_HOTKEY" \
+  --channel-binding-type tls_spki_sha256 \
+  --channel-binding-digest "$TLS_SPKI_SHA256"
+```
+
+The validator requests attestation over TLS, verifies the quote binds your
+channel, then sends work and its bearer credential. Credit is proportional to
+verified work.
+
+See [docs/TDX_LAUNCH.md](docs/TDX_LAUNCH.md) for the full verifier contract and
+the five `CATHEDRAL_TDX_VERIFY_*` variables, and
+[docs/GPU_ATTESTATION.md](docs/GPU_ATTESTATION.md) for the GPU-composite path.
+
+### Develop without TDX hardware
+
+The `MockMiner` in `cathedral/neuron/miner.py` serves mock evidence, meaning the
+real REPORT_DATA binding and policy check without vendor crypto, and does real
+SAT work. It exercises the serve, verify, and score path on any machine. It
+cannot earn, because the validator runs the real vendor-crypto verifier in
+production, but it is the way to build and test a worker locally.
+
+Prerequisites: Python 3.11 or 3.12, and for production an Intel TDX confidential
+VM plus an SN39 hotkey registered **after** acceptance.
+
 ## Your measurement must be approved first
 
 This is the gate that stops most first attempts. Nothing else you do correctly

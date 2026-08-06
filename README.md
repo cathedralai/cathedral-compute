@@ -2,6 +2,22 @@
 
 **Intel TDX CPU evidence and verified-work scoring for Cathedral SN39.**
 
+<!-- VIDEO SLOT -----------------------------------------------------------
+Walkthrough video goes here, matching cathedral-distill's README.
+To publish: drag the file into any GitHub issue comment, copy the
+user-attachments URL it produces, paste it as `src` below, then delete
+these comment markers.
+
+<div align="center">
+  <video controls width="800" src="PASTE_GITHUB_USER_ATTACHMENTS_URL_HERE"></video>
+  <p><a href="PASTE_YOUTUBE_URL_HERE">Watch on YouTube</a></p>
+</div>
+------------------------------------------------------------------------ -->
+
+Attestation is admission, not payment. Registration, uptime, a valid quote,
+hardware ownership, or self-reported volume never earns weight on its own. Only
+verified work does, and positive weight and emissions are never guaranteed.
+
 > This repository was previously named `cathedralconfidential`. Old links
 > redirect here. The installed Python package and its console command keep the
 > historical `cathedral` identifier, and downstream validators pin this
@@ -17,10 +33,6 @@ evidence lane, not the publisher of final weights:
    or an explicit zero; and
 4. an independent SN39 validator checks that report and decides whether to set
    weights.
-
-**Attestation is admission, not payment.** Registration, uptime, a valid quote,
-hardware ownership, or self-reported volume never earns weight on its own. Only
-verified work does, and positive weight and emissions are never guaranteed.
 
 > **Status: mainnet live testing, operator-assisted.**
 >
@@ -155,10 +167,17 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-At `03a3b50` this reported 1391 passed, 9 skipped. The default suite uses test
-doubles behind the real verifier interface, so passing it proves software
-behavior. It does not prove live Intel hardware, deployment, a current eligible
-miner, or an on-chain write.
+The suite collects 1488 tests, and `tests/test_documented_counts.py` holds that
+number to this file, so it cannot quietly drift. The collected count is stated
+rather than a passing count, because the TDX and SEV-SNP suites skip unless the
+hardware is present, which means the passing total differs between a laptop and
+the TDX box.
+
+The default suite uses test doubles behind the real verifier interface, so
+passing it proves software behavior. It does not prove live Intel hardware,
+deployment, a current eligible miner, or an on-chain write.
+
+Per-command breakdown: [docs/TESTING.md](docs/TESTING.md).
 
 ## Documentation
 
@@ -183,8 +202,12 @@ miner, or an on-chain write.
 - [Key-release design](docs/KEY_RELEASE.md)
 
 Design documents describe intended capability, not deployed availability.
-Historical handoffs and dated launch-candidate records must not be used as
-current onboarding instructions.
+
+### Historical
+
+[docs/history/](docs/history/) holds superseded build plans and commissioning
+handoffs. They are kept for provenance and **must not** be used as current
+onboarding instructions. Start at [MINING.md](MINING.md) instead.
 
 ## Licensing
 
