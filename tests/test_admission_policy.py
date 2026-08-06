@@ -34,6 +34,7 @@ from cathedral.admission_policy import (
     sign_admission_policy,
     verify_admission_policy,
 )
+from cathedral.launch_limits import MAX_LAUNCH_CANDIDATES
 from cathedral.policy_registry import canonical_json
 
 SEED = bytes(range(128, 160))
@@ -322,6 +323,21 @@ def test_caps_must_be_bounded_positive_integers(value):
         verify(policy_bytes(max_endpoints=value))
     with pytest.raises(ValueError):
         verify(policy_bytes(max_total=value))
+
+
+def test_the_cap_ceiling_is_pinned_to_the_frozen_launch_cardinality():
+    """The ceiling is not a free parameter, so assert the pin, not the number.
+
+    The test above uses MAX_CAP_VALUE + 1, which holds for any ceiling and so
+    cannot notice the value moving. It was 100000 -- 24x MAX_LAUNCH_CANDIDATES
+    -- which let a validly signed policy authorize a population large enough
+    that Ledger.complete_epoch raises, so no epoch closes and nobody is paid.
+    A cap that can be signed above the cardinality the ledger will accept is a
+    liveness fault reachable through the normal configuration path.
+    """
+    assert MAX_CAP_VALUE == MAX_LAUNCH_CANDIDATES
+    with pytest.raises(ValueError):
+        verify(policy_bytes(max_total=MAX_LAUNCH_CANDIDATES + 1))
 
 
 def test_required_profile_ids_must_be_a_bounded_non_empty_identifier_list():

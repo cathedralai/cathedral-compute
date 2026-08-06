@@ -610,6 +610,51 @@ def test_the_total_worker_cap_is_enforced(tmp_path: Path):
     assert row(store, STRANGER_HOTKEY) is None
 
 
+def test_a_failed_worker_does_not_hold_the_total_cap(tmp_path: Path):
+    """FAILED must free its slot; REVOKED must not.
+
+    A failed worker is never probed again (NETWORK_ELIGIBLE_STATES excludes it)
+    and cannot legally return to PENDING, so counting it lets ordinary churn --
+    no attacker needed -- fill max_admitted_workers_total with dead rows and
+    close enrollment subnet-wide. Revocation is a punishment, so freeing that
+    slot would hand the owner a fresh one to retry from. Both halves are
+    asserted here because the whole rule is which states consume.
+    """
+    app, store, _ = build_app(
+        tmp_path,
+        policy=policy_bytes(mode="all_registered", coldkeys=[], max_total=1),
+        registered={HOTKEY: COLDKEY, STRANGER_HOTKEY: OTHER_COLDKEY},
+    )
+    assert call(app, v2_payload())[0] == 200
+
+    def _force(state: WorkerLifecycleState) -> None:
+        with sqlite3.connect(store.path) as conn:
+            conn.execute(
+                "UPDATE worker_lifecycle_current SET state = ? WHERE hotkey = ?",
+                (state.value, HOTKEY),
+            )
+
+    def _stranger(nonce: str) -> tuple[int, dict]:
+        return call(
+            app,
+            v2_payload(
+                keypair=STRANGER,
+                coldkey=OTHER_COLDKEY,
+                endpoint_url=ENDPOINT_TWO,
+                nonce=nonce,
+            ),
+        )
+
+    _force(WorkerLifecycleState.REVOKED)
+    status, body = _stranger("31" * 16)
+    assert status == 403, "a revoked worker must keep holding its slot"
+    assert body["error"] == "the subnet has reached its worker cap"
+
+    _force(WorkerLifecycleState.FAILED)
+    status, _ = _stranger("32" * 16)
+    assert status == 200, "a failed worker must not hold the cap forever"
+
+
 @pytest.mark.parametrize(
     "variant",
     [
