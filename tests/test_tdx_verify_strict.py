@@ -29,6 +29,7 @@ from cathedral.verify import (
     _read_bounded_subprocess,
     _require_static_linux_elf,
     _validate_production_tdx_configuration,
+    replay_verify_tdx,
     verify,
 )
 
@@ -441,3 +442,189 @@ def test_verifier_empty_stdout_rejects(tmp_path, monkeypatch):
     body = "pass  # prints nothing"
     monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path, body))
     assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is None
+
+
+# ---------------------------------------------------------------------------
+# Subprocess safety — the sanitized environment
+# ---------------------------------------------------------------------------
+
+
+def test_production_verifier_runs_with_a_sanitized_environment(tmp_path, monkeypatch):
+    """The pinned binary must not be steerable through the environment.
+
+    Pinning the verifier's BYTES is only half the guarantee. A dynamically
+    influenced process can still be redirected by what it inherits:
+    LD_LIBRARY_PATH and LD_PRELOAD change which code actually runs, and
+    collateral or proxy variables change which revocation data it trusts. So
+    the content pin and the environment sanitization are one control, and the
+    sweep found neither half held:
+
+      pinned replay no longer forces production_mode  SURVIVED
+      drop the sanitized cwd                          SURVIVED
+      drop the sanitized env entirely                 SURVIVED
+
+    This asserts what the child actually receives rather than that the flag was
+    passed, because the flag being passed is what the mutants left intact.
+    """
+    nonce = issue_nonce()
+    hotkey = "hk-sanitized-1"
+    rd_hex = report_data(nonce, hotkey).hex()
+    dump = tmp_path / "child-env.json"
+
+    stable_id = "tdx-platform-sha256:" + "a" * 64
+    claims = {
+        "advisory_ids": [],
+        "claims_bound_to_quote": True,
+        "collateral_current": True,
+        "debug_enabled": False,
+        "intel_verified": True,
+        "measurement": "m1",
+        "platform_id": stable_id,
+        "platform_identity_kind": "stable",
+        "platform_identity_verified": True,
+        "report_data": rd_hex,
+        "report_data_match": True,
+        "stable_platform_id": stable_id,
+        "tcb": 0,
+        "tcb_status": "UpToDate",
+        "tcb_svn": "0d010800000000000000000000000000",
+        "tdx_attestation_key_id": "tdx-ak-sha256:" + "c" * 64,
+        "tdx_pck_cert_id": "tdx-pck-cert-sha256:" + "b" * 64,
+    }
+    body = (
+        "import json, os\n"
+        f"open({str(dump)!r}, 'w').write(json.dumps("
+        "{'env': dict(os.environ), 'cwd': os.getcwd()}))\n"
+        f"print({json.dumps(json.dumps(claims))})"
+    )
+    command = _fake_verifier(tmp_path, body)
+
+    # Exactly the variables that make a pinned binary steerable.
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/attacker-libs")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/attacker.so")
+    monkeypatch.setenv("SGX_AESM_ADDR", "1")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", "/opt/cathedral/tdx-verifier")
+    monkeypatch.setattr(
+        "cathedral.verify._production_tdx_command", lambda _command: command.split()
+    )
+
+    assert verify(_make_evidence(nonce, hotkey), nonce, _production_policy("m1")) is not None
+
+    child = json.loads(dump.read_text())
+    # Dunder-prefixed names are injected by the platform itself regardless of
+    # the env passed to the child (macOS adds __CF_USER_TEXT_ENCODING), so they
+    # are not inherited configuration and cannot be attacker-set. Everything
+    # else must be exactly the sanitized set.
+    inherited = {k: v for k, v in child["env"].items() if not k.startswith("__")}
+    assert inherited == {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}, (
+        "the production verifier inherited environment beyond the sanitized set; "
+        f"a pinned binary is steerable through it: {sorted(inherited)}"
+    )
+    assert child["cwd"] == "/", f"expected a fixed working directory, got {child['cwd']!r}"
+
+    for leaked in ("LD_LIBRARY_PATH", "LD_PRELOAD", "SGX_AESM_ADDR"):
+        assert leaked not in child["env"]
+
+
+def test_development_verifier_still_inherits_its_environment(tmp_path, monkeypatch):
+    """The other direction, so the test above cannot pass by sanitizing always.
+
+    Development runs deliberately inherit, which is why the sanitization is
+    conditional and therefore worth pinning: the condition is the control.
+    """
+    nonce = issue_nonce()
+    hotkey = "hk-sanitized-2"
+    rd_hex = report_data(nonce, hotkey).hex()
+    dump = tmp_path / "dev-env.json"
+
+    body = (
+        "import json, os\n"
+        f"open({str(dump)!r}, 'w').write(json.dumps({{'env': dict(os.environ)}}))\n"
+        + _good_claims_body(rd_hex, "m1", "p1")
+    )
+    monkeypatch.setenv("CATHEDRAL_MARKER_FOR_TEST", "inherited")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path, body))
+
+    assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is not None
+    assert json.loads(dump.read_text())["env"].get("CATHEDRAL_MARKER_FOR_TEST") == "inherited"
+
+
+def _executable_fake_verifier(tmp_path, body: str) -> str:
+    """A single absolute executable, which is the shape replay demands.
+
+    The replay path accepts exactly one absolute path, so the usual
+    "python script.py" two-element command cannot be used. An absolute shebang
+    also survives the sanitized PATH, which only contains /usr/bin and /bin.
+    """
+    script = tmp_path / "pinned_verifier"
+    script.write_text(f"#!{sys.executable}\nimport sys\n_q = open(sys.argv[1], 'rb').read()\n{body}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_pinned_replay_sanitizes_even_under_a_non_production_policy(tmp_path, monkeypatch):
+    """Replay must FORCE the sanitized environment, not inherit the decision.
+
+    `replay_verify_tdx` requires `policy.tdx_strict`, but a strict policy is
+    not necessarily `production_ready_for_tdx`: that additionally needs the
+    verified-registry fields. So the two conditions genuinely differ, and the
+    replay path forces production_mode rather than asking the policy.
+
+    That distinction is the guard. Replay authenticates the verifier's BYTES;
+    if it then inherited the caller's environment, the pinned binary could
+    still be steered by LD_PRELOAD and a content pin would prove nothing about
+    what actually ran.
+
+    The two tests above cannot see this: they use a production policy, where
+    both branches of the decision agree. This one uses a strict, non-production
+    policy, where they do not.
+    """
+    policy = Policy(allowed_measurements={"m1"}, tdx_strict=True)
+    assert policy.tdx_strict is True
+    assert policy.production_ready_for_tdx is False, (
+        "fixture no longer distinguishes the two branches"
+    )
+
+    nonce = issue_nonce()
+    hotkey = "hk-replay-1"
+    rd_hex = report_data(nonce, hotkey).hex()
+    dump = tmp_path / "replay-env.json"
+    stable_id = "tdx-platform-sha256:" + "a" * 64
+    claims = {
+        "advisory_ids": [],
+        "claims_bound_to_quote": True,
+        "collateral_current": True,
+        "debug_enabled": False,
+        "intel_verified": True,
+        "measurement": "m1",
+        "platform_id": stable_id,
+        "platform_identity_kind": "stable",
+        "platform_identity_verified": True,
+        "report_data": rd_hex,
+        "report_data_match": True,
+        "stable_platform_id": stable_id,
+        "tcb": 0,
+        "tcb_status": "UpToDate",
+        "tcb_svn": "0d010800000000000000000000000000",
+        "tdx_attestation_key_id": "tdx-ak-sha256:" + "c" * 64,
+        "tdx_pck_cert_id": "tdx-pck-cert-sha256:" + "b" * 64,
+    }
+    pinned = _executable_fake_verifier(
+        tmp_path,
+        "import json, os\n"
+        f"open({str(dump)!r}, 'w').write(json.dumps({{'env': dict(os.environ)}}))\n"
+        f"print({json.dumps(json.dumps(claims))})",
+    )
+
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/attacker.so")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/attacker-libs")
+
+    assert replay_verify_tdx(_make_evidence(nonce, hotkey), nonce, policy, [pinned]) is not None
+
+    child = json.loads(dump.read_text())
+    inherited = {k: v for k, v in child["env"].items() if not k.startswith("__")}
+    assert "LD_PRELOAD" not in inherited, (
+        "pinned replay inherited LD_PRELOAD; a content pin proves nothing "
+        "about what actually ran"
+    )
+    assert inherited == {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
