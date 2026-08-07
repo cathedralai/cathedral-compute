@@ -1425,3 +1425,42 @@ def test_selection_rotates_so_the_surplus_is_not_starved(tmp_path: Path) -> None
     assert skipped_per_epoch[0] != skipped_per_epoch[1], (
         "the same miner was skipped in consecutive epochs; selection is not rotating"
     )
+
+
+def test_verified_work_persists_replayable_artifacts(tmp_path: Path) -> None:
+    """A verified challenge must leave the exact bytes its receipt signs.
+
+    `record_work_artifacts` had no coverage: deleting the call, and neutering
+    the condition that reaches it, both left the whole suite green.
+
+    Nothing visible breaks at the time. The epoch completes, scores freeze and
+    weights publish. The failure surfaces later at export, where the evidence
+    path refuses with "has no persisted work artifacts; a signer-only work
+    assertion is never publishable". So the lane keeps paying while every
+    bundle it produces becomes unpublishable, and the cause is an epoch that
+    already closed.
+
+    Both directions are asserted, so the test cannot pass by always recording:
+    a verified challenge persists artifacts, a failed one does not.
+    """
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b", invalid_sat=True)})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("miner-ok", "http://127.0.0.1:9001"), ("miner-bad", "http://127.0.0.1:9002")],
+        specs,
+    )
+    run = runtime.run_epoch(7, CANARY)
+    assert run.status == "complete"
+
+    verified_challenge = factory.log["sat:miner-ok"][0]
+    artifacts = ledger.work_artifacts_for_challenge(verified_challenge)
+    assert artifacts is not None, (
+        "a verified challenge left no replayable work artifacts; its evidence "
+        "bundle can never be exported"
+    )
+    assert bytes(artifacts["work_item_body"]), "work item body is empty"
+    assert bytes(artifacts["result_body"]), "result body is empty"
+
+    # The other direction: work that did not verify has nothing to replay.
+    failed_challenge = factory.log["sat:miner-bad"][0]
+    assert ledger.work_artifacts_for_challenge(failed_challenge) is None
