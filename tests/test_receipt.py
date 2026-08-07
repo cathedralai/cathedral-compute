@@ -457,6 +457,67 @@ def test_claim_digest_presence_and_explicit_zero_are_enforced():
         verify_receipt(_resign(document), snapshot)
 
 
+def test_verify_side_tcb_policy_gates_reject_a_validly_signed_receipt():
+    """The three TCB gates, each broken alone on a properly re-signed receipt.
+
+    These had no coverage. The tamper matrix above includes an "OutOfDate" case,
+    but it re-identifies without re-signing, so it dies on the signature check
+    and never reaches the policy gate. Deleting each of these three left the
+    whole suite green.
+
+    Why the verify side matters and not just the issuer: `provenance` counts a
+    verified receipt's work units into weight, and `verify_receipt` is the only
+    TCB check a third-party auditor ever runs. If the issuer is compromised, or
+    simply wrong, this is what stands between a bad TCB posture and payment.
+
+    Each case re-signs with the genuine key, so the receipt is cryptographically
+    valid and only the policy is violated. That is the case a signature check
+    cannot catch.
+    """
+    snapshot, _policy, _claims_value, receipt = _issued_receipt()
+    assert verify_receipt(receipt.receipt_bytes, snapshot)  # control: it verifies as issued
+
+    # 1. A TCB status outside the allowed set.
+    document = json.loads(receipt.receipt_bytes)
+    document["tcb"]["status"] = "OutOfDate"
+    with pytest.raises(ReceiptError, match="does not satisfy policy"):
+        verify_receipt(_resign(document), snapshot)
+
+    # 2. Debug-enabled hardware. A debuggable TEE offers no confidentiality
+    #    guarantee, so a receipt from one must never be creditable.
+    document = json.loads(receipt.receipt_bytes)
+    document["tcb"]["debug_enabled"] = True
+    with pytest.raises(ReceiptError, match="does not satisfy policy"):
+        verify_receipt(_resign(document), snapshot)
+
+    # 3. Stale collateral. The verdict was reached against revocation data that
+    #    was not current, so it cannot be relied on.
+    document = json.loads(receipt.receipt_bytes)
+    document["tcb"]["collateral_current"] = False
+    with pytest.raises(ReceiptError, match="does not satisfy policy"):
+        verify_receipt(_resign(document), snapshot)
+
+
+def test_verify_side_tcb_gates_reject_absent_values_not_only_false_ones():
+    """Fail-closed on missing data, which is the weaker input than forgery.
+
+    The schema block accepts `null` for these fields, so a receipt can be
+    schema-valid while saying nothing about its TCB posture. The policy gate is
+    what turns "unknown" into a refusal: `debug_enabled is not False` and
+    `collateral_current is not True` both reject `None`.
+
+    Without that, an issuer that simply omits the fields is credited, which is
+    an easier failure to reach than forging a value.
+    """
+    snapshot, _policy, _claims_value, receipt = _issued_receipt()
+
+    for field in ("debug_enabled", "collateral_current"):
+        document = json.loads(receipt.receipt_bytes)
+        document["tcb"][field] = None
+        with pytest.raises(ReceiptError, match="does not satisfy policy"):
+            verify_receipt(_resign(document), snapshot)
+
+
 def test_public_receipt_does_not_leak_raw_evidence_platform_or_credentials():
     _snapshot_value, _policy, _claims_value, receipt = _issued_receipt()
     forbidden = (
