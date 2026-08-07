@@ -56,3 +56,62 @@ def test_routing_normalizes_when_shares_do_not_sum_to_one():
     weights, burn = apply_routing(lane_scores, {"sat_benchmark": 1.0, "inference": 1.0}, floor=0.0)
     assert abs(sum(weights.values()) + burn - 1.0) < 1e-9
     assert abs(weights["m1"] - weights["m2"]) < 1e-9   # equal shares -> equal split
+
+
+# --- conservation at the production floor of 0.0 ---------------------------
+#
+# Every test above uses floor=0.1. Production runs floor=0.0, and the floor is
+# what makes most of these pass: with a floor, admitted miners hold weight even
+# when a lane is unserved, so a redistribution bug still leaves burn positive
+# and looks fine. At floor=0.0 that cover disappears.
+#
+# The invariant these hold: an unserved lane's budget BURNS. It is never
+# renormalized across the lanes that did produce work. Redistributing it would
+# silently pay one lane's share to miners who did not earn it, and because the
+# totals still sum to 1.0 the arithmetic would look correct.
+
+
+def test_an_unserved_lane_burns_its_budget_at_the_production_floor():
+    """Lane b is routed 50% and produced nothing, so 50% must burn."""
+    lane_scores = {"sat_benchmark": {"m1": 1.0}, "inference": {}}
+    routing = {"sat_benchmark": 0.5, "inference": 0.5}
+    weights, burn = apply_routing(lane_scores, routing, floor=0.0)
+    assert abs(weights["m1"] - 0.5) < 1e-9, "the served lane must not absorb the idle lane"
+    assert abs(burn - 0.5) < 1e-9, "the unserved lane's budget must burn"
+
+
+def test_a_lane_absent_from_scores_burns_its_budget_too():
+    """Same invariant when the lane is missing rather than empty.
+
+    A routed lane that reported nothing at all is the ordinary case for a lane
+    that is configured but not yet producing, so it must not be cheaper to be
+    absent than to be present with no work.
+    """
+    lane_scores = {"sat_benchmark": {"m1": 1.0}}
+    routing = {"sat_benchmark": 0.5, "inference": 0.5}
+    weights, burn = apply_routing(lane_scores, routing, floor=0.0)
+    assert abs(weights["m1"] - 0.5) < 1e-9
+    assert abs(burn - 0.5) < 1e-9
+
+
+def test_both_lanes_served_burns_nothing_at_floor_zero():
+    """The other direction, so the tests above cannot pass by burning always."""
+    lane_scores = {"sat_benchmark": {"m1": 1.0}, "inference": {"m2": 1.0}}
+    routing = {"sat_benchmark": 0.5, "inference": 0.5}
+    weights, burn = apply_routing(lane_scores, routing, floor=0.0)
+    assert abs(sum(weights.values()) - 1.0) < 1e-9
+    assert abs(burn) < 1e-9
+
+
+def test_conservation_holds_at_floor_zero_across_lane_states():
+    """Weights plus burn is exactly 1.0 whatever the lanes did."""
+    routing = {"sat_benchmark": 0.5, "inference": 0.5}
+    for lane_scores in (
+        {"sat_benchmark": {"m1": 1.0}, "inference": {"m2": 1.0}},
+        {"sat_benchmark": {"m1": 1.0}, "inference": {}},
+        {"sat_benchmark": {"m1": 1.0}},
+        {"sat_benchmark": {}, "inference": {}},
+        {},
+    ):
+        weights, burn = apply_routing(lane_scores, routing, floor=0.0)
+        assert abs(sum(weights.values()) + burn - 1.0) < 1e-9, lane_scores

@@ -167,7 +167,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The suite collects 1603 tests, and `tests/test_documented_counts.py` holds that
+The suite collects 1607 tests, and `tests/test_documented_counts.py` holds that
 number to this file, so it cannot quietly drift. The collected count is stated
 rather than a passing count, because the TDX and SEV-SNP suites skip unless the
 hardware is present, which means the passing total differs between a laptop and
