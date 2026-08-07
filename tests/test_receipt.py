@@ -1758,3 +1758,107 @@ def test_malformed_measurement_is_still_a_schema_fault():
         )
 
     assert raised.value.category == "schema"
+
+
+# --- the receipt must be bound to the resolution it is credited for --------
+#
+# resolve_challenge_with_receipt is the write-time gate between a signed
+# receipt and the units the ledger pays on. Three of its bindings had no test,
+# and each one deleted alone left the whole suite green:
+#
+#   units comparison               SURVIVED
+#   receipt work challenge_id      SURVIVED
+#   receipt subject/epoch binding  SURVIVED
+#
+# The downstream backstop in score_class fires only when the report is
+# exported, which is AFTER the epoch is frozen and posted, and the
+# failed/abandoned branch has no backstop at all. So this is the last place a
+# mismatch can be refused rather than reported.
+
+
+def _epoch_with_challenge(tmp_path: Path, name: str = "bind") -> tuple[Ledger, int]:
+    snapshot = _snapshot()
+    ledger = Ledger(tmp_path / f"{name}.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=snapshot.release,
+        policy_registry_digest=snapshot.digest,
+        network="local",
+        netuid=1,
+        challenge_anchor_block=ANCHOR_BLOCK,
+        challenge_anchor_hash=ANCHOR_HASH,
+    )
+    ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
+    return ledger, epoch_id
+
+
+def test_ledger_refuses_to_credit_units_the_receipt_did_not_sign_for(tmp_path: Path):
+    """The paid number must equal the signed number.
+
+    Without this the ledger credits whatever it is told while storing a receipt
+    that attests something else, and the only later objection comes at export,
+    after the epoch is frozen.
+    """
+    ledger, epoch_id = _epoch_with_challenge(tmp_path, "units")
+    _s, _p, _c, receipt = _issued_receipt(epoch_id=epoch_id, work_units=3.5)
+    with pytest.raises(LedgerError, match="work units do not match"):
+        ledger.resolve_challenge_with_receipt(
+            CHALLENGE_ID,
+            "verified",
+            400.0,  # credited, versus 3.5 signed for
+            validator_derived=True,
+            receipt_id=receipt.receipt_id,
+            receipt_body=receipt.receipt_bytes,
+            receipt_digest=receipt.receipt_digest,
+            issued_at=ISSUED_TEXT,
+        )
+    ledger.close()
+
+
+def test_ledger_refuses_a_receipt_signed_for_a_different_challenge(tmp_path: Path):
+    """A receipt is evidence for one challenge, not for any challenge.
+
+    Without this binding a single genuine receipt could be replayed to resolve
+    other challenges, since every other field still checks out.
+    """
+    ledger, epoch_id = _epoch_with_challenge(tmp_path, "challenge")
+    _s, _p, _c, receipt = _issued_receipt(
+        epoch_id=epoch_id, challenge_id="f" * 64, work_units=3.5
+    )
+    with pytest.raises(LedgerError, match="does not match its work resolution"):
+        ledger.resolve_challenge_with_receipt(
+            CHALLENGE_ID,  # the challenge being resolved
+            "verified",
+            3.5,
+            validator_derived=True,
+            receipt_id=receipt.receipt_id,
+            receipt_body=receipt.receipt_bytes,
+            receipt_digest=receipt.receipt_digest,
+            issued_at=ISSUED_TEXT,
+        )
+    ledger.close()
+
+
+def test_ledger_refuses_a_receipt_issued_for_another_hotkey(tmp_path: Path):
+    """The receipt's subject must be the miner the challenge was issued to.
+
+    This is the binding that stops one miner's genuine receipt paying another
+    miner. It is checked inside the write transaction, against the issued
+    challenge row rather than against the caller's arguments.
+    """
+    ledger, epoch_id = _epoch_with_challenge(tmp_path, "subject")
+    _s, _p, _c, receipt = _issued_receipt(
+        epoch_id=epoch_id, subject_hotkey="thief-hotkey", work_units=3.5
+    )
+    with pytest.raises(LedgerError, match="receipt subject does not match"):
+        ledger.resolve_challenge_with_receipt(
+            CHALLENGE_ID,
+            "verified",
+            3.5,
+            validator_derived=True,
+            receipt_id=receipt.receipt_id,
+            receipt_body=receipt.receipt_bytes,
+            receipt_digest=receipt.receipt_digest,
+            issued_at=ISSUED_TEXT,
+        )
+    ledger.close()
