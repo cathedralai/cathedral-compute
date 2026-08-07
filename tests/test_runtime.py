@@ -262,6 +262,35 @@ def test_canary_chip_collision_at_distinct_endpoint_creates_no_epoch(tmp_path: P
     assert "sat:miner" not in factory.log
 
 
+def test_canary_hotkey_enrolled_as_a_miner_creates_no_epoch(tmp_path: Path) -> None:
+    """The canary hotkey must not also be a scored miner.
+
+    The endpoint and chip collision guards beside this one were covered; the
+    hotkey one was not, and deleting it left the whole suite green.
+
+    What it prevents: the canary is the operator's own health check, and its
+    success is what authorises the epoch. If the same hotkey is also enrolled,
+    it is scored by the epoch it authorised, so the operator earns emissions
+    from their own canary. Reachable by accident, not only by self-dealing:
+    reusing a convenient hotkey when enrolling a box is enough.
+
+    Distinct endpoint and distinct chip on purpose, so the two sibling guards
+    cannot be what rejects this. The identity itself has to be refused.
+    """
+    specs = default_specs(**{"9001": MinerSpec("distinct-chip")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [(CANARY.hotkey, "http://127.0.0.1:9001")],
+        specs,
+    )
+    with pytest.raises(RuntimeError, match="canary identity must be dedicated"):
+        runtime.run_epoch(1, CANARY)
+    assert ledger.blocking_epoch() is None
+    assert ledger.get_epoch(1) is None
+    # Refused before any work is dispatched, not scored and then discarded.
+    assert "sat:canary" not in factory.log
+
+
 def _production_runtime(
     tmp_path: Path,
     *,
