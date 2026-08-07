@@ -3874,7 +3874,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(published so external validators can recompute the "
         "implementation digest from the binary blob)",
     )
-    p_export_evidence.add_argument("--mechanism", default="validated_supply_v1")
+    # New evidence is emitted as validated_supply_v2, which is what README.md
+    # documents and what cathedral.provenance already defaults to. The default
+    # here named the retired v1 id, so an operator running the documented
+    # command stamped a mechanism the docs call historical, and every test had
+    # to pin v2 explicitly to work around it. v1 stays registered and can still
+    # be pinned by hand so already-signed historical evidence keeps verifying.
+    p_export_evidence.add_argument("--mechanism", default="validated_supply_v2")
     p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
     p_export_evidence.add_argument("--source-revision")
     p_export_evidence.add_argument(
@@ -3995,7 +4001,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov_verify.add_argument(
         "--verifier-digest", required=True, help="pinned TDX verifier implementation digest"
     )
-    p_prov_verify.add_argument("--mechanism", default="validated_supply_v1")
+    # Matches the export default above, so verifying freshly exported evidence
+    # needs no flag. Verifying historical v1 evidence still works, but now says
+    # so out loud: pass --mechanism validated_supply_v1 explicitly. The pin is
+    # deliberately fail-closed on mismatch, so a wrong default is not a
+    # cosmetic disagreement, it rejects the bundle.
+    p_prov_verify.add_argument("--mechanism", default="validated_supply_v2")
     p_prov_verify.add_argument(
         "--mechanism-revision",
         type=int,
