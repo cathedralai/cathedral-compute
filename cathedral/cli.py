@@ -35,6 +35,11 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from cathedral import census as census_mod
+from cathedral.admission_policy import (
+    MODE_SELECTED,
+    load_policy_keys,
+    verify_admission_policy,
+)
 from cathedral.assurance import AssuranceDimension
 from cathedral.attest import collect_snp, collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
@@ -3294,22 +3299,63 @@ def cmd_lifecycle_retire(args: argparse.Namespace) -> int:
 
 
 def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
-    """List enrollments whose coldkey is not on the signed allowlist.
+    """List enrollments the current approval artifact no longer covers.
 
     With --remove, retire the flagged rows and clear their attestation
-    verdicts (docs/ENROLLMENT_ALLOWLIST.md). Never runs automatically:
-    reconciliation of pre-existing rows is an explicit operator action.
+    verdicts. Never runs automatically: reconciliation of pre-existing rows
+    is an explicit operator action.
+
+    Accepts either approval artifact, because it is the only way to free
+    enrollment capacity and a service running an admission policy could
+    otherwise not run it at all (docs/ADMISSION_POLICY.md names this command
+    as the remedy).
+
+    Under open mode there is no approved-coldkey set, so coldkey approval is
+    not a criterion. Applying one anyway would flag every row and, with
+    --remove, retire the entire board. Open mode therefore reclaims exactly
+    the rows whose hotkey is no longer registered on the subnet.
     """
     if not Path(args.registry_db).is_file():
         raise ValueError("registry database does not exist")
-    allowlist = verify_allowlist(
-        _read_bounded_registry_file(args.allowlist, "coldkey allowlist"),
-        load_allowlist_keys(
-            args.allowlist_keys,
-            pinned_digest=args.allowlist_keys_digest,
-        ),
-        max_age_seconds=args.allowlist_max_age_seconds,
-    )
+    # getattr: callers construct this namespace directly (tests, and the
+    # operator wrapper), so a missing optional attribute must mean "not
+    # supplied" rather than AttributeError.
+    policy_path = getattr(args, "admission_policy", None)
+    if bool(getattr(args, "allowlist", None)) == bool(policy_path):
+        raise ValueError("pass exactly one of --allowlist or --admission-policy")
+    approved: frozenset[str] | None
+    artifact: dict[str, object]
+    if getattr(args, "allowlist", None):
+        allowlist = verify_allowlist(
+            _read_bounded_registry_file(args.allowlist, "coldkey allowlist"),
+            load_allowlist_keys(
+                args.allowlist_keys,
+                pinned_digest=args.allowlist_keys_digest,
+            ),
+            max_age_seconds=args.allowlist_max_age_seconds,
+        )
+        approved = allowlist.coldkeys
+        artifact = {
+            "allowlist_release": allowlist.release,
+            "allowlist_digest": allowlist.digest,
+        }
+    else:
+        policy = verify_admission_policy(
+            _read_bounded_registry_file(policy_path, "admission policy"),
+            load_policy_keys(
+                args.admission_policy_keys,
+                pinned_digest=getattr(args, "admission_policy_keys_digest", None),
+            ),
+            network=getattr(args, "network", "finney"),
+            netuid=getattr(args, "netuid", 39),
+            max_age_seconds=args.allowlist_max_age_seconds,
+        )
+        approved = policy.coldkeys if policy.mode == MODE_SELECTED else None
+        artifact = {
+            "admission_config_version": policy.config_version,
+            "admission_digest": policy.digest,
+            "admission_mode": policy.mode,
+        }
     registration = JsonHotkeyRegistrationProvider(
         args.registered_hotkeys_file,
         max_age_seconds=args.registration_max_age_seconds,
@@ -3318,8 +3364,8 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     # unresolvable would flag (and with --remove retire) the whole board.
     if registration is None:
         raise ValueError("registration snapshot is missing, stale, or malformed")
-    _hotkeys, coldkey_map = registration
-    if coldkey_map is None:
+    registered_hotkeys, coldkey_map = registration
+    if coldkey_map is None and approved is not None:
         raise ValueError(
             "registration snapshot carries no coldkey mapping; rotate the "
             "extended {'hotkeys': {hotkey: coldkey}} format first"
@@ -3329,15 +3375,23 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     flagged: list[dict[str, object]] = []
     for enrollment in store.enrollments():
         checked += 1
-        coldkey = coldkey_map.get(enrollment.hotkey)
-        if coldkey is not None and coldkey in allowlist.coldkeys:
+        coldkey = (coldkey_map or {}).get(enrollment.hotkey)
+        if approved is None:
+            # Open mode: the only reclaimable rows are workers that left the
+            # subnet. Everything else is legitimately enrolled.
+            if enrollment.hotkey in registered_hotkeys:
+                continue
+            status = "not_registered"
+        elif coldkey is not None and coldkey in approved:
             continue
+        else:
+            status = "unresolvable" if coldkey is None else "not_allowlisted"
         lifecycle = store.lifecycle_snapshot(enrollment.hotkey)
         flagged.append(
             {
                 "hotkey": enrollment.hotkey,
                 "coldkey": coldkey,
-                "status": "unresolvable" if coldkey is None else "not_allowlisted",
+                "status": status,
                 "lifecycle_state": lifecycle.state.value,
             }
         )
@@ -3349,8 +3403,7 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "allowlist_release": allowlist.release,
-                "allowlist_digest": allowlist.digest,
+                **artifact,
                 "checked": checked,
                 "flagged": flagged,
                 "removed": removed,
@@ -3575,16 +3628,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_enroll_reconcile.add_argument("--registry-db", required=True)
     p_enroll_reconcile.add_argument(
-        "--allowlist", required=True, help="signed coldkey allowlist artifact"
+        "--allowlist", help="signed coldkey allowlist artifact"
     )
     p_enroll_reconcile.add_argument(
         "--allowlist-keys",
-        required=True,
         help="trusted allowlist signing keys (JSON object of id to base64 key)",
     )
     p_enroll_reconcile.add_argument(
+        "--admission-policy",
+        help=(
+            "signed admission policy artifact, as an alternative to "
+            "--allowlist. Exactly one of the two is required"
+        ),
+    )
+    p_enroll_reconcile.add_argument(
+        "--admission-policy-keys",
+        help="trusted admission policy signing keys (JSON object of id to base64 key)",
+    )
+    p_enroll_reconcile.add_argument(
+        "--admission-policy-keys-digest",
+        metavar="sha256:HEX",
+        help="pin the admission policy key file to this sha256 digest",
+    )
+    p_enroll_reconcile.add_argument(
+        "--network", default="finney", help="network the policy must be bound to"
+    )
+    p_enroll_reconcile.add_argument(
+        "--netuid", type=int, default=39, help="netuid the policy must be bound to"
+    )
+    p_enroll_reconcile.add_argument(
         "--allowlist-keys-digest",
-        required=True,
         metavar="sha256:HEX",
         help=(
             "pin the key file to this sha256 digest. Required: reconcile is "

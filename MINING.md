@@ -357,12 +357,25 @@ The validator operator then checks:
 5. bounded work completes and its witness verifies; and
 6. the complete score report contains the correct explicit outcome.
 
-Production enrollment is additionally gated by a signed allowlist of
-approved coldkeys: the registry resolves your hotkey's owning coldkey and
-rejects the enrollment unless that coldkey has been approved, failing closed
-whenever the allowlist or the resolution is unavailable. See
-`docs/ENROLLMENT_ALLOWLIST.md` for the artifact format and operator
-workflow.
+Production enrollment is additionally gated by one signed artifact that the
+registry resolves your hotkey's owning coldkey against, failing closed
+whenever the artifact or the resolution is unavailable. Two artifacts exist
+and an operator runs exactly one of them:
+
+- **Signed admission policy** (`docs/ADMISSION_POLICY.md`), the current
+  design. It carries the mode (`selected`, approved coldkeys only, or
+  `all_registered`, any registered SN39 hotkey), the network and netuid it
+  speaks for, the profile ids you may request, and the enrollment caps.
+- **Signed coldkey allowlist** (`docs/ENROLLMENT_ALLOWLIST.md`), the earlier
+  form. Still supported and unchanged.
+
+Which one is running changes what you send. Against an admission policy the
+enrollment request is v2: it additionally carries your coldkey, the network
+and netuid, the profile you are requesting, and an expiry, all inside the
+signature, and it answers `{"status": "pending"}` rather than
+`{"status": "enrolled"}` — because enrollment is permission to be tested,
+not admission. A v1 request cannot enroll against a policy-gated registry.
+Ask the operator which artifact is in force before building your client.
 
 ## 8. Know what success means
 
