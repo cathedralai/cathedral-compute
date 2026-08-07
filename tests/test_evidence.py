@@ -24,7 +24,7 @@ from cathedral.assurance import (
     evaluated_claim,
     with_verified_channel,
 )
-from cathedral.cli import main as cli_main
+from cathedral.cli import build_parser, main as cli_main
 from cathedral.common import Attested, Tier
 from cathedral.evidence import (
     EvidenceError,
@@ -533,10 +533,10 @@ def _verify_cli_args(tmp_path: Path, evidence_dir: Path) -> list[str]:
         str(index_keys),
         "--verifier-digest",
         VERIFIER_DIGEST,
-        # Pinned explicitly: the CLI default still names the retired
-        # validated_supply_v1 id (see issue #64 follow-up).
-        "--mechanism",
-        "validated_supply_v2",
+        # No --mechanism here on purpose. The CLI default is now
+        # validated_supply_v2, so every caller of this helper exercises the
+        # default rather than papering over it. If the default regresses to the
+        # retired v1 id, these all fail instead of silently passing.
     ]
 
 
@@ -611,6 +611,86 @@ def test_cli_verify_rejects_wrong_mechanism_pin(tmp_path: Path, exported_evidenc
     )
     capsys.readouterr()
     assert code == 1
+
+
+# --- the mechanism identity the CLI standardizes on (#102) -----------------
+#
+# README.md states that new evidence is emitted as validated_supply_v2 and that
+# validated_supply_v1 stays registered only so already-signed historical
+# evidence keeps verifying. Both CLI defaults named v1, so the documented
+# command produced evidence the docs call historical, and an operator following
+# the README pinned v2 and was rejected. The pin is fail-closed on mismatch, so
+# that disagreement rejects the bundle rather than merely reading oddly.
+#
+# These assert the identity itself rather than a flag being accepted, so a
+# revert of either default fails here instead of passing quietly.
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["runtime", "export-evidence"],
+        ["provenance", "verify"],
+    ],
+)
+def test_both_cli_mechanism_defaults_name_v2(argv):
+    """Pins the identity itself, so reverting either default fails here.
+
+    Asserted against the parser rather than inferred from a run: the previous
+    defaults named v1 and every test papered over it with an explicit flag, so
+    the disagreement survived a full suite.
+    """
+    parser = build_parser()
+    defaults = {
+        action.dest: action.default
+        for action in parser._subparsers._group_actions[0]  # type: ignore[union-attr]
+        .choices[argv[0]]
+        ._subparsers._group_actions[0]
+        .choices[argv[1]]
+        ._actions
+    }
+    assert defaults["mechanism"] == "validated_supply_v2", (
+        f"`cathedral {' '.join(argv)}` defaults to {defaults['mechanism']!r}; "
+        "README.md says new evidence is validated_supply_v2 and calls v1 historical"
+    )
+    assert defaults["mechanism_revision"] == 1
+
+
+def test_verify_accepts_the_default_mechanism_and_reaches_a_verdict(
+    tmp_path: Path, exported_evidence, capsys
+):
+    """With no --mechanism flag the pin agrees and verification proceeds.
+
+    Exit code is deliberately not asserted: this fixture is receipts-only, so
+    it lands on NOT_PROVEN for reasons that have nothing to do with the
+    mechanism (see test_cli_export_then_receipts_only_verify_is_not_proven).
+    What matters is that the manifest was accepted under the default pin and
+    the run reached a verdict instead of being refused at the gate.
+    """
+    evidence_dir, _summary = exported_evidence
+    cli_main(_verify_cli_args(tmp_path, evidence_dir))
+    out = capsys.readouterr().out
+    assert "mechanism=validated_supply_v2" in out
+    assert "PROVENANCE_RESULT" in out
+    assert "does not match the pinned mechanism" not in out
+
+
+def test_verify_refuses_v2_evidence_when_v1_is_pinned(
+    tmp_path: Path, exported_evidence, capsys
+):
+    """The other side of the pin: v1 stays selectable and stays fail-closed.
+
+    Pinning v1 against v2 evidence must be refused at the gate, which is the
+    mirror of the failure operators actually hit (README says v2, CLI stamped
+    v1). Refused at the gate, not merely a different verdict.
+    """
+    evidence_dir, _summary = exported_evidence
+    code = cli_main(
+        _verify_cli_args(tmp_path, evidence_dir) + ["--mechanism", "validated_supply_v1"]
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "PROVENANCE_RESULT" not in out, "v1 pin must be refused before any verdict"
 
 
 # ---------------------------------------------------------------------------
