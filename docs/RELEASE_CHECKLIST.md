@@ -81,9 +81,41 @@ part of the preimage. A release whose verifier digest was computed against a
 staging path will fail against production for a reason that reads like
 tampering. Compute it against the deployed installation.
 
+## Standing gate: reconcile the allowlist (#56)
+
+Coldkey approval is enforced **only at enrollment time**. `is_allowed` is
+consulted in the enrollment request handler (`cathedral/enroll.py:2425`) and
+nowhere else, so a worker that enrolled while its coldkey was approved keeps its
+registry row, keeps being probed, and keeps earning after that coldkey is
+removed from the allowlist. Nothing revokes it on its own.
+
+The remedy exists and is effective, but it is manual:
+
+```bash
+cathedral enroll reconcile \
+  --registry-db /data/registry.sqlite \
+  --allowlist /etc/cathedral/enroll-allowlist-sn39.r2.json \
+  --allowlist-keys /etc/cathedral/enroll-allowlist-keys.json \
+  --registered-hotkeys-file /path/to/registration-snapshot.json
+  # add --remove to retire the flagged rows, omit it to see them first
+```
+
+Run it without `--remove` first and read the flagged set; that output is the
+answer to "who is currently earning who should not be".
+
+Make this a release gate and a recurring one:
+
+- [ ] run reconcile before cutting the release, record the flagged set
+- [ ] run it again after any allowlist revocation, since revoking alone changes nothing
+- [ ] note the allowlist expiry, release 2 lapses **2026-08-29**, and a lapsed
+      allowlist means no new enrollments at all
+
+This is currently low-risk because the approved set is small and admits no
+external miners, which is exactly why it is easy to forget once it does.
+
 ## What this checklist does not cover
 
 Deployment questions that are not release mechanics: whether existing live
 manifests need re-emitting after the `validated_supply_v2` standardization
-(#102), and seeding plus reconciling the coldkey allowlist (#56). Both are
+(#102), and the initial seeding of the coldkey allowlist (#56). Both are
 operator calls.
