@@ -1,6 +1,6 @@
 """Executable cross-repo compatibility for `cathedral_assurance_receipt_v2`.
 
-These tests verify real receipts across three repositories with the private
+These tests verify real receipts across three repositories with the sibling
 packages actually installed, because a parser extension on its own does not
 create compatibility. Each leg is proved or refused with a concrete reason:
 
@@ -21,16 +21,18 @@ create compatibility. Each leg is proved or refused with a concrete reason:
   * unknown top-level keys, plain SEV, and TEE/class conflicts fail on both
     sides.
 
-The sibling packages are private, so this module skips when they are absent and
-CI (which installs only `.[dev]` and holds no read credential for them) will
-skip it. CI therefore does NOT prove this contract; only an environment with
-the sibling repos present does, and a skip is never evidence of compatibility.
-Read the run counts, not the green tick.
+The default Compute test environment may skip this module when the sibling
+packages are absent. The dedicated cross-repository CI job sets
+``CATHEDRAL_REQUIRED_CROSS_REPO_CONTRACT=1`` and imports every required module
+directly, so a missing package is a hard collection failure rather than a
+passing skip. That job installs fixed local worktrees and is the required
+compatibility signal.
 """
 
 from __future__ import annotations
 
 import atexit
+import importlib
 import json
 import os
 import shutil
@@ -51,25 +53,38 @@ from tests.test_receipt import (
     _snapshot,
 )
 
-compute_receipt = pytest.importorskip(
+_REQUIRED_CONTRACT_ENV = "CATHEDRAL_REQUIRED_CROSS_REPO_CONTRACT"
+
+
+def _contract_module(name: str, *, reason: str):
+    if os.environ.get(_REQUIRED_CONTRACT_ENV) == "1":
+        return importlib.import_module(name)
+    return pytest.importorskip(name, reason=reason)
+
+
+compute_receipt = _contract_module(
     "cathedral_distill.compute_receipt",
-    reason="cathedral-distill (private) is not installed in this environment",
+    reason="cathedral-distill is not installed in this environment",
 )
-integrated_feed = pytest.importorskip(
+integrated_feed = _contract_module(
     "cathedral_distill.integrated_feed",
-    reason="cathedral-distill (private) is not installed in this environment",
+    reason="cathedral-distill is not installed in this environment",
 )
-distill_testing = pytest.importorskip(
+distill_testing = _contract_module(
     "cathedral_distill.testing",
-    reason="cathedral-distill (private) is not installed in this environment",
+    reason="cathedral-distill is not installed in this environment",
 )
-thin_integration = pytest.importorskip(
+thin_integration = _contract_module(
     "cathedral_thin.integration",
-    reason="cathedral-validator (private) is not installed in this environment",
+    reason="cathedral-validator is not installed in this environment",
 )
-distill_receipt = pytest.importorskip("cathedral_distill.distill_receipt")
-ConsumptionLedger = pytest.importorskip(
-    "cathedral_distill.consumption_ledger"
+distill_receipt = _contract_module(
+    "cathedral_distill.distill_receipt",
+    reason="cathedral-distill is not installed in this environment",
+)
+ConsumptionLedger = _contract_module(
+    "cathedral_distill.consumption_ledger",
+    reason="cathedral-distill is not installed in this environment",
 ).ConsumptionLedger
 
 # The shared contract refuses a non-durable ledger, so the policed preview needs
