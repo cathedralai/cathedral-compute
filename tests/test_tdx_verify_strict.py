@@ -364,6 +364,37 @@ def test_verifier_nonzero_exit_rejects(tmp_path, monkeypatch):
     assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is None
 
 
+def test_verifier_that_accepts_then_exits_nonzero_is_rejected(tmp_path, monkeypatch):
+    """Accepting claims on stdout AND a nonzero exit must still reject.
+
+    The test above prints nothing, so it passes because there is no JSON to
+    parse, not because of the exit code. Deleting the `returncode != 0` guard
+    left it green. This one prints a fully valid, accepting claims object and
+    only then exits nonzero, so the exit code is the only thing left to reject
+    on.
+
+    The failure it stands for is a verifier that completes its checks, emits a
+    positive verdict, and then dies during a late step (collateral fetch, CRL
+    refresh, teardown, a signal). Trusting the claims it already printed would
+    mean accepting an attestation the verifier itself did not stand behind.
+    """
+    nonce = issue_nonce()
+    hotkey = "hk-exit-2"
+    rd_hex = report_data(nonce, hotkey).hex()
+    body = _good_claims_body(rd_hex, "m1", "p1") + "\nraise SystemExit(2)"
+
+    # Control: the identical claims, exiting zero, are accepted. Without this
+    # the test could pass because the claims were malformed all along.
+    monkeypatch.setenv(
+        "CATHEDRAL_TDX_VERIFY_CMD",
+        _fake_verifier(tmp_path, _good_claims_body(rd_hex, "m1", "p1")),
+    )
+    assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is not None
+
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path, body))
+    assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is None
+
+
 # ---------------------------------------------------------------------------
 # Subprocess safety — oversized output
 # ---------------------------------------------------------------------------
