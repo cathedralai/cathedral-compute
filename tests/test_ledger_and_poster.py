@@ -124,6 +124,51 @@ class TestEpochStateMachine:
         assert sum(isinstance(value, int) for value in outcomes) == 1
         assert sum(isinstance(value, LedgerError) for value in outcomes) == 1
 
+    def test_an_aborted_epoch_can_never_be_completed(self) -> None:
+        """Terminal statuses are terminal, in the direction that pays.
+
+        `complete_epoch` freezes scores and makes an epoch publishable. Its
+        status guard had no test: deleting it left the whole suite green, and
+        an aborted epoch could then be frozen and published.
+
+        The production route is a race rather than a mistake. `runtime
+        abort-running` is a separate process against the same SQLite file, so
+        it can land while an epoch loop is between resolving its last challenge
+        and completing. Whoever wrote the abort believes the epoch is dead; the
+        loop then pays it out.
+
+        Both terminal statuses are covered because they arrive by different
+        routes: `aborted` from the operator command, `abandoned` from the
+        recovery path for a complete epoch that can never publish.
+        """
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(10)
+        ledger.abort_epoch(epoch_id)
+        with pytest.raises(LedgerError, match="cannot complete"):
+            ledger.complete_epoch(epoch_id, set())
+
+    def test_an_abandoned_epoch_can_never_be_re_completed(self) -> None:
+        """The other terminal status, reached by the other route."""
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(10)
+        ledger.complete_epoch(epoch_id, set())
+        ledger.abandon_completed_epoch(epoch_id, "ingest refused the frozen report")
+        with pytest.raises(LedgerError, match="cannot complete"):
+            ledger.complete_epoch(epoch_id, set())
+
+    def test_a_completed_epoch_cannot_be_aborted(self) -> None:
+        """The mirror guard on abort, which was also unheld.
+
+        Not flagged by the sweep; found by mutating the neighbour. Without it,
+        an operator racing `abort-running` against an epoch that just completed
+        would discard frozen, publishable work rather than being refused.
+        """
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(10)
+        ledger.complete_epoch(epoch_id, set())
+        with pytest.raises(LedgerError, match="cannot abort"):
+            ledger.abort_epoch(epoch_id)
+
     def test_abort_does_not_consume_source_epoch(self) -> None:
         ledger = Ledger()
         first = ledger.begin_epoch(10)
