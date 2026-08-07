@@ -9,6 +9,8 @@ policy registry.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from datetime import timedelta
 from decimal import Decimal
@@ -272,6 +274,48 @@ def test_corrupt_receipt_bytes_fail_closed(exported):
     corrupted = {receipt_id: body[:-2] + b" }" for receipt_id, body in receipts.items()}
     with pytest.raises(ProvenanceError, match="does not match its digest"):
         _verify(report, corrupted)
+
+
+def test_receipt_with_a_forged_signature_is_rejected(exported):
+    """A receipt whose signature no longer verifies must not be credited.
+
+    This is the one attack the surrounding loop cannot catch on its own, and
+    `verify_receipt` was the only thing catching it. Deleting that call left
+    the whole suite green while paying full positive weight.
+
+    Why every other check in the loop passes:
+
+    * the receipt id is derived from `_id_material`, which EXCLUDES the
+      signature, so corrupting the signature does not change the id;
+    * the digest check compares against the report, and a compromised producer
+      re-signs the report with its genuine key, so the digest is rebound;
+    * subject hotkey, source epoch and work units are all untouched.
+
+    So the receipt is internally consistent and correctly referenced. Only its
+    signature is wrong. That is exactly the receipt a compromised or buggy
+    issuer emits, and the case a third-party auditor most needs refused.
+    """
+    report, receipts = exported
+    receipt_id, body = next(iter(receipts.items()))
+
+    document = json.loads(body)
+    raw = base64.b64decode(document["signature"]["value_base64"])
+    document["signature"]["value_base64"] = base64.b64encode(
+        bytes([raw[0] ^ 0x01]) + raw[1:]
+    ).decode("ascii")
+    forged = canonical_json(document)
+    assert forged != body
+
+    # The compromised producer rebinds the digest and re-signs the report, so
+    # the reference is consistent with the forged bytes it is handing over.
+    def rebind(doc):
+        for entry in doc["entries"]:
+            for ref in entry.get("evidence") or []:
+                if ref.get("id") == receipt_id:
+                    ref["digest"] = "sha256:" + hashlib.sha256(forged).hexdigest()
+
+    with pytest.raises(ProvenanceError, match="failed verification"):
+        _verify(_reforge(report, rebind), {**receipts, receipt_id: forged})
 
 
 def test_zero_entry_carrying_evidence_is_rejected(exported):
