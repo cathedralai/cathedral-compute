@@ -905,6 +905,29 @@ def _build_runtime(
     )
     if require_report_audience and config.production_mode and config.score_network is None:
         raise ValueError("production score reports require --score-network and --score-netuid")
+    if (
+        require_policy
+        and config.production_mode
+        and getattr(args, "receipt_signing_key_id", None) is None
+    ):
+        # Both receipt flags are optional, which is right for dev and testnet.
+        # In production that is a fail-open: with no issuer, work resolution
+        # records validator-derived units and returns before any receipt
+        # exists, so the epoch completes and weights publish on work carrying
+        # no assurance. The only existing objection lives in the score-class
+        # export ("positive work ... lacks an assurance receipt"), which runs
+        # AFTER payment and is a report rather than a gate.
+        #
+        # require_policy already means "this command admits miners and runs
+        # epochs"; recovery and status commands work on frozen ledger state and
+        # legitimately need no issuer. Refused here with the other argument
+        # gates, before any file is read, so a misconfigured production start
+        # fails on its arguments rather than part-way through setup.
+        raise ValueError(
+            "production admission requires an assurance receipt issuer "
+            "(--receipt-signing-key-id AND --receipt-signing-key-file); "
+            "without one the lane pays verified work that carries no receipt"
+        )
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
         production_mode=config.production_mode,
