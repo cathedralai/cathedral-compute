@@ -19,12 +19,18 @@ verified for signature, freshness, policy, and provenance. A report with no
 positive entries must resolve fail-closed; it must not inherit this document's
 historical positive worker.
 
-**Current public contract comparison: `FAIL` (2026-07-25 audit).** The deployed
-vector advertises the v1 validated-supply shape, including
-`verified_gpu_allocation`, and omits `external_scores.latest_body_sha256`; the
-current verifier requires the v2 `fixed_burn_allocation` and exact body binding.
-The publisher, validator, verifier, and immutable release must converge before
-the public path can claim independent end-to-end reproduction.
+**Current public contract comparison: `AGREE` (2026-08-07).** The deployed
+vector carries the v2 shape (`policy_metadata.validated_supply` with
+`fixed_burn_allocation` and `intel_tdx_allocation`, no `verified_gpu_allocation`)
+and reproduces against the current verifier. The 2026-07-28 redeploy converged
+production; the prior `FAIL` banner described the pre-redeploy state and was
+left stale for ten days, so treat a banner here as dated until re-derived.
+
+What still blocks the independent-reproduction claim is publication, not the
+contract: there is no tagged release and no published key-bundle digests, so
+`docs/PROVENANCE.md` still carries placeholder pins and an outside validator
+cannot assemble the one-command reproduction. See
+[`docs/LAUNCH_CANDIDATE.md`](docs/LAUNCH_CANDIDATE.md) items 4 and 5.
 
 Testnet SN292 remains the non-paying dry-run integration lane.
 
@@ -61,7 +67,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 1600 tests collected. (Collected, not passing: the
+- Repository test suite: 1603 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)

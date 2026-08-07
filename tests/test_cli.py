@@ -394,6 +394,69 @@ def test_production_run_epoch_requires_explicit_score_audience_before_io():
         )
 
 
+def _production_admission_args(tmp_path: Path, *receipt_flags: str):
+    return build_parser().parse_args(
+        [
+            "runtime",
+            "audit-attestation",
+            "--registry-db",
+            str(tmp_path / "registry.sqlite"),
+            "--ledger-db",
+            str(tmp_path / "ledger.sqlite"),
+            "--policy-registry",
+            str(tmp_path / "policy.json"),
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://8.8.8.8",
+            *receipt_flags,
+        ]
+    )
+
+
+def test_production_admission_requires_a_receipt_issuer(tmp_path: Path):
+    """The fail-open this closes: production paying work with no receipt.
+
+    Without an issuer, work resolution records validator-derived units and
+    returns before any receipt exists, so the epoch completes and weights
+    publish. The only existing objection is in the score-class export, which
+    runs after payment. Refused on arguments instead.
+    """
+    args = _production_admission_args(tmp_path)
+    with pytest.raises(ValueError, match="assurance receipt issuer"):
+        _build_runtime(args, require_policy=True)
+
+
+def test_production_admission_accepts_a_receipt_issuer(tmp_path: Path):
+    """The other side: with the flags present this gate is silent.
+
+    It fails later on the unreadable policy registry, which is what proves the
+    receipt gate let it through rather than the command being rejected twice.
+    """
+    args = _production_admission_args(
+        tmp_path,
+        "--receipt-signing-key-id",
+        "receipt-test-1",
+        "--receipt-signing-key-file",
+        str(tmp_path / "receipt.key"),
+    )
+    with pytest.raises(Exception) as excinfo:
+        _build_runtime(args, require_policy=True)
+    assert "assurance receipt issuer" not in str(excinfo.value)
+
+
+def test_non_production_admission_needs_no_receipt_issuer(tmp_path: Path):
+    """The flags stay optional off production, which is why they were optional.
+
+    Dev and testnet runtimes legitimately run without an issuer, so the gate
+    must key on production_mode rather than simply requiring the flags.
+    """
+    args = _production_admission_args(tmp_path, "--development")
+    with pytest.raises(Exception) as excinfo:
+        _build_runtime(args, require_policy=True)
+    assert "assurance receipt issuer" not in str(excinfo.value)
+
+
 def test_runtime_restart_commands_only_require_ledger_path():
     args = build_parser().parse_args(["runtime", "status", "--ledger-db", "ledger.sqlite"])
     assert args.runtime_command == "status"
@@ -416,6 +479,14 @@ def test_production_runtime_rejects_legacy_measurements_file(tmp_path: Path):
             "canary",
             "--canary-endpoint",
             "https://8.8.8.8",
+            # Production admission now requires a receipt issuer, refused on
+            # arguments before any file is read. Supplied so this test still
+            # reaches the legacy-measurements rejection it is about; neither
+            # file is opened before that check fires.
+            "--receipt-signing-key-id",
+            "receipt-test-1",
+            "--receipt-signing-key-file",
+            str(tmp_path / "receipt.key"),
         ]
     )
     with pytest.raises(ValueError, match="development-only"):
