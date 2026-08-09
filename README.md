@@ -1,7 +1,7 @@
 <div align="center">
-  <h1>⚡ Cathedral Compute</h1>
-  <p><strong>The fastest sandbox fleet on earth, built from machines that prove what they run.</strong></p>
-  <p><code>MAINNET LIVE TESTING</code></p>
+  <h1>⚡ Cathedral</h1>
+  <p><strong>Bittensor SN39 · The fastest sandbox fleet on earth, built from machines that prove what they run.</strong></p>
+  <p><a href="https://cathedral.computer">cathedral.computer</a> · <a href="MINING.md">Mine</a> · <a href="https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md">Validate</a> · <a href="https://github.com/cathedralai/cathedral-distill">Distill track</a></p>
 </div>
 
 <!-- VIDEO SLOT -----------------------------------------------------------
@@ -16,12 +16,52 @@ these comment markers.
 </div>
 ------------------------------------------------------------------------ -->
 
-Every other provider buys its fleet. This network recruits one. A hot,
-attested Intel TDX worker is an edge node of a single distributed machine
-whose job is to hand an AI agent a sandbox that already exists before it
-asks.
+## Intro
 
-## Mining: the five things to know
+AI agents need sandboxes: isolated machines they can spawn in milliseconds,
+use, and throw away. Every provider selling them buys its fleet with capital.
+This subnet recruits one with incentives: a miner who keeps a hot, attested
+Intel TDX worker standing by becomes an edge node of a single distributed
+machine that hands an agent a sandbox that already exists before it asks.
+
+Three rules keep it honest:
+
+| Rule | Meaning |
+|---|---|
+| Attestation is admission, not payment | Registration, uptime, a valid quote, hardware ownership, or self-reported volume never earns weight. Only verified work does. |
+| Supply follows demand | The network does not pay for capacity nobody uses. Miners onboard through an approval gate that opens as real demand arrives: the distill track, subnet partnerships that need attested sandboxes in their stack, and paying customers. |
+| Nothing is advertised before it pays | Every future mechanism phase is labeled with whether it pays, and none arms without a versioned contract re-pin. |
+
+## Incentive mechanism
+
+**What pays today: verified work under `validated_supply_v2`.**
+
+1. The validator derives a fresh challenge from finalized SN39 chain state and
+   your hotkey. Your worker answers with an Intel TDX quote bound to that
+   challenge; an unknown measurement is rejected no matter how valid the quote.
+2. Admitted workers receive bounded work. The validator verifies the returned
+   result and derives work units from the task itself, never from your claimed
+   score.
+3. Every epoch produces a signed, complete score report: verified credit or an
+   explicit zero for every candidate. An independent validator re-verifies the
+   report before any weight reaches the chain.
+
+**Where it is going: [docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md).** The
+mechanism's next revisions pay for being fast and warm: producer-clocked
+latency scoring on probes indistinguishable from customer work, capacity from
+your attested profile, grades instead of cliffs. Shadow measurement is running
+now; nothing in it pays until validators adopt the re-pinned contract, and the
+phase table says exactly which phase pays.
+
+Deep dive (architecture, deployed-versus-designed status, trust boundary):
+[docs/EVIDENCE_LANE.md](docs/EVIDENCE_LANE.md). Live state: the
+[signed vector](https://api.cathedral.computer/v1/validator/weights/next) and
+[public evidence index](https://api.cathedral.computer/v1/evidence/index.json).
+
+## Miner setup
+
+<details>
+<summary><strong>The five things to know, then the full guide</strong></summary>
 
 1. **Hardware:** an Intel TDX-capable CPU host. Nothing else is admitted today.
 2. **Apply before you provision.** Admission requires your worker's measurement
@@ -37,90 +77,45 @@ asks.
 5. **Never post credentials.** No seeds, keys, tokens, IPs, or instance
    identifiers in any issue, ever.
 
-## Three rules keep it honest
+Full onboarding: [MINING.md](MINING.md) ·
+Enrollment gate: [docs/ENROLLMENT_ALLOWLIST.md](docs/ENROLLMENT_ALLOWLIST.md) ·
+Workload admission: [docs/WORKLOAD_ADMISSION.md](docs/WORKLOAD_ADMISSION.md) ·
+Worker lifecycle: [docs/LIFECYCLE.md](docs/LIFECYCLE.md)
 
-| Rule | Meaning |
-|---|---|
-| Attestation is admission, not payment | Registration, uptime, a valid quote, hardware ownership, or self-reported volume never earns weight. Only verified work does. |
-| Supply follows demand | The network does not pay for capacity nobody uses. Miners onboard through an approval gate that opens as real demand arrives: the distill track, subnet partnerships that need attested sandboxes in their stack, and paying customers. |
-| Nothing is advertised before it pays | What pays today is verified work under `validated_supply_v2`. The latency-paid direction is [docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md), every phase labeled with whether it pays. |
+</details>
 
-## Choose your path
+## Validator setup
 
-| Role | Start here |
-|---|---|
-| Provide Intel TDX CPU compute | [MINING.md](MINING.md) |
-| Use Cathedral Computer as a customer | [Product and API documentation](https://cathedral.computer/docs/) |
-| Compete in the Distill (CyberGym) track | [`cathedral-distill`](https://github.com/cathedralai/cathedral-distill) |
-| Run or audit a validator | [`cathedral/VALIDATOR.md`](https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md), plus [this repo's provenance contract](docs/PROVENANCE.md) |
-| Understand the architecture and trust boundary | [docs/EVIDENCE_LANE.md](docs/EVIDENCE_LANE.md) |
-| Contribute to protocol code | [`cathedral` issues](https://github.com/cathedralai/cathedral/issues), [this repo's issues](https://github.com/cathedralai/cathedral-compute/issues) |
+Validators verify the signed epoch report and independently map hotkeys to UIDs
+before any chain decision; the producer can never pay itself unchecked.
 
-How the evidence lane works, what is deployed versus designed, the admission
-boundary in full, and exactly what attestation does and does not prove:
-[docs/EVIDENCE_LANE.md](docs/EVIDENCE_LANE.md). Current live state: the
-[signed vector](https://api.cathedral.computer/v1/validator/weights/next) and
-[public evidence index](https://api.cathedral.computer/v1/evidence/index.json).
+Start at [`cathedral/VALIDATOR.md`](https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md),
+then this repo's [provenance contract](docs/PROVENANCE.md),
+[policy registry](docs/POLICY_REGISTRY.md), and
+[receipts](docs/RECEIPTS.md). Assurance claims and their limits:
+[docs/ASSURANCE.md](docs/ASSURANCE.md).
 
-## Verify the software yourself
-
-Requires Python 3.11 or newer:
+Verify the software yourself (Python 3.11+):
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-compute.git
 cd cathedral-compute
-
-python3.11 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip
+python3.11 -m venv .venv && . .venv/bin/activate
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
 The suite collects 1640 tests, and `tests/test_documented_counts.py` holds that
-number to this file, so it cannot quietly drift. The collected count is stated
-rather than a passing count, because the TDX and SEV-SNP suites skip unless the
-hardware is present. Passing proves software behavior against test doubles; it
-does not prove live Intel hardware, deployment, a current eligible miner, or an
-on-chain write. Per-command breakdown: [docs/TESTING.md](docs/TESTING.md).
+number to this file, so it cannot quietly drift. Passing proves software
+behavior against test doubles; it does not prove live hardware, deployment, or
+an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated
+evidence record in [BUILD_STATUS.md](BUILD_STATUS.md).
 
-## Documentation
+---
 
-### Current operator and assurance documents
-
-- [Build and evidence status](BUILD_STATUS.md)
-- [Mining and provider onboarding](MINING.md)
-- [Evidence lane: architecture, status, trust boundary](docs/EVIDENCE_LANE.md)
-- [Warm supply: where the mechanism is going](docs/WARM_SUPPLY.md)
-- [Assurance claims](docs/ASSURANCE.md)
-- [Intel TDX launch path](docs/TDX_LAUNCH.md)
-- [Public and controlled provenance](docs/PROVENANCE.md)
-- [Enrollment allowlist](docs/ENROLLMENT_ALLOWLIST.md)
-- [Policy registry](docs/POLICY_REGISTRY.md)
-- [Receipts](docs/RECEIPTS.md)
-- [Cathedral Computer customer receipts](docs/CUSTOMER_RECEIPTS.md)
-- [Worker lifecycle](docs/LIFECYCLE.md)
-- [Workload admission](docs/WORKLOAD_ADMISSION.md)
-
-### Design and future capability
-
-- [Architecture and roadmap](docs/DESIGN.md)
-- [GPU attestation foundation](docs/GPU_ATTESTATION.md)
-- [Key-release design](docs/KEY_RELEASE.md)
-
-Design documents describe intended capability, not deployed availability.
-
-### Historical
-
-[docs/history/](docs/history/) holds superseded build plans and commissioning
-handoffs. They are kept for provenance and **must not** be used as current
-onboarding instructions. Start at [MINING.md](MINING.md) instead.
-
-> This repository was previously named `cathedralconfidential`. Old links
-> redirect here. The installed Python package and its console command keep the
-> historical `cathedral` identifier, and downstream validators pin this
-> repository by commit, so a rename cannot invalidate those pins.
-
-## Licensing
-
-See [LICENSE](LICENSE).
+<sub>Previously named `cathedralconfidential`; old links redirect and
+validator commit pins stay valid. Design docs
+([DESIGN.md](docs/DESIGN.md), [GPU_ATTESTATION.md](docs/GPU_ATTESTATION.md),
+[KEY_RELEASE.md](docs/KEY_RELEASE.md)) describe intended capability, not
+deployed availability. [docs/history/](docs/history/) is provenance, not
+onboarding. License: [MIT](LICENSE).</sub>
