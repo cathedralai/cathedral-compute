@@ -54,6 +54,17 @@ Each phase holds indefinitely if the one after it is not ready. The calibration
 data for every threshold comes from M0 capture across the live fleet, never
 from one-off observations.
 
+## Supply follows demand
+
+Paying for capacity nobody uses is how incentive networks die: supply balloons,
+revenue never arrives, and the token subsidizes an empty warehouse. This
+network onboards miners relative to demand, through the enrollment allowlist,
+and grows the admit set as real workload arrives from three directions: the
+distill track's verification workload, partnerships with subnet owners who
+need attested sandboxes inside their own stack, and paying customers. The
+demand-coupling phase (M4) makes this structural: verified serving of real
+customer work outweighs probes, and it arms only after demonstrated demand.
+
 ## What this means for an operator today
 
 - Keep your worker warm and answering. When probe scoring arms, the historical
