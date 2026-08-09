@@ -1,6 +1,8 @@
-# Cathedral Compute
-
-**Intel TDX CPU evidence and verified-work scoring for Cathedral SN39.**
+<div align="center">
+  <h1>⚡ Cathedral Compute</h1>
+  <p><strong>The fastest sandbox fleet on earth, built from machines that prove what they run.</strong></p>
+  <p><code>MAINNET LIVE TESTING</code></p>
+</div>
 
 <!-- VIDEO SLOT -----------------------------------------------------------
 Walkthrough video goes here, matching cathedral-distill's README.
@@ -14,9 +16,19 @@ these comment markers.
 </div>
 ------------------------------------------------------------------------ -->
 
-Attestation is admission, not payment. Registration, uptime, a valid quote,
-hardware ownership, or self-reported volume never earns weight on its own. Only
-verified work does, and positive weight and emissions are never guaranteed.
+Every other provider buys its fleet. This network recruits one. A hot,
+attested Intel TDX worker is an edge node of a single distributed machine
+whose job is to hand an AI agent a sandbox that already exists before it
+asks. Idle costs the network nothing, so the fleet can afford to be warm
+everywhere.
+
+## Three rules keep it honest
+
+| Rule | Meaning |
+|---|---|
+| Attestation is admission, not payment | Registration, uptime, a valid quote, hardware ownership, or self-reported volume never earns weight. Only verified work does, and positive weight and emissions are never guaranteed. |
+| Supply follows demand | The network does not pay for capacity nobody uses. Miners onboard through an approval gate that opens as real demand arrives: the distill track, subnet partnerships that need attested sandboxes in their stack, and paying customers. |
+| Nothing is advertised before it pays | What pays today is verified work under `validated_supply_v2`. The latency-paid direction is [docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md), every phase labeled with whether it pays. |
 
 > This repository was previously named `cathedralconfidential`. Old links
 > redirect here. The installed Python package and its console command keep the
