@@ -1,6 +1,19 @@
 # Cathedral Compute
 
-**Intel TDX CPU evidence and verified-work scoring for Cathedral SN39.**
+**We are building the fastest sandbox fleet on earth, out of machines that
+prove what they run.**
+
+Every other provider buys its fleet. This network recruits one. A miner who
+keeps a hot, attested Intel TDX worker standing by is an edge node of a single
+distributed machine whose job is to hand an AI agent a sandbox that already
+exists before it asks, milliseconds away, on hardware that can prove its work.
+Idle costs this network nothing, so the fleet can afford to be warm everywhere;
+the mechanism's direction is to pay for exactly that. Where it is going, phase
+by phase, and the strict rule that nothing is advertised before it pays:
+[docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md).
+
+What this repository holds today: Intel TDX CPU evidence and verified-work
+scoring for Cathedral SN39.
 
 <!-- VIDEO SLOT -----------------------------------------------------------
 Walkthrough video goes here, matching cathedral-distill's README.
