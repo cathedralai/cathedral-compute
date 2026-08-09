@@ -13,7 +13,9 @@ import json
 import math
 import os
 import threading
+import time
 import urllib.parse
+import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -49,7 +51,7 @@ from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
-from cathedral.ledger import CustomerJobLease, Ledger
+from cathedral.ledger import CustomerJobLease, Ledger, LedgerError
 from cathedral.lifecycle import (
     NETWORK_ELIGIBLE_STATES,
     LifecycleError,
@@ -61,6 +63,31 @@ from cathedral.lifecycle import (
 from cathedral.poster import Poster
 from cathedral.receipt import ReceiptIssuer
 from cathedral.remote import RemoteMiner
+
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+_process_boot_id: str | None = None
+_process_boot_id_lock = threading.Lock()
+
+
+def _producer_boot_id() -> str:
+    """The producer host boot identity stamped on shadow timing rows.
+
+    Monotonic clocks reset across reboots, so two timing rows are only
+    comparable under the same boot id. Falls back to a per-process token where
+    the kernel boot id is unavailable (non-Linux test hosts), which keeps the
+    same property: rows never compare across clock domains.
+    """
+    global _process_boot_id
+    with _process_boot_id_lock:
+        if _process_boot_id is None:
+            try:
+                _process_boot_id = _BOOT_ID_PATH.read_text(encoding="ascii").strip()
+            except OSError:
+                _process_boot_id = f"process:{uuid.uuid4().hex}"
+            if not _process_boot_id:
+                _process_boot_id = f"process:{uuid.uuid4().hex}"
+        return _process_boot_id
+
 from cathedral.score_audience import validate_score_audience
 from cathedral.verify import preflight_tdx_verifier, verify
 
@@ -302,6 +329,7 @@ class ConfidentialRuntime:
         self.nonce_factory = nonce_factory
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
+        self._work_timing_failures = 0
         gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
         if self.config.expected_tier is Tier.CC_GPU and any(
             item is None for item in gpu_configuration
@@ -1333,13 +1361,17 @@ class ConfidentialRuntime:
                 issued.append((result, item, lease))
 
             with ThreadPoolExecutor(max_workers=len(issued)) as executor:
-                futures = [
-                    executor.submit(self._request_sat, result.client, item)
-                    for result, item, _lease in issued
-                ]
-                for (result, item, lease), future in zip(issued, futures, strict=True):
+                dispatched_ns: list[int] = []
+                futures: list[Future[tuple[SatCertificate | None, str | None]]] = []
+                for result, item, _lease in issued:
+                    dispatched_ns.append(time.monotonic_ns())
+                    futures.append(executor.submit(self._request_sat, result.client, item))
+                for (result, item, lease), future, dispatch_ns in zip(
+                    issued, futures, dispatched_ns, strict=True
+                ):
                     certificate, error = future.result()
                     accepted = lane.verify(item, certificate) if certificate is not None else None
+                    self._record_work_timing(item, lease, dispatch_ns, time.monotonic_ns())
                     if accepted is None:
                         failure = error or "invalid SAT certificate"
                         assurance = _work_assurance(
@@ -1423,6 +1455,37 @@ class ConfidentialRuntime:
                         work_units=units,
                         assurance=assurance,
                     )
+
+    def _record_work_timing(
+        self,
+        item: SatWorkItem,
+        lease: CustomerJobLease | None,
+        dispatch_ns: int,
+        verified_ns: int,
+    ) -> None:
+        """Record producer-clocked shadow timing for one dispatched work item.
+
+        Calibration capture only (warm_supply M0): nothing on the scoring or
+        export path reads it, so a refused row must not fail the epoch the way
+        receipt-path writes do. It still cannot be silent, because quietly
+        thin shadow data would calibrate the future latency buckets on a
+        sample the producer believed was complete.
+        """
+        try:
+            self.ledger.record_work_timing(
+                item.challenge_id,
+                dispatch_monotonic_ns=dispatch_ns,
+                verified_monotonic_ns=verified_ns,
+                job_class="canonical" if lease is None else "customer",
+                producer_boot_id=_producer_boot_id(),
+            )
+        except LedgerError as exc:
+            self._work_timing_failures += 1
+            if self._work_timing_failures == 1 or self._work_timing_failures % 100 == 0:
+                print(
+                    f"work timing capture refused ({self._work_timing_failures} total): {exc}",
+                    flush=True,
+                )
 
     def _resolve_work(
         self,
