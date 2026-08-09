@@ -1,7 +1,7 @@
 # Warm Supply: where this mechanism is going
 
-**The mission: the fastest sandbox fleet on earth, built out of machines that
-prove what they run.**
+**The mission: win the race to the fastest sandbox fleet on earth, with
+machines that prove what they run.**
 
 Every other sandbox provider buys its fleet: datacenters, capacity contracts,
 capex in every region. This network recruits its fleet. A miner who keeps a

@@ -1,6 +1,6 @@
 <div align="center">
   <h1>⚡ Cathedral</h1>
-  <p><strong>Bittensor SN39 · The fastest sandbox fleet on earth, built from machines that prove what they run.</strong></p>
+  <p><strong>Bittensor SN39 · Racing to build the fastest sandbox fleet on earth, from machines that prove what they run.</strong></p>
   <p><a href="https://cathedral.computer">cathedral.computer</a> · <a href="MINING.md">Mine</a> · <a href="https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md">Validate</a> · <a href="https://github.com/cathedralai/cathedral-distill">Distill track</a></p>
 </div>
 
