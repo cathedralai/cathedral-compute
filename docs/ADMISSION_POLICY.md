@@ -163,10 +163,17 @@ remains the chip-id gate at admission.
 
 > `max_admitted_workers_total` is enforced at enrollment as a necessary
 > condition, because enrolled is always greater than or equal to admitted.
-> The authoritative admitted-count gate belongs at admission
-> (`runtime.py::_admit_unique_chips`) and **is not implemented**. Until it
-> lands, do not read this cap as a proof that the admitted population is
-> bounded — read it as a bound on the pending directory.
+> The authoritative admitted-count gate belongs at admission, alongside
+> `runtime.py::_admit_unique_chips`, and **that count gate is not
+> implemented**. Until it lands, do not read this cap as a proof that the
+> admitted population is bounded; read it as a bound on the pending
+> directory.
+>
+> To be unambiguous about what does exist: `_admit_unique_chips` itself is
+> implemented and runs every epoch (`runtime.py::_admit_unique_chips`,
+> invoked from the epoch attestation path). It enforces chip-id uniqueness
+> and chip-to-hotkey rotation binding. What is missing is only the
+> admitted-count cap, not the gate.
 >
 > Two related limits worth knowing before enabling open mode. The per-pass
 > probe budget bounds the standalone prober; the validator's own epoch
