@@ -82,9 +82,14 @@ eligible for re-attestation in the next cycle.
 ## Policy and concurrency safety
 
 A measurement removed from the active policy moves directly to `revoked`
-without contacting the worker. Identity conflicts do the same. Terminal
-transitions cancel local refresh work; generation and revision checks discard
-late results from another thread or process before they can restore eligibility.
+without contacting the worker. A GPU identity conflict does the same, because a
+passed-through GPU identity claimed by two workers has no innocent reading.
+Chip contention does not: a duplicate or already-bound `chip_id` is refused for
+the epoch and the worker stays eligible, since `chip_id` derives from a
+per-host PPID that co-resident cloud guests share through no fault of their own.
+Terminal transitions cancel local refresh work; generation and revision checks
+discard late results from another thread or process before they can restore
+eligibility.
 
 Each state change appends an event and updates the current projection in one
 database transaction. Clock rollback, an illegal transition, or a stale

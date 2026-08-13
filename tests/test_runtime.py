@@ -27,6 +27,7 @@ from cathedral.common import (
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
+from cathedral.lifecycle import NETWORK_ELIGIBLE_STATES, WorkerLifecycleState
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
@@ -991,6 +992,44 @@ def test_duplicate_chip_excludes_all_independent_of_order(
     assert dict(run.scores) == {"a": 0.0, "b": 0.0}
     assert {outcome.status for outcome in run.outcomes} == {"duplicate_chip"}
     assert ledger.attested_hotkeys(run.epoch_id) == frozenset()
+    # Refused for the epoch, not revoked: chip_id names a physical host, so a
+    # collision has an innocent explanation under cloud tenancy (#138).
+    for hotkey in ("a", "b"):
+        lifecycle = runtime.registry.lifecycle_snapshot(hotkey)
+        assert lifecycle.state is not WorkerLifecycleState.REVOKED
+        assert lifecycle.state in NETWORK_ELIGIBLE_STATES
+
+
+def test_duplicate_chip_claimant_earns_again_once_the_collision_clears(
+    tmp_path: Path,
+) -> None:
+    """The refusal must not outlive the epoch that saw the collision.
+
+    Two co-resident miners collide in epoch 1. In epoch 2 only one of them is
+    still attesting on that chip, and it must be admitted and scored with no
+    operator action -- which a terminal REVOKED state would have made
+    impossible.
+    """
+
+    specs = default_specs(**{"9001": MinerSpec("same"), "9002": MinerSpec("same")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("a", "http://127.0.0.1:9001"), ("b", "http://127.0.0.1:9002")],
+        specs,
+        poster=RecordingPoster(),
+    )
+
+    first = runtime.run_epoch(1, CANARY, publish=True)
+    assert {outcome.status for outcome in first.outcomes} == {"duplicate_chip"}
+
+    # "b" is rescheduled onto its own host, so the chip is uncontested.
+    specs["http://127.0.0.1:9002"] = MinerSpec("other")
+
+    second = runtime.run_epoch(2, CANARY)
+    statuses = {outcome.hotkey: outcome.status for outcome in second.outcomes}
+    assert statuses == {"a": "verified", "b": "verified"}
+    assert dict(second.scores) == {"a": 1.0, "b": 1.0}
+    assert ledger.attested_hotkeys(second.epoch_id) == frozenset({"a", "b"})
 
 
 def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> None:
@@ -1041,6 +1080,11 @@ def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> No
     assert "already bound to hotkey a" in (
         next(o.error for o in second.outcomes if o.hotkey == "b") or ""
     )
+    # The later claimant is refused while the incumbent binding is live, not
+    # revoked: on cloud supply it may simply have been placed on that host.
+    lifecycle = registry.lifecycle_snapshot("b")
+    assert lifecycle.state is not WorkerLifecycleState.REVOKED
+    assert lifecycle.state in NETWORK_ELIGIBLE_STATES
 
 
 def test_invalid_miner_is_zero_while_peer_succeeds(tmp_path: Path) -> None:

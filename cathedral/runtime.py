@@ -1052,13 +1052,19 @@ class ConfidentialRuntime:
         for chip_id in sorted(chip_groups):
             group = chip_groups[chip_id]
             if len(group) > 1:
+                # chip_id is derived from the PCK PPID, which names a physical
+                # platform and not a guest, so co-resident tenants on one cloud
+                # host collide without either of them misbehaving (#138).
+                # Contention is refused for the epoch instead of revoked: no
+                # duplicate chip earns, and an honest claimant does not need an
+                # operator to lift a terminal state it never deserved.
                 for result in group:
-                    self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
                         "duplicate_chip",
-                        error="all claimants of a duplicate chip are excluded",
+                        error="all claimants of a duplicate chip are refused for this epoch",
+                        error_category="identity_conflict",
                     )
                 continue
             result = group[0]
@@ -1082,12 +1088,16 @@ class ConfidentialRuntime:
                 continue
             rotation_owner = self.registry.chip_rotation_owner(chip_id, result.target.hotkey)
             if rotation_owner is not None:
-                self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
+                # The same contention seen across epochs rather than inside one
+                # batch. The incumbent keeps its binding either way, so the
+                # later claimant is refused while that binding is live and is
+                # free to claim the chip once it lapses.
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
                     result.endpoint,
                     "chip_rotation_conflict",
                     error=f"chip_id already bound to hotkey {rotation_owner}",
+                    error_category="identity_conflict",
                 )
                 continue
             pending_gpu_claim = None
