@@ -235,6 +235,15 @@ CREATE TABLE IF NOT EXISTS epoch_worker_lifecycle (
     PRIMARY KEY (epoch_id, hotkey)
 );
 
+CREATE TABLE IF NOT EXISTS work_timing (
+    challenge_id TEXT PRIMARY KEY REFERENCES challenges(challenge_id),
+    dispatch_monotonic_ns INTEGER NOT NULL CHECK (dispatch_monotonic_ns >= 0),
+    verified_monotonic_ns INTEGER NOT NULL CHECK (verified_monotonic_ns >= dispatch_monotonic_ns),
+    job_class TEXT NOT NULL CHECK (job_class IN ('canonical', 'customer')),
+    producer_boot_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS customer_jobs (
     job_id TEXT PRIMARY KEY,
     customer_id TEXT NOT NULL,
@@ -2169,6 +2178,71 @@ class Ledger:
                     "result_body, created_at) VALUES (?, ?, ?, ?)",
                     (challenge_id, work_item_body, result_body, _now()),
                 )
+
+    def record_work_timing(
+        self,
+        challenge_id: str,
+        *,
+        dispatch_monotonic_ns: int,
+        verified_monotonic_ns: int,
+        job_class: str,
+        producer_boot_id: str,
+    ) -> None:
+        """Persist producer-clocked dispatch/verification timing for one challenge.
+
+        Shadow calibration data only: nothing on the scoring or export path reads
+        this table, so recording can never move a weight. Timing that would
+        violate the schema (negative, non-monotonic, unknown class) is a producer
+        bug and fails closed rather than storing a row the calibration would
+        silently trust. Idempotent for identical values; different values for a
+        recorded challenge are equivocation and fail closed, matching
+        record_work_artifacts.
+        """
+        if (
+            not challenge_id
+            or isinstance(dispatch_monotonic_ns, bool)
+            or isinstance(verified_monotonic_ns, bool)
+            or not isinstance(dispatch_monotonic_ns, int)
+            or not isinstance(verified_monotonic_ns, int)
+            or dispatch_monotonic_ns < 0
+            or verified_monotonic_ns < dispatch_monotonic_ns
+            or job_class not in ("canonical", "customer")
+            or not producer_boot_id
+            or not isinstance(producer_boot_id, str)
+        ):
+            raise LedgerError("work timing is invalid")
+        values = (
+            dispatch_monotonic_ns,
+            verified_monotonic_ns,
+            job_class,
+            producer_boot_id,
+        )
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT dispatch_monotonic_ns, verified_monotonic_ns, job_class, "
+                "producer_boot_id FROM work_timing WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if row is not None:
+                if tuple(row) != values:
+                    raise LedgerError(f"work timing for {challenge_id!r} is immutable")
+                return
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO work_timing (challenge_id, dispatch_monotonic_ns, "
+                    "verified_monotonic_ns, job_class, producer_boot_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (challenge_id, *values, _now()),
+                )
+
+    def work_timing_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT dispatch_monotonic_ns, verified_monotonic_ns, job_class, "
+                "producer_boot_id, created_at FROM work_timing WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
 
     def work_artifacts_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
         with self._lock:
