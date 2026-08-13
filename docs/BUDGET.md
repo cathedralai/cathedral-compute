@@ -93,7 +93,7 @@ drift — and never a multi-gigabyte cap.
 
 Economic rollback follows the same monotonic rules as policy rollback
 (`docs/MRTD.md`): mechanisms are versioned and pinned in manifests,
-recomputation, and validator config; the subnet's cathedralconfidential
+recomputation, and validator config; the subnet's cathedral-compute
 dependency is an immutable full-sha pin, so reverting code is an explicit
 reviewed re-pin, and durable anti-rollback fences prevent any older
 signed state from verifying again.

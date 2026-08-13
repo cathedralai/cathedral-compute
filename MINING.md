@@ -116,7 +116,7 @@ self-reported volume alone.
 ## 1. Request a beta slot
 
 Open the public
-[miner beta request](https://github.com/cathedralai/cathedralconfidential/issues/new?template=miner-beta.yml).
+[miner beta request](https://github.com/cathedralai/cathedral-compute/issues/new?template=miner-beta.yml).
 You may apply before you have a machine. Include only:
 
 - your public SS58 hotkey address;
@@ -154,8 +154,8 @@ You need:
 Install the repository into an isolated environment:
 
 ```bash
-git clone https://github.com/cathedralai/cathedralconfidential.git
-cd cathedralconfidential
+git clone https://github.com/cathedralai/cathedral-compute.git
+cd cathedral-compute
 
 python3.11 -m venv .venv
 . .venv/bin/activate
