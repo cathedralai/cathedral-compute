@@ -67,7 +67,7 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 **ecdsa 0.19.2 — PYSEC-2026-1325 (Minerva timing, P-256 sign/keygen/ECDH).**
 Dependency-path evidence, collected 2026-07-24 on the launch venvs:
 `pip show ecdsa` → `Required-by: substrate-interface` ONLY, and only in the
-cathedralconfidential *dev* extra venv (the subnet validator venv does not
+cathedral-compute *dev* extra venv (the subnet validator venv does not
 install it; `bittensor` uses its own sr25519/ed25519 stacks). `grep -rn
 "import ecdsa|from ecdsa" cathedral/ scaffold/` → zero hits: no launch-path
 code imports it directly. substrate-interface uses ecdsa only for

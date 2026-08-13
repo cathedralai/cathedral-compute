@@ -1,4 +1,4 @@
-# Independent provenance verification (cathedralconfidential)
+# Independent provenance verification (cathedral-compute)
 
 Public claim under proof: **"SN39 mainnet: validated Intel TDX CPU
 compute."** Nothing broader. This document describes how ANY third party
@@ -11,13 +11,22 @@ evidence — and exactly what each outcome means.
 > supported release, and clean outside-operator reproduction remain launch
 > gates. Locally green code and a signed receipt chain are not substitutes.
 
-> **Current compatibility: `FAIL` (audited 2026-07-25).** The deployed signed
-> vector currently advertises contract v1 and `verified_gpu_allocation`, and
-> does not carry `external_scores.latest_body_sha256`. This verifier requires
-> the v2 `fixed_burn_allocation` contract and exact body binding. Therefore the
-> current public vector cannot pass this repository's end-to-end comparison.
-> Publisher, validator, verifier, and release pins must converge before
-> independent reproduction can be claimed.
+> **Current compatibility: `AGREE` (2026-08-07).** Publisher, validator,
+> verifier and release pins converged: the deployed vector carries the
+> `fixed_burn_allocation` contract and exact body binding, and this
+> repository's end-to-end comparison passes against it. `BUILD_STATUS.md`
+> carries the same result and is the file to trust if the two ever disagree.
+>
+> The earlier `FAIL` recorded here (audited 2026-07-25) is superseded. It
+> described a v1 vector advertising `verified_gpu_allocation` with no
+> `external_scores.latest_body_sha256`, which is no longer what is deployed.
+>
+> A validator pinned to `validated_supply_v1` accepts v2 evidence
+> (`MECHANISM_ACCEPTED` in the validator scaffold), and the burn contract is
+> always looked up from the operator's own pinned mechanism rather than from
+> the id a manifest claims, so widening acceptance cannot move the burn. New
+> evidence is emitted as v2; v1 is retired only once no live validator pins it
+> and no historical release needs reproducing.
 
 ## Reproduction contract
 
@@ -30,7 +39,7 @@ From a clean machine (fresh venv, no Cathedral infrastructure access):
 
 ```bash
 python -m pip install --upgrade 'pip>=26.1.2'
-pip install <pinned cathedralconfidential release>
+pip install <pinned cathedral-compute release>
 
 # Capture the candidate oracle with YOUR OWN chain access (from the
 # cathedralsubnet package): the anchored block is printed by the manifest.

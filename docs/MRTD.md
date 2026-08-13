@@ -183,7 +183,7 @@ receipt time — at admission and again at independent replay.
 - **Bad policy release:** publish a corrected HIGHER release. Lower
   releases are refused by every durable high-water fence; there is no
   in-place mutation path, and `generated_at` can never move backwards.
-- **Bad code release:** the subnet consumes cathedralconfidential only
+- **Bad code release:** the subnet consumes cathedral-compute only
   through an immutable full-sha pin (`docs/BUDGET.md`); rolling back
   means pinning the previous reviewed sha — an explicit, reviewed commit.
 

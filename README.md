@@ -49,9 +49,10 @@ Three rules keep it honest:
 **Where it is going: [docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md).** The
 mechanism's next revisions pay for being fast and warm: producer-clocked
 latency scoring on probes indistinguishable from customer work, capacity from
-your attested profile, grades instead of cliffs. Shadow measurement is running
-now; nothing in it pays until validators adopt the re-pinned contract, and the
-phase table says exactly which phase pays.
+your attested profile, grades instead of cliffs. Shadow measurement is designed
+and under review, not running: it lands with M0. Nothing in it pays until
+validators adopt the re-pinned contract, and the phase table says exactly which
+phase pays.
 
 Deep dive (architecture, deployed-versus-designed status, trust boundary):
 [docs/EVIDENCE_LANE.md](docs/EVIDENCE_LANE.md). Live state: the
