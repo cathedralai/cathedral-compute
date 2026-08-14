@@ -28,6 +28,12 @@ a new endpoint, is refused. Returning a `retiring` worker to service is the
 operator's own action (`cathedral lifecycle reenroll`), not something the
 worker can trigger by changing its endpoint URL.
 
+A worker already `failed` or `retired` before an epoch begins also leaves
+that epoch's frozen score report, since neither state consumes admission
+capacity; `revoked` does consume capacity and keeps its explicit zero row.
+Enrollment rows are never deleted, so this is what keeps the report bounded
+as workers churn through the subnet over time.
+
 ## Freshness and retries
 
 Freshness is calculated from the attestation verification time plus the

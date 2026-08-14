@@ -230,24 +230,52 @@ def test_canary_failure_creates_no_epoch(tmp_path: Path) -> None:
     assert ledger.blocking_epoch() is None
 
 
-def test_canary_endpoint_collision_creates_no_epoch(tmp_path: Path) -> None:
-    specs = {CANARY.endpoint_url: MinerSpec("chip")}
-    runtime, ledger, _ = make_runtime(tmp_path, [("miner", CANARY.endpoint_url)], specs)
-    with pytest.raises(RuntimeError, match="dedicated"):
-        runtime.run_epoch(1, CANARY)
-    assert ledger.blocking_epoch() is None
+def test_canary_endpoint_claimant_is_excluded_and_the_epoch_completes(tmp_path: Path) -> None:
+    """A miner that enrolls at the canary's own endpoint must not wedge the
+    epoch: one signed enrollment request cannot be allowed to stall every
+    published weight. The claimant is excluded for the epoch instead."""
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("squatter", CANARY.endpoint_url), ("miner", "http://127.0.0.1:9001")],
+        specs,
+    )
+    run = runtime.run_epoch(1, CANARY)
+    assert run.status == "complete"
+    # The fleet still earns even though one claimant collided with the canary.
+    assert run.scores["miner"] == 1.0
+    assert run.scores["squatter"] == 0.0
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["squatter"].status == "canary_endpoint_conflict"
+    # Never probed: the claimant is excluded before attestation is attempted.
+    assert "nonce:squatter" not in factory.log
+
+    # The wedge does not recur epoch over epoch: unblock begin_epoch the same
+    # way any completed-but-unpublished epoch does, then the squatter stays
+    # parked at the canary endpoint and every subsequent epoch completes.
+    runtime.abandon_completed(run.epoch_id, "test does not publish")
+    run2 = runtime.run_epoch(2, CANARY)
+    assert run2.status == "complete"
 
 
 def test_canary_collision_is_rejected_even_when_enrollment_is_duplicated(tmp_path: Path) -> None:
+    """Two hotkeys claiming the canary endpoint (one a trailing-slash
+    variant) are both dropped as duplicate_endpoint inside _prepare_targets
+    before the canary-endpoint check ever sees them, so the epoch still
+    completes."""
     specs = {CANARY.endpoint_url: MinerSpec("chip")}
-    runtime, ledger, _ = make_runtime(
+    runtime, ledger, factory = make_runtime(
         tmp_path,
         [("a", CANARY.endpoint_url), ("b", CANARY.endpoint_url + "/")],
         specs,
     )
-    with pytest.raises(RuntimeError, match="dedicated"):
-        runtime.run_epoch(1, CANARY)
-    assert ledger.blocking_epoch() is None
+    run = runtime.run_epoch(1, CANARY)
+    assert run.status == "complete"
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["a"].status == "duplicate_endpoint"
+    assert outcomes["b"].status == "duplicate_endpoint"
+    assert "nonce:a" not in factory.log
+    assert "nonce:b" not in factory.log
 
 
 def test_canary_chip_collision_at_distinct_endpoint_creates_no_epoch(tmp_path: Path) -> None:
@@ -687,6 +715,49 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert dict(run.scores) == {"miner-a": 1.0, "miner-b": 1.0}
     assert {outcome.status for outcome in run.outcomes} == {"verified"}
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
+
+
+def test_retired_enrollment_leaves_the_report_universe(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+    )
+    # remove_enrollment is the strongest removal the API offers: it lands
+    # RETIRING lifecycle to RETIRED and clears the stored verdict. The row
+    # itself is never deleted (enrollments are append-only), so miner-b stays
+    # in the registry forever.
+    runtime.registry.remove_enrollment("miner-b")
+
+    run = runtime.run_epoch(1, CANARY)
+
+    report = json.loads(ledger.report_bytes(run.epoch_id))
+    assert {row["miner_hotkey"] for row in report["scores"]} == {"miner-a"}
+    assert "miner-b" not in run.scores
+    # Operator visibility survives the universe change: the run's own
+    # outcomes still surface the retired worker, just not the frozen report.
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["miner-b"].status == "retired"
+
+
+def test_failed_enrollment_leaves_the_report_universe(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+    )
+    # Drive miner-b to FAILED before the epoch begins, the same terminal-ish
+    # state a probe reaches after its retry ladder is exhausted.
+    runtime.registry.record_verdict("miner-b", None)
+
+    run = runtime.run_epoch(1, CANARY)
+
+    report = json.loads(ledger.report_bytes(run.epoch_id))
+    assert {row["miner_hotkey"] for row in report["scores"]} == {"miner-a"}
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["miner-b"].status == "failed"
 
 
 @pytest.mark.parametrize(

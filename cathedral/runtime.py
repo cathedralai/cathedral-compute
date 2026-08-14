@@ -47,12 +47,13 @@ from cathedral.common import (
     is_globally_routable,
     issue_nonce,
 )
-from cathedral.enroll import RegistryStore
+from cathedral.enroll import Enrollment, RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import CustomerJobLease, Ledger, LedgerError
 from cathedral.lifecycle import (
+    CAPACITY_CONSUMING_STATES,
     NETWORK_ELIGIBLE_STATES,
     LifecycleError,
     LifecycleReason,
@@ -698,6 +699,14 @@ class ConfidentialRuntime:
         }
         targets: list[MinerTarget] = []
         lifecycle_outcomes: dict[str, MinerOutcome] = {}
+        # Captured at epoch start, not recomputed after SAT: a worker that
+        # participates and then dies mid-epoch must stay in the universe (its
+        # receipt cross-check at ledger.py add_lifecycle_snapshot and its
+        # explicit zero both need it), while a worker already dead before the
+        # epoch began (FAILED or RETIRED) is excluded so append-only,
+        # never-deleted enrollment rows cannot grow the frozen report past
+        # MAX_LAUNCH_CANDIDATES as the subnet churns.
+        epoch_candidates: list[Enrollment] = []
         for enrollment in enrollments:
             if (
                 self._candidate_hotkeys is not None
@@ -715,6 +724,8 @@ class ConfidentialRuntime:
                 self.reattestor.cancel(enrollment.hotkey)
                 continue
             snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+            if snapshot.state in CAPACITY_CONSUMING_STATES:
+                epoch_candidates.append(enrollment)
             if snapshot.state not in NETWORK_ELIGIBLE_STATES:
                 lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
                     enrollment.hotkey,
@@ -742,7 +753,28 @@ class ConfidentialRuntime:
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
         outcomes = {**lifecycle_outcomes, **outcomes}
         if canary_endpoint in enrolled_endpoints:
-            raise RuntimeError("canary endpoint must be dedicated and not enrolled")
+            # One signed enrollment request must not stall every published
+            # weight: exclude the claimant instead of raising, mirroring the
+            # duplicate_endpoint pattern above. The excluded row is never
+            # probed, attested, or scored, so the canary stays dedicated.
+            # This is not a weakened check: the enforced property (canary
+            # work is never scored as a miner's) is preserved by exclusion;
+            # only the availability blast radius changes. The chip-identity
+            # guard below and the canary-hotkey guard above remain hard
+            # failures, since no miner can satisfy the chip guard without
+            # running on the canary's own physical socket. Claimants that
+            # duplicated the canary endpoint with each other never reach
+            # `prepared` at all: _prepare_targets already dropped them as
+            # duplicate_endpoint, so the epoch proceeds in that case too.
+            for target, endpoint in [pair for pair in prepared if pair[1] == canary_endpoint]:
+                outcomes[target.hotkey] = MinerOutcome(
+                    target.hotkey,
+                    endpoint,
+                    "canary_endpoint_conflict",
+                    error="enrolled endpoint collides with the dedicated canary endpoint; excluded this epoch",
+                )
+                self.reattestor.cancel(target.hotkey)
+            prepared = [pair for pair in prepared if pair[1] != canary_endpoint]
 
         canary_result = self._check_canary_result(canary_target)
         canary_reservation = self._reserve_gpu_canary(canary_result)
@@ -806,7 +838,7 @@ class ConfidentialRuntime:
                 self._run_sat(epoch_id, source_epoch, admitted, outcomes)
                 self._require_live_gpu_profile()
 
-                for enrollment in enrollments:
+                for enrollment in epoch_candidates:
                     # A receipt already signed this exact snapshot at
                     # issuance time; re-reading the live registry here races
                     # concurrent writers (enrollment service, standalone
@@ -823,7 +855,7 @@ class ConfidentialRuntime:
                         snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
                     self.ledger.add_lifecycle_snapshot(epoch_id, snapshot)
 
-                all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
+                all_hotkeys = {enrollment.hotkey for enrollment in epoch_candidates}
                 self._require_live_gpu_profile()
                 score_authority_valid_until = None
                 if self.config.expected_tier is Tier.CC_GPU and self.config.production_mode:
