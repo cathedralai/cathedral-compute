@@ -150,11 +150,12 @@ What consumes capacity is deliberate in both directions:
 | `RETIRED` | no | the operator's own act of freeing capacity |
 
 A worker in a terminal state (`REVOKED`, `RETIRED`) is refused if it tries to
-re-enroll. `reenroll_lifecycle` writes `PENDING` directly without consulting
-the transition table, so without that gate a revoked worker would rehabilitate
-itself by re-enrolling into its own row. It would not mint weight, because
-every attestation gate re-runs, but a revocation a miner can lift is not a
-revocation.
+re-enroll, and so is a worker in `RETIRING` even though `RETIRING` is not
+terminal. `reenroll_lifecycle` writes `PENDING` directly without consulting
+the transition table, so without that gate a revoked or retiring worker would
+rehabilitate itself by re-enrolling into its own row. It would not mint
+weight, because every attestation gate re-runs, but a revocation, or a
+retirement, that a miner can lift is not a revocation or a retirement.
 
 One further rule applies only under a policy: an endpoint already enrolled by
 a different live worker is refused (`endpoint_claimed`). This is the
@@ -206,15 +207,24 @@ python -m cathedral.enroll \
   --admission-policy /etc/cathedral/admission-policy-sn39.json \
   --admission-policy-keys /etc/cathedral/admission-policy-keys.json \
   --admission-policy-keys-digest sha256:<digest of the key file> \
-  --admission-policy-digest sha256:<digest of the policy artifact>
+  --admission-policy-state /var/lib/cathedral/admission-policy-state.json
 ```
 
-Production requires both digests. The key digest pins the root of trust, not
-the document; the `config_version` guard is in-process and resets on restart,
-so a superseded but still validly signed policy could otherwise be replayed
-to re-open a mode or restore a revoked coldkey. **Pinning the artifact digest
-is what makes revocation durable.** Rotating a pinned policy is deliberately
-a restart with the new digest.
+Production requires the key digest plus the state file, not an artifact
+digest pin. The key digest pins the root of trust, not the document; without
+it a superseded but still validly signed policy could be replayed with a
+compromised or stale key. The state file records the highest accepted
+`config_version` durably across restarts, which is what actually makes
+revocation and rollback resistance survive a restart: an in-process-only
+guard forgets on every restart.
+
+Pinning the policy artifact itself with `--admission-policy-digest` is
+optional and not part of the production requirement, because it conflicts
+with rotation: the staleness ceiling forces a re-sign before `issued_at` goes
+stale, a re-sign changes the canonical document and therefore the digest, and
+a service with a required artifact pin would then refuse every enrollment
+until an operator restarted it with the new digest. Use it only for a policy
+that is deliberately frozen and not expected to rotate.
 
 ## Rejection reasons
 
