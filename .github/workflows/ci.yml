@@ -82,7 +82,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.25.13"
           cache-dependency-path: cmd/cathedral-tdx-verifier/go.sum
 
       - name: Test
@@ -90,7 +90,7 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: |
-          test "$(go env GOVERSION)" = go1.25.12
+          test "$(go env GOVERSION)" = go1.25.13
           go mod verify
           go vet ./...
           go test -race ./...
