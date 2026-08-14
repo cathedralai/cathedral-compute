@@ -1034,12 +1034,24 @@ def _build_runtime(
             Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
         )
     ledger = Ledger(args.ledger_db)
+    registry = RegistryStore(getattr(args, "registry_db", ":memory:"))
+
+    def token_provider(hotkey: str) -> str | None:
+        """The operator's token file first, then the token minted at enrollment.
+
+        File first so an operator can still override or revoke one worker's
+        token without touching the registry, which is the only manual control
+        that remains. Registry second so a miner that enrolled after this
+        landed needs no manual step at all.
+        """
+        return tokens.get(hotkey) or registry.worker_token(hotkey)
+
     runtime = ConfidentialRuntime(
-        RegistryStore(getattr(args, "registry_db", ":memory:")),
+        registry,
         ledger,
         policy,
         _publisher_from_args(args),
-        token_provider=tokens.get,
+        token_provider=token_provider,
         policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,

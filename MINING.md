@@ -218,17 +218,34 @@ weight, or earnings.
 
 ## 4. Create worker credentials
 
-Use a unique random credential for each worker. Store it with mode `0600`:
+**Enrollment mints this for you.** A successful `POST /v1/enroll` returns
+`worker_token` in its response body. That is the credential this worker must
+present, and the validator already holds the same value, so no operator has to
+transcribe a secret and nothing is exchanged out of band. Store it with mode
+`0600`:
 
 ```bash
 install -d -m 700 "$HOME/.config/cathedral"
 umask 077
-openssl rand -hex 32 > "$HOME/.config/cathedral/worker-token"
+# paste the worker_token from the enrollment response
+cat > "$HOME/.config/cathedral/worker-token"
+chmod 600 "$HOME/.config/cathedral/worker-token"
 export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 ```
 
-Keep the value out of command arguments, shell history, screenshots, public
-issues, and ordinary logs. A validator does not need any wallet private key.
+The token is minted once and does not rotate on re-enrollment, so if you lose
+it, enrol again at the same endpoint and the response returns the same value.
+
+If you are on a deployment that predates minted tokens, generate your own and
+send it to the operator out of band instead:
+
+```bash
+openssl rand -hex 32 > "$HOME/.config/cathedral/worker-token"
+```
+
+Either way, keep the value out of command arguments, shell history,
+screenshots, public issues, and ordinary logs. A validator does not need any
+wallet private key.
 
 ## 5. Prove local TDX evidence first
 

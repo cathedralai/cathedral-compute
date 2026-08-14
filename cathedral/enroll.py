@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -84,6 +85,29 @@ REJECTED_HOSTS = {"localhost", "metadata.google.internal"}
 DEFAULT_HOTKEY_ENROLL_LIMIT = 20
 DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS = 3600
 _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
+
+# The bearer token the validator presents to a worker. Kept well inside
+# runtime.MAX_BEARER_TOKEN_LENGTH (4096) and restricted to the printable
+# ASCII the runtime's own validator accepts, so a minted token can never be
+# the thing that makes a miner unreachable.
+WORKER_TOKEN_BYTES = 32
+
+
+def generate_worker_token() -> str:
+    """Mint one bearer token for a worker.
+
+    ``secrets.token_urlsafe`` yields url-safe base64, which is a strict subset
+    of the printable-ASCII range ``_validate_bearer_token`` requires.
+    """
+    return secrets.token_urlsafe(WORKER_TOKEN_BYTES)
+
+
+def _valid_worker_token(token: object) -> bool:
+    return (
+        isinstance(token, str)
+        and 0 < len(token) <= 4096
+        and all(0x21 <= ord(character) <= 0x7E for character in token)
+    )
 
 
 class RegistrationProvider(Protocol):
@@ -597,6 +621,13 @@ class RegistryStore:
                     "UPDATE enrollments SET endpoint_canonical = endpoint_url"
                     " WHERE endpoint_canonical IS NULL"
                 )
+            # The bearer token the validator presents to this worker. Minted
+            # once at enrollment and returned to the miner in that response,
+            # so no operator has to transcribe a secret by hand. NULL for rows
+            # written before this existed; those keep working from the
+            # operator's token file, which still wins on lookup.
+            if "worker_token" not in enrollment_columns:
+                conn.execute("ALTER TABLE enrollments ADD COLUMN worker_token TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS enrollments_endpoint_canonical_idx
@@ -1638,9 +1669,9 @@ class RegistryStore:
                 """
                 INSERT INTO enrollments(
                     hotkey, endpoint_url, enrolled_at_iso, updated_at_iso,
-                    coldkey, requested_profile_id, endpoint_canonical
+                    coldkey, requested_profile_id, endpoint_canonical, worker_token
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hotkey) DO UPDATE SET
                     endpoint_url=excluded.endpoint_url,
                     updated_at_iso=excluded.updated_at_iso,
@@ -1648,7 +1679,8 @@ class RegistryStore:
                     requested_profile_id=COALESCE(
                         excluded.requested_profile_id, enrollments.requested_profile_id
                     ),
-                    endpoint_canonical=excluded.endpoint_canonical
+                    endpoint_canonical=excluded.endpoint_canonical,
+                    worker_token=COALESCE(enrollments.worker_token, excluded.worker_token)
                 """,
                 (
                     hotkey,
@@ -1658,6 +1690,7 @@ class RegistryStore:
                     coldkey,
                     requested_profile_id,
                     canonical_endpoint_key(endpoint_url),
+                    generate_worker_token(),
                 ),
             )
 
@@ -1827,6 +1860,22 @@ class RegistryStore:
                 "SELECT hotkey, endpoint_url FROM enrollments ORDER BY updated_at_iso, hotkey"
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
+
+    def worker_token(self, hotkey: str) -> str | None:
+        """Return the bearer token minted for *hotkey* at enrollment.
+
+        None for a hotkey that is not enrolled, and for rows written before
+        the column existed. Both cases fall back to the operator's token file,
+        so an existing deployment keeps working untouched.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT worker_token FROM enrollments WHERE hotkey = ?", (hotkey,)
+            ).fetchone()
+        if row is None:
+            return None
+        token = row["worker_token"]
+        return token if _valid_worker_token(token) else None
 
     def remove_enrollment(self, hotkey: str) -> None:
         """Retire *hotkey* and clear its published attestation verdict.
@@ -2483,7 +2532,11 @@ class RegistryApp:
                 hotkey=hotkey, reason="terminal_state",
             )
         logger.info("enroll accepted hotkey=%s", hotkey)
-        return self._json(start_response, 200, {"status": "enrolled"})
+        return self._json(
+            start_response,
+            200,
+            self._with_worker_token({"status": "enrolled"}, hotkey),
+        )
 
     def _enroll_under_policy(
         self,
@@ -2582,12 +2635,30 @@ class RegistryApp:
         return self._json(
             start_response,
             200,
-            {
-                "status": "pending",
-                "lifecycle_state": WorkerLifecycleState.PENDING.value,
-                "admission_config_version": policy.config_version,
-            },
+            self._with_worker_token(
+                {
+                    "status": "pending",
+                    "lifecycle_state": WorkerLifecycleState.PENDING.value,
+                    "admission_config_version": policy.config_version,
+                },
+                hotkey,
+            ),
         )
+
+    def _with_worker_token(self, body: dict[str, Any], hotkey: str) -> dict[str, Any]:
+        """Attach the worker's bearer token to a successful enrollment response.
+
+        The request that produced this response was signed by the hotkey, so
+        only its owner can reach here. Returning the token on every successful
+        enrollment (not just the first) is deliberate: a miner that lost it
+        re-enrols to recover it rather than asking an operator, and the token
+        itself does not change, so the validator's stored copy stays valid.
+        """
+        token = self.store.worker_token(hotkey)
+        if token is not None:
+            body = dict(body)
+            body["worker_token"] = token
+        return body
 
     def _resolve_coldkey(self, hotkey: str) -> str | None:
         """Resolve the coldkey owning *hotkey* via the registration provider.

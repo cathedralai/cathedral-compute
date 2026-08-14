@@ -195,7 +195,9 @@ def test_allowlisted_coldkey_enrolls(tmp_path: Path) -> None:
     )
     status, body = _call(app, _signed_payload(nonce="10" * 16))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled"
+    # The token is minted at enrollment and handed back here (#60 interim).
+    assert body["worker_token"]
     assert [e.hotkey for e in app.store.enrollments()] == [HOTKEY]
 
 
@@ -381,7 +383,9 @@ def test_non_production_without_allowlist_keeps_current_behavior(tmp_path: Path)
         app, _signed_payload("https://miner.example.com:8090", nonce="41" * 16)
     )
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled"
+    # The token is minted at enrollment and handed back here (#60 interim).
+    assert body["worker_token"]
 
 
 def test_non_production_with_allowlist_activates_gate(tmp_path: Path) -> None:
@@ -607,3 +611,80 @@ def test_extended_snapshot_with_invalid_values_fails_closed(tmp_path: Path) -> N
     provider = JsonHotkeyRegistrationProvider(str(bad), max_age_seconds=3600)
     assert provider.is_registered(HOTKEY) is None
     assert provider.resolve_coldkey(HOTKEY) is None
+
+
+# ---------------------------------------------------------------------------
+# Worker token minted at enrollment (#60 interim: removes the manual step)
+# ---------------------------------------------------------------------------
+
+def test_worker_token_is_minted_once_and_survives_re_enrollment(tmp_path: Path) -> None:
+    """The token must be stable across re-enrollment.
+
+    A miner that changes endpoint re-enrols, and the validator has already
+    stored the token it was minted. Rotating it on every enrollment would
+    break the validator's copy until the next epoch read, so the first token
+    wins and later enrollments return the same one.
+    """
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    status, body = _call(app, _signed_payload(nonce="20" * 16))
+    assert status == 200
+    minted = body["worker_token"]
+    assert minted and app.store.worker_token(HOTKEY) == minted
+
+    status, body = _call(
+        app,
+        _signed_payload(endpoint_url="https://8.8.4.4:9443", nonce="21" * 16),
+    )
+    assert status == 200
+    assert body["worker_token"] == minted
+    assert app.store.worker_token(HOTKEY) == minted
+
+
+def test_worker_token_is_accepted_by_the_runtime_bearer_rules(tmp_path: Path) -> None:
+    """A minted token must never be the thing that makes a miner unreachable.
+
+    The runtime refuses any token that is empty, over-long, or carries a byte
+    outside printable ASCII, and it reports that as missing_auth for the whole
+    epoch. Minting has to stay inside those bounds by construction.
+    """
+    from cathedral.enroll import generate_worker_token
+    from cathedral.runtime import MAX_BEARER_TOKEN_LENGTH, _validate_bearer_token
+
+    for _ in range(32):
+        token = generate_worker_token()
+        assert 0 < len(token) <= MAX_BEARER_TOKEN_LENGTH
+        assert all(0x21 <= ord(character) <= 0x7E for character in token)
+        _validate_bearer_token(token, required=True)
+
+    assert len({generate_worker_token() for _ in range(64)}) == 64
+
+
+def test_unenrolled_hotkey_has_no_worker_token(tmp_path: Path) -> None:
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    assert app.store.worker_token("5" + "Z" * 47) is None
+
+
+def test_rows_written_before_the_column_existed_fall_back_to_the_file(
+    tmp_path: Path,
+) -> None:
+    """A legacy enrollment has a NULL token and must not shadow the operator's
+    file. The lookup returns None so the file-based provider still answers."""
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    status, _ = _call(app, _signed_payload(nonce="22" * 16))
+    assert status == 200
+
+    with sqlite3.connect(app.store.path) as conn:
+        conn.execute("UPDATE enrollments SET worker_token = NULL WHERE hotkey = ?", (HOTKEY,))
+    assert app.store.worker_token(HOTKEY) is None
