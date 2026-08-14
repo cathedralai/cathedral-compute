@@ -22,6 +22,18 @@ requires explicit reenrollment, which creates a new generation in `pending`;
 it never rewrites the old history. Identity conflicts remain terminal for the
 generation in which they were detected.
 
+`retiring` cannot be lifted by the worker either. It is not a terminal state,
+but it is operator intent to stop the worker: a re-enrollment request, even at
+a new endpoint, is refused. Returning a `retiring` worker to service is the
+operator's own action (`cathedral lifecycle reenroll`), not something the
+worker can trigger by changing its endpoint URL.
+
+A worker already `failed` or `retired` before an epoch begins also leaves
+that epoch's frozen score report, since neither state consumes admission
+capacity; `revoked` does consume capacity and keeps its explicit zero row.
+Enrollment rows are never deleted, so this is what keeps the report bounded
+as workers churn through the subnet over time.
+
 ## Freshness and retries
 
 Freshness is calculated from the attestation verification time plus the
@@ -82,9 +94,14 @@ eligible for re-attestation in the next cycle.
 ## Policy and concurrency safety
 
 A measurement removed from the active policy moves directly to `revoked`
-without contacting the worker. Identity conflicts do the same. Terminal
-transitions cancel local refresh work; generation and revision checks discard
-late results from another thread or process before they can restore eligibility.
+without contacting the worker. A GPU identity conflict does the same, because a
+passed-through GPU identity claimed by two workers has no innocent reading.
+Chip contention does not: a duplicate or already-bound `chip_id` is refused for
+the epoch and the worker stays eligible, since `chip_id` derives from a
+per-host PPID that co-resident cloud guests share through no fault of their own.
+Terminal transitions cancel local refresh work; generation and revision checks
+discard late results from another thread or process before they can restore
+eligibility.
 
 Each state change appends an event and updates the current projection in one
 database transaction. Clock rollback, an illegal transition, or a stale
@@ -94,6 +111,16 @@ Every completed epoch includes the state, reason, generation, revision, event
 ID, evidence-expiry time, and snapshot time used for score gating. Receipt v2
 signs the same lifecycle identifiers and expiry. When a receipt exists, the
 ledger rejects an epoch snapshot that does not match those signed fields.
+
+For a worker that holds a receipt, the runtime records the exact lifecycle
+snapshot the receipt signed, captured once at receipt issuance, rather than
+re-reading the registry after the epoch's work is resolved. A registry
+lifecycle change that lands after that worker's own receipt was issued
+(self-service re-enrollment, a prober verdict, an operator retire) therefore
+takes effect at the next epoch instead of aborting the running one. A change
+that lands earlier in the epoch, before that worker's receipt is issued,
+still fails the whole epoch: the ledger rejects the mismatched snapshot and
+the epoch aborts.
 
 ## Public and operator views
 
@@ -126,17 +153,18 @@ measurement and digest references, retry metadata, and bounded failure detail.
 Operator output should remain access-controlled and must not be copied into a
 public status response.
 
-Reenrollment is the explicit recovery mechanism after a terminal failure or
-revocation. It clears the current generation's evidence and retry fields and
-starts a new `pending` generation without modifying prior events. For a
-CC_GPU worker revoked by a GPU identity conflict after a hotkey rotation,
-reenrollment alone is not enough: the old hotkey's GPU identity claims must
-first be released with `cathedral runtime release-gpu-identities` (see
-[docs/GPU_ATTESTATION.md](GPU_ATTESTATION.md)), or the next attestation
-revokes the new generation again. `retire`
-stops network refresh and score eligibility in `retiring`; add `--removed` once
-the worker has been removed to finish in `retired`. Runtime-driven retirement
-also cancels local in-flight work. A late result from another process loses the
+Reenrollment is the explicit recovery mechanism after a terminal failure,
+revocation, or retirement. It clears the current generation's evidence and
+retry fields and starts a new `pending` generation without modifying prior
+events. For a CC_GPU worker revoked by a GPU identity conflict after a hotkey
+rotation, reenrollment alone is not enough: the old hotkey's GPU identity
+claims must first be released with `cathedral runtime release-gpu-identities`
+(see [docs/GPU_ATTESTATION.md](GPU_ATTESTATION.md)), or the next attestation
+revokes the new generation again. `retire` stops network refresh and score
+eligibility in `retiring`; add `--removed` once the worker has been removed to
+finish in `retired`. A worker cannot reverse its own `retiring` by
+re-enrolling; only this operator command does. Runtime-driven retirement also
+cancels local in-flight work. A late result from another process loses the
 generation/revision comparison and cannot restore eligibility.
 
 ## Upgrade and rollback
