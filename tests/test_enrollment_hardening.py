@@ -714,6 +714,29 @@ def test_json_provider_unreadable_file(tmp_path: Path) -> None:
     assert provider.is_registered(HOTKEY) is None
 
 
+def test_json_provider_empty_snapshot_fails_closed(tmp_path: Path) -> None:
+    """Finding: a snapshot that parses to zero hotkeys is never a truthful
+    metagraph view on a live subnet (the validator itself is always
+    registered), so it must fail closed (None) like a stale or malformed
+    file, not be accepted as a valid, empty registration list."""
+    hk_file = tmp_path / "hotkeys.json"
+    variants = [
+        "",
+        "   \n  \t \n",
+        "# comment only\n",
+        "[]",
+        '{"hotkeys": []}',
+        '{"hotkeys": {}}',
+    ]
+    for content in variants:
+        hk_file.write_text(content)
+        now = time.time()
+        os.utime(str(hk_file), (now, now))
+        provider = JsonHotkeyRegistrationProvider(str(hk_file), max_age_seconds=3600)
+        assert provider.load_snapshot() is None, f"content={content!r}"
+        assert provider.is_registered(HOTKEY) is None, f"content={content!r}"
+
+
 # ---------------------------------------------------------------------------
 # Test 9: Production mode with file provider
 # ---------------------------------------------------------------------------

@@ -956,6 +956,46 @@ def test_open_mode_reconcile_reclaims_only_deregistered_workers(tmp_path: Path, 
     assert report["flagged"][0]["status"] == "not_registered"
 
 
+def test_open_mode_reconcile_aborts_on_empty_snapshot(tmp_path: Path):
+    """Finding: a torn or failed rotation write of the registration
+    snapshot must abort reconcile loudly in open mode too, not flag and
+    (with --remove) retire every enrolled hotkey as not_registered."""
+    import argparse
+
+    from cathedral.cli import cmd_enroll_reconcile
+
+    app, store, policy_path = build_app(
+        tmp_path,
+        policy=policy_bytes(mode="all_registered", coldkeys=[]),
+        registered={HOTKEY: COLDKEY, HOTKEY_TWO: COLDKEY},
+    )
+    assert call(app, v2_payload())[0] == 200
+    assert call(app, v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT_TWO, nonce="a0" * 16))[0] == 200
+
+    # Torn rotation write: zero bytes, fresh mtime.
+    (tmp_path / "registered.json").write_bytes(b"")
+
+    keys = tmp_path / "policy-keys.json"
+    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
+    args = argparse.Namespace(
+        registry_db=str(store.path),
+        allowlist=None,
+        admission_policy=str(policy_path),
+        admission_policy_keys=str(keys),
+        admission_policy_keys_digest=None,
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=True,
+    )
+    with pytest.raises(ValueError, match="registration snapshot"):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(HOTKEY_TWO).state is WorkerLifecycleState.PENDING
+
+
 def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):
     import argparse
 

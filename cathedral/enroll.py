@@ -123,6 +123,10 @@ class JsonHotkeyRegistrationProvider:
     - File does not exist or cannot be read (``OSError``).
     - File mtime is older than *max_age_seconds* (stale snapshot).
     - File parses as JSON but is not a recognised array/object shape.
+    - File parses to zero hotkeys (empty snapshot). On a live subnet the
+      validator itself is always registered, so an empty parse result can
+      only be a torn or failed rotation write, never a truthful metagraph
+      view; it is refused the same as a stale or malformed file.
 
     Returns ``True`` when the hotkey is present, ``False`` when absent and
     the file is fresh and readable.  ``None`` always triggers a 403 via the
@@ -151,7 +155,7 @@ class JsonHotkeyRegistrationProvider:
 
         Returns ``(hotkeys, coldkey_by_hotkey)`` where the mapping is ``None``
         for the hotkeys-only formats, or ``None`` overall when the file is
-        missing, unreadable, stale, or malformed (fail closed).
+        missing, unreadable, stale, empty, or malformed (fail closed).
         """
         try:
             stat_result = os.stat(self.path)
@@ -162,7 +166,14 @@ class JsonHotkeyRegistrationProvider:
                 content = fh.read()
         except OSError:
             return None  # missing or unreadable file; fail closed
-        return self._parse(content)
+        parsed = self._parse(content)
+        if parsed is not None and not parsed[0]:
+            # Zero hotkeys can only be a torn or failed rotation write on a
+            # live subnet (the validator itself is always registered); fail
+            # closed the same as a stale or malformed snapshot rather than
+            # let an empty view read as "nobody is registered".
+            return None
+        return parsed
 
     def is_registered(self, hotkey: str) -> bool | None:
         snapshot = self.load_snapshot()

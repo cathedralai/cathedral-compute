@@ -3411,7 +3411,7 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     # A broken snapshot must abort loudly: treating every enrollment as
     # unresolvable would flag (and with --remove retire) the whole board.
     if registration is None:
-        raise ValueError("registration snapshot is missing, stale, or malformed")
+        raise ValueError("registration snapshot is missing, stale, empty, or malformed")
     registered_hotkeys, coldkey_map = registration
     if coldkey_map is None and approved is not None:
         raise ValueError(
