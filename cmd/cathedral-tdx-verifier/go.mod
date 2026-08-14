@@ -1,6 +1,6 @@
 module github.com/cathedralai/cathedralconfidential/cmd/cathedral-tdx-verifier
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/google/go-tdx-guest v0.3.2-0.20260714160433-fff6cc779034
