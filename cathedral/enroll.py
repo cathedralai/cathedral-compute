@@ -1421,9 +1421,18 @@ class RegistryStore:
 
         That matters most for an operator-retired worker that is still
         hardware-valid (it re-attests and is fully back, defeating
-        retire-without-firewall) and for an identity-conflict revoked claimant,
-        which can re-queue itself and take a chip once the honest binding lapses
-        -- the one-machine-one-UID sybil defence.
+        retire-without-firewall) and for a GPU identity-conflict revoked
+        claimant, which could otherwise re-queue itself against an identity
+        another worker already holds.
+
+        RETIRING is not in TERMINAL_STATES but must be refused the same way:
+        it is operator intent to stop the worker (docs/LIFECYCLE.md), and a
+        retirement the miner can lift by re-enrolling is not a retirement.
+
+        Chip contention is deliberately not in that set. A duplicate or
+        already-bound chip_id is refused rather than revoked (#138), so those
+        claimants stay non-terminal and re-queue on their own -- the chip gates
+        run again every epoch and still admit only one hotkey per chip.
         """
         if reason not in {LifecycleReason.REENROLLED, LifecycleReason.ENDPOINT_CHANGED}:
             raise LifecycleError("reenrollment lifecycle reason is invalid")
@@ -1432,9 +1441,12 @@ class RegistryStore:
             current = self._lifecycle_snapshot_from_row(
                 self._lifecycle_row(conn, hotkey)
             )
-            if current.state in TERMINAL_STATES and not operator:
+            if (
+                current.state in TERMINAL_STATES
+                or current.state is WorkerLifecycleState.RETIRING
+            ) and not operator:
                 raise LifecycleError(
-                    f"worker {hotkey!r} is {current.state.value}; a terminal worker "
+                    f"worker {hotkey!r} is {current.state.value}; it "
                     "cannot re-enroll itself. Recovery is an operator action: "
                     "`cathedral lifecycle reenroll --hotkey <hotkey>`")
             generation = current.generation + 1
@@ -1716,6 +1728,16 @@ class RegistryStore:
                     "worker is in a terminal lifecycle state",
                     reason=f"lifecycle_{row['state']}",
                 )
+            if row is not None and row["state"] == WorkerLifecycleState.RETIRING.value:
+                # RETIRING is operator intent, not a terminal state, but the
+                # same rehabilitation-by-re-enroll hole applies: refuse it
+                # here too so the policy path returns a structured 403
+                # instead of reenroll_lifecycle's LifecycleError escaping as
+                # an unhandled 500.
+                raise EnrollmentRejected(
+                    "worker is retiring; re-enrollment is an operator action",
+                    reason="lifecycle_retiring",
+                )
 
         canonical = canonical_endpoint_key(endpoint_url)
         if unique_endpoint:
@@ -1960,15 +1982,18 @@ class RegistryStore:
                 raise LifecycleError(
                     "GPU profile is not active at lifecycle commit time"
                 )
-            identity_conflict = False
             if status == "VERIFIED" and chip_id is not None:
                 conflict = self._chip_rotation_owner(conn, chip_id, hotkey)
                 if conflict is not None:
+                    # Refuse the verdict so a live chip binding stays with one
+                    # hotkey, but treat it as an ordinary verification failure
+                    # rather than an identity conflict. Contention for a chip_id
+                    # is not proof of misuse: the PPID it derives from names a
+                    # physical host shared by co-resident cloud guests (#138).
                     status = "FAILED"
                     chip_id = None
                     tier = None
                     error = f"chip_id already bound to hotkey {conflict}"
-                    identity_conflict = True
             conn.execute(
                 """
                 INSERT INTO attestations(
@@ -2012,16 +2037,8 @@ class RegistryStore:
                 self._transition_lifecycle_in_connection(
                     conn,
                     hotkey,
-                    (
-                        WorkerLifecycleState.REVOKED
-                        if identity_conflict
-                        else WorkerLifecycleState.FAILED
-                    ),
-                    (
-                        LifecycleReason.IDENTITY_CONFLICT
-                        if identity_conflict
-                        else LifecycleReason.VERIFICATION_FAILED
-                    ),
+                    WorkerLifecycleState.FAILED,
+                    LifecycleReason.VERIFICATION_FAILED,
                     lifecycle_when,
                     operator_detail=error,
                     expected_generation=(
@@ -2444,8 +2461,9 @@ class RegistryApp:
         try:
             self.store.enroll(hotkey, endpoint_url, nonce=nonce)
         except LifecycleError as exc:
-            # A terminal worker (revoked / retired) may not re-enroll itself by
-            # changing its endpoint; recovery is an operator action (#85). 409:
+            # A terminal worker (revoked / retired / retiring) may not
+            # re-enroll itself by changing its endpoint; recovery is an
+            # operator action (#85). 409:
             # the request is well-formed and authenticated, it conflicts with
             # durable state.
             logger.info("enroll refused hotkey=%s reason=terminal_state", hotkey)
@@ -2809,7 +2827,7 @@ def main() -> None:
     # monotonicity alone is in-process and resets on restart, so a superseded
     # but still validly signed release could be replayed to re-admit a revoked
     # coldkey. Pinning the artifact digest is what makes revocation durable.
-    if args.production_mode and not args.enroll_allowlist_digest:
+    if args.production_mode and args.enroll_allowlist and not args.enroll_allowlist_digest:
         parser.error("--production-mode requires --enroll-allowlist-digest")
     if args.enroll_allowlist and not args.enroll_allowlist_keys:
         parser.error("--enroll-allowlist requires --enroll-allowlist-keys")
