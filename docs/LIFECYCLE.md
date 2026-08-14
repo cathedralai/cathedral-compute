@@ -95,6 +95,13 @@ ID, evidence-expiry time, and snapshot time used for score gating. Receipt v2
 signs the same lifecycle identifiers and expiry. When a receipt exists, the
 ledger rejects an epoch snapshot that does not match those signed fields.
 
+For a worker that holds a receipt, the runtime records the exact lifecycle
+snapshot the receipt signed, captured once at receipt issuance, rather than
+re-reading the registry after the epoch's work is resolved. A registry
+lifecycle change that lands mid-epoch (self-service re-enrollment, a prober
+verdict, an operator retire) therefore takes effect at the next epoch instead
+of aborting the running one.
+
 ## Public and operator views
 
 The customer-safe view contains the state, safe reason, generation, transition

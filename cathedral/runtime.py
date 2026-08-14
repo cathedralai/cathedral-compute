@@ -330,6 +330,12 @@ class ConfidentialRuntime:
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
         self._work_timing_failures = 0
+        # Snapshot each receipt's signed worker lifecycle at issuance time,
+        # keyed by hotkey. Reused by the post-SAT lifecycle-recording loop so
+        # the epoch row matches exactly what the receipt signed instead of a
+        # fresh registry read racing concurrent writers (enrollment service,
+        # standalone prober). Reset per epoch attempt in _run_epoch_once.
+        self._receipt_lifecycles: dict[str, LifecycleSnapshot] = {}
         gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
         if self.config.expected_tier is Tier.CC_GPU and any(
             item is None for item in gpu_configuration
@@ -622,6 +628,9 @@ class ConfidentialRuntime:
         # derivation and the durable epoch record can never diverge.
         self._active_source_epoch = int(source_epoch)
         self._active_challenge_anchor = self._config_challenge_anchor()
+        # A prior aborted attempt at this epoch must not leak its captured
+        # receipt lifecycle snapshots into this attempt.
+        self._receipt_lifecycles = {}
         self._require_live_gpu_profile()
         # The canary is operator-run and is the epoch's control: a missing or
         # malformed canary token raises MissingAuthError here, before any
@@ -748,10 +757,21 @@ class ConfidentialRuntime:
                 self._require_live_gpu_profile()
 
                 for enrollment in enrollments:
-                    self.ledger.add_lifecycle_snapshot(
-                        epoch_id,
-                        self.registry.lifecycle_snapshot(enrollment.hotkey),
-                    )
+                    # A receipt already signed this exact snapshot at
+                    # issuance time; re-reading the live registry here races
+                    # concurrent writers (enrollment service, standalone
+                    # prober), and any mid-epoch write (miner re-enrollment,
+                    # prober verdict, operator retire) made the ledger reject
+                    # the runtime's own receipt and abort the whole epoch. A
+                    # worker without a receipt has no stored receipt to
+                    # match, so a fresh read stays correct for it
+                    # (lifecycle-excluded, refresh_scheduled, missing_auth,
+                    # tier-ineligible, not-selected, identity-conflict
+                    # revoked).
+                    snapshot = self._receipt_lifecycles.get(enrollment.hotkey)
+                    if snapshot is None:
+                        snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+                    self.ledger.add_lifecycle_snapshot(epoch_id, snapshot)
 
                 all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
                 self._require_live_gpu_profile()
@@ -1558,6 +1578,11 @@ class ConfidentialRuntime:
             customer_error=customer_error,
             customer_max_attempts=self.config.customer_job_max_attempts,
         )
+        # Record the exact snapshot the receipt signed, only after the ledger
+        # has durably stored the receipt. Reused (not re-read) by the
+        # post-SAT lifecycle-recording loop so a mid-epoch registry write
+        # cannot make the ledger reject the runtime's own receipt.
+        self._receipt_lifecycles[result.target.hotkey] = worker_lifecycle
 
     def _collect_attestation(
         self,
