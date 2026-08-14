@@ -24,8 +24,11 @@ import base64
 import io
 import json
 import os
+import shutil
 import sqlite3
 import socket as _socket_module
+import ssl
+import subprocess
 import threading
 import time
 from base64 import b64encode
@@ -47,6 +50,7 @@ from cathedral.enroll import (
     now_iso,
     validate_endpoint_url,
 )
+from cathedral.lifecycle import TERMINAL_STATES, WorkerLifecycleState
 from cathedral.prober import (
     _PreResolvedHTTPConnection,
     _PreResolvedHTTPSConnection,
@@ -313,6 +317,12 @@ def test_registry_chip_rotation_conflict_does_not_publish_rejected_identity(
     assert miners[claimant]["verification_status"] == "FAILED"
     assert miners[claimant]["chip_id_prefix"] is None
     assert miners[claimant]["tier"] is None
+    # The rejected identity costs the claimant its verdict, not its worker.
+    # chip_id derives from a per-host PPID, so a co-resident cloud tenant can
+    # land here innocently and must stay recoverable without an operator (#138).
+    claimant_lifecycle = store.lifecycle_snapshot(claimant)
+    assert claimant_lifecycle.state is WorkerLifecycleState.FAILED
+    assert claimant_lifecycle.state not in TERMINAL_STATES
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +825,137 @@ def test_production_mode_missing_file_fails_closed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test 10: Pre-resolved connector
 # ---------------------------------------------------------------------------
+
+def _certificate_pair(directory: Path, name: str) -> tuple[Path, Path, bytes]:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("OpenSSL is required for the local TLS integration test")
+    key = directory / f"{name}.key.pem"
+    cert = directory / f"{name}.cert.pem"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    certificate_der = ssl.PEM_cert_to_DER_cert(cert.read_text(encoding="ascii"))
+    return cert, key, certificate_der
+
+
+def test_pre_resolved_https_connect_performs_tls_handshake(tmp_path: Path) -> None:
+    """connect() must complete a TLS handshake using only attributes
+    http.client.HTTPSConnection actually defines.  Before the fix, connect()
+    called self._wrap_socket, which does not exist on any supported
+    interpreter, and raised AttributeError before ever touching the network.
+    """
+    cert, key, _ = _certificate_pair(tmp_path, "https-connect")
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(str(cert), str(key))
+
+    listener = _socket_module.socket(_socket_module.AF_INET, _socket_module.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def _accept_once() -> None:
+        raw_conn, _addr = listener.accept()
+        try:
+            with server_context.wrap_socket(raw_conn, server_side=True) as tls_conn:
+                try:
+                    tls_conn.recv(1)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_accept_once, daemon=True)
+    thread.start()
+    try:
+        client_context = ssl.create_default_context(cafile=str(cert))
+        conn = _PreResolvedHTTPSConnection(
+            f"127.0.0.1:{port}",
+            resolved_addr="127.0.0.1",
+            context=client_context,
+        )
+        try:
+            conn.connect()
+            assert isinstance(conn.sock, ssl.SSLSocket)
+        finally:
+            conn.close()
+    finally:
+        thread.join(timeout=5.0)
+        listener.close()
+
+
+def test_request_evidence_over_https_uses_working_connection_classes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_request_evidence over https:// with no opener/resolver injection
+    exercises the real _build_pre_resolved_opener / _ResolvedHTTPSHandler /
+    _PreResolvedHTTPSConnection path.  Before the fix this raises
+    AttributeError before the request is ever sent.
+    """
+    cert, key, _ = _certificate_pair(tmp_path, "request-evidence")
+    nonce = b"\x07" * 32
+
+    class _EvidenceHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:  # noqa: D401 - silence test logs
+            pass
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps(
+                {
+                    "kind": "tdx",
+                    "quote_b64": base64.b64encode(TDX_QUOTE).decode("ascii"),
+                    "nonce_hex": nonce.hex(),
+                    "miner_hotkey": HOTKEY,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), _EvidenceHandler)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(str(cert), str(key))
+    server.socket = server_context.wrap_socket(server.socket, server_side=True)
+    port = server.server_address[1]
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    try:
+        evidences = _request_evidence(f"https://127.0.0.1:{port}", HOTKEY, nonce)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5.0)
+        server.server_close()
+
+    assert len(evidences) == 1
+    assert evidences[0].kind is EvidenceKind.TDX
+    assert evidences[0].nonce == nonce
+    assert evidences[0].miner_hotkey == HOTKEY
+
 
 def test_pre_resolved_connector_stores_original_hostname() -> None:
     conn = _PreResolvedHTTPConnection("miner.example.com:9000", resolved_addr="203.0.113.1")

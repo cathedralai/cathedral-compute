@@ -155,6 +155,36 @@ digests are recorded in a durable recovery event before the transaction commits.
 The same identity key required by normal operation must authorize recovery;
 using the wrong key or running recovery with no interrupted claims fails closed.
 
+Committed claims are durable by design: nothing in ordinary operation deletes
+a worker's `worker_admission` row, so the one-GPU-one-worker invariant holds
+across restarts and crashes. That durability deliberately survives hotkey
+deregistration and rotation too. A hotkey change (Bittensor deregistration and
+re-registration, key rotation, coldkey change) does not release the previous
+hotkey's claim on its GPUs; moving GPUs to a new hotkey is an explicit operator
+ceremony, not something that happens on its own:
+
+```text
+cathedral runtime release-gpu-identities \
+  --gpu-identity-db /var/lib/cathedral/gpu-identities.sqlite \
+  --gpu-identity-key-file /run/secrets/cathedral-gpu-identity.key \
+  --gpu-identity-anchor-file /var/lib/cathedral-identity-anchor/generation \
+  --hotkey <old-hotkey> \
+  --reason "hotkey rotation"
+```
+
+The command deletes only the named worker's own committed claims. It is
+authenticated by the same identity key as every other mutation here, records a
+durable audit event before the transaction commits, and advances the anchored
+generation like any other write. It fails closed: an unknown or already-empty
+hotkey raises rather than succeeding silently, and a registry that still holds
+an interrupted admission (see crash recovery above) must be recovered first.
+
+Rotation runbook order: retire the old hotkey, release its GPU identities with
+`release-gpu-identities`, then enroll (or `lifecycle reenroll`) the new hotkey.
+Skipping the release step is not recoverable by re-enrolling: the new hotkey's
+very next attestation is revoked as a GPU identity conflict, because the GPUs
+are still claimed by the old hotkey.
+
 The composite verifier establishes the attested channel-key claim, but channel
 ownership is not marked passed until the validator confirms that key on the
 live connection. This keeps quote verification separate from proof that the

@@ -58,6 +58,16 @@ NETWORK_ELIGIBLE_STATES = frozenset(
     }
 )
 
+# The ONE definition shared by the enrollment capacity cap
+# (RegistryStore._enforce_enrollment_caps) and the epoch report universe
+# (ConfidentialRuntime._run_epoch_once). FAILED and RETIRED are excluded on
+# purpose: enrollment rows are append-only and never deleted, so counting
+# dead rows in either place lets churn exhaust the admission cap or grow the
+# frozen report past MAX_LAUNCH_CANDIDATES.
+CAPACITY_CONSUMING_STATES = frozenset(
+    NETWORK_ELIGIBLE_STATES | {WorkerLifecycleState.RETIRING, WorkerLifecycleState.REVOKED}
+)
+
 # Self-transitions are deliberate audit events: a successful refresh advances
 # attested evidence, while a retry event advances bounded retry metadata.
 ALLOWED_TRANSITIONS = {

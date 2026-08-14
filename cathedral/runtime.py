@@ -47,12 +47,13 @@ from cathedral.common import (
     is_globally_routable,
     issue_nonce,
 )
-from cathedral.enroll import RegistryStore
+from cathedral.enroll import Enrollment, RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import CustomerJobLease, Ledger, LedgerError
 from cathedral.lifecycle import (
+    CAPACITY_CONSUMING_STATES,
     NETWORK_ELIGIBLE_STATES,
     LifecycleError,
     LifecycleReason,
@@ -89,6 +90,7 @@ def _producer_boot_id() -> str:
         return _process_boot_id
 
 from cathedral.score_audience import validate_score_audience
+from cathedral.score_class import validate_candidate_snapshot
 from cathedral.verify import preflight_tdx_verifier, verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
@@ -314,6 +316,7 @@ class ConfidentialRuntime:
         remote_factory: RemoteFactory = RemoteMiner,
         config: RuntimeConfig | None = None,
         receipt_issuer: ReceiptIssuer | None = None,
+        candidate_snapshot: Mapping[str, object] | None = None,
         reattestor: SingleFlightReattestor[_AttestationResult] | None = None,
         gpu_profile=None,
         gpu_verifier=None,
@@ -330,6 +333,12 @@ class ConfidentialRuntime:
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
         self._work_timing_failures = 0
+        # Snapshot each receipt's signed worker lifecycle at issuance time,
+        # keyed by hotkey. Reused by the post-SAT lifecycle-recording loop so
+        # the epoch row matches exactly what the receipt signed instead of a
+        # fresh registry read racing concurrent writers (enrollment service,
+        # standalone prober). Reset per epoch attempt in _run_epoch_once.
+        self._receipt_lifecycles: dict[str, LifecycleSnapshot] = {}
         gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
         if self.config.expected_tier is Tier.CC_GPU and any(
             item is None for item in gpu_configuration
@@ -394,6 +403,27 @@ class ConfidentialRuntime:
                         "audience (--score-network/--score-netuid)"
                     )
                 self._config_challenge_anchor()
+        self._candidate_hotkeys: frozenset[str] | None = None
+        if candidate_snapshot is not None:
+            if self.config.score_network is None or self.config.score_netuid is None:
+                raise ValueError(
+                    "a candidate snapshot requires the score audience "
+                    "(score_network/score_netuid)"
+                )
+            binding = validate_candidate_snapshot(
+                candidate_snapshot,
+                network=self.config.score_network,
+                netuid=int(self.config.score_netuid),
+            )
+            anchor = self._config_challenge_anchor()
+            if anchor is not None and (anchor["block"], anchor["block_hash"]) != (
+                binding["block"],
+                binding["block_hash"],
+            ):
+                raise ValueError(
+                    "candidate snapshot block/hash does not match the configured challenge anchor"
+                )
+            self._candidate_hotkeys = frozenset(binding["hotkeys"])
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -570,6 +600,18 @@ class ConfidentialRuntime:
         self._require_admission_enabled()
         if self.config.production_mode and self.config.score_network is None:
             raise RuntimeError("production epoch requires an explicit score network and netuid")
+        if (
+            self.config.production_mode
+            and self.config.expected_tier is Tier.CC_CPU_TDX
+            and self._candidate_hotkeys is None
+        ):
+            raise RuntimeError(
+                "production CPU scoring requires the anchored candidate "
+                "snapshot (--candidate-snapshot): without it the runtime "
+                "cannot tell a still-registered hotkey from a deregistered "
+                "one, and an epoch that credits positive work to a hotkey "
+                "outside the snapshot can never be exported"
+            )
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("an epoch run is already in progress")
         try:
@@ -622,6 +664,9 @@ class ConfidentialRuntime:
         # derivation and the durable epoch record can never diverge.
         self._active_source_epoch = int(source_epoch)
         self._active_challenge_anchor = self._config_challenge_anchor()
+        # A prior aborted attempt at this epoch must not leak its captured
+        # receipt lifecycle snapshots into this attempt.
+        self._receipt_lifecycles = {}
         self._require_live_gpu_profile()
         # The canary is operator-run and is the epoch's control: a missing or
         # malformed canary token raises MissingAuthError here, before any
@@ -654,8 +699,33 @@ class ConfidentialRuntime:
         }
         targets: list[MinerTarget] = []
         lifecycle_outcomes: dict[str, MinerOutcome] = {}
+        # Captured at epoch start, not recomputed after SAT: a worker that
+        # participates and then dies mid-epoch must stay in the universe (its
+        # receipt cross-check at ledger.py add_lifecycle_snapshot and its
+        # explicit zero both need it), while a worker already dead before the
+        # epoch began (FAILED or RETIRED) is excluded so append-only,
+        # never-deleted enrollment rows cannot grow the frozen report past
+        # MAX_LAUNCH_CANDIDATES as the subnet churns.
+        epoch_candidates: list[Enrollment] = []
         for enrollment in enrollments:
+            if (
+                self._candidate_hotkeys is not None
+                and enrollment.hotkey not in self._candidate_hotkeys
+            ):
+                lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
+                    enrollment.hotkey,
+                    enrollment.endpoint_url,
+                    "not_registered",
+                    error=(
+                        "hotkey is not in the anchored candidate snapshot for "
+                        "this epoch; it is excluded from attestation and work"
+                    ),
+                )
+                self.reattestor.cancel(enrollment.hotkey)
+                continue
             snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+            if snapshot.state in CAPACITY_CONSUMING_STATES:
+                epoch_candidates.append(enrollment)
             if snapshot.state not in NETWORK_ELIGIBLE_STATES:
                 lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
                     enrollment.hotkey,
@@ -683,7 +753,28 @@ class ConfidentialRuntime:
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
         outcomes = {**lifecycle_outcomes, **outcomes}
         if canary_endpoint in enrolled_endpoints:
-            raise RuntimeError("canary endpoint must be dedicated and not enrolled")
+            # One signed enrollment request must not stall every published
+            # weight: exclude the claimant instead of raising, mirroring the
+            # duplicate_endpoint pattern above. The excluded row is never
+            # probed, attested, or scored, so the canary stays dedicated.
+            # This is not a weakened check: the enforced property (canary
+            # work is never scored as a miner's) is preserved by exclusion;
+            # only the availability blast radius changes. The chip-identity
+            # guard below and the canary-hotkey guard above remain hard
+            # failures, since no miner can satisfy the chip guard without
+            # running on the canary's own physical socket. Claimants that
+            # duplicated the canary endpoint with each other never reach
+            # `prepared` at all: _prepare_targets already dropped them as
+            # duplicate_endpoint, so the epoch proceeds in that case too.
+            for target, endpoint in [pair for pair in prepared if pair[1] == canary_endpoint]:
+                outcomes[target.hotkey] = MinerOutcome(
+                    target.hotkey,
+                    endpoint,
+                    "canary_endpoint_conflict",
+                    error="enrolled endpoint collides with the dedicated canary endpoint; excluded this epoch",
+                )
+                self.reattestor.cancel(target.hotkey)
+            prepared = [pair for pair in prepared if pair[1] != canary_endpoint]
 
         canary_result = self._check_canary_result(canary_target)
         canary_reservation = self._reserve_gpu_canary(canary_result)
@@ -747,13 +838,24 @@ class ConfidentialRuntime:
                 self._run_sat(epoch_id, source_epoch, admitted, outcomes)
                 self._require_live_gpu_profile()
 
-                for enrollment in enrollments:
-                    self.ledger.add_lifecycle_snapshot(
-                        epoch_id,
-                        self.registry.lifecycle_snapshot(enrollment.hotkey),
-                    )
+                for enrollment in epoch_candidates:
+                    # A receipt already signed this exact snapshot at
+                    # issuance time; re-reading the live registry here races
+                    # concurrent writers (enrollment service, standalone
+                    # prober), and any mid-epoch write (miner re-enrollment,
+                    # prober verdict, operator retire) made the ledger reject
+                    # the runtime's own receipt and abort the whole epoch. A
+                    # worker without a receipt has no stored receipt to
+                    # match, so a fresh read stays correct for it
+                    # (lifecycle-excluded, refresh_scheduled, missing_auth,
+                    # tier-ineligible, not-selected, identity-conflict
+                    # revoked).
+                    snapshot = self._receipt_lifecycles.get(enrollment.hotkey)
+                    if snapshot is None:
+                        snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+                    self.ledger.add_lifecycle_snapshot(epoch_id, snapshot)
 
-                all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
+                all_hotkeys = {enrollment.hotkey for enrollment in epoch_candidates}
                 self._require_live_gpu_profile()
                 score_authority_valid_until = None
                 if self.config.expected_tier is Tier.CC_GPU and self.config.production_mode:
@@ -1052,13 +1154,19 @@ class ConfidentialRuntime:
         for chip_id in sorted(chip_groups):
             group = chip_groups[chip_id]
             if len(group) > 1:
+                # chip_id is derived from the PCK PPID, which names a physical
+                # platform and not a guest, so co-resident tenants on one cloud
+                # host collide without either of them misbehaving (#138).
+                # Contention is refused for the epoch instead of revoked: no
+                # duplicate chip earns, and an honest claimant does not need an
+                # operator to lift a terminal state it never deserved.
                 for result in group:
-                    self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
                         "duplicate_chip",
-                        error="all claimants of a duplicate chip are excluded",
+                        error="all claimants of a duplicate chip are refused for this epoch",
+                        error_category="identity_conflict",
                     )
                 continue
             result = group[0]
@@ -1082,12 +1190,16 @@ class ConfidentialRuntime:
                 continue
             rotation_owner = self.registry.chip_rotation_owner(chip_id, result.target.hotkey)
             if rotation_owner is not None:
-                self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
+                # The same contention seen across epochs rather than inside one
+                # batch. The incumbent keeps its binding either way, so the
+                # later claimant is refused while that binding is live and is
+                # free to claim the chip once it lapses.
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
                     result.endpoint,
                     "chip_rotation_conflict",
                     error=f"chip_id already bound to hotkey {rotation_owner}",
+                    error_category="identity_conflict",
                 )
                 continue
             pending_gpu_claim = None
@@ -1558,6 +1670,11 @@ class ConfidentialRuntime:
             customer_error=customer_error,
             customer_max_attempts=self.config.customer_job_max_attempts,
         )
+        # Record the exact snapshot the receipt signed, only after the ledger
+        # has durably stored the receipt. Reused (not re-read) by the
+        # post-SAT lifecycle-recording loop so a mid-epoch registry write
+        # cannot make the ledger reject the runtime's own receipt.
+        self._receipt_lifecycles[result.target.hotkey] = worker_lifecycle
 
     def _collect_attestation(
         self,
