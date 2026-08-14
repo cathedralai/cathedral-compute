@@ -559,8 +559,8 @@ def test_reconcile_aborts_on_stale_snapshot(tmp_path: Path) -> None:
 def test_reconcile_aborts_on_empty_snapshot(tmp_path: Path) -> None:
     """Finding: a torn or failed rotation write (zero-byte redirect, or a
     well-formed but empty extended snapshot) must abort reconcile loudly,
-    the same as a stale or malformed one — never be read as 'nobody is
-    registered' and retire the whole board."""
+    the same as a stale or malformed one. It must never be read as 'nobody
+    is registered' and retire the whole board."""
     import os
 
     store, approved, rogue = _reconcile_fixture(tmp_path)
