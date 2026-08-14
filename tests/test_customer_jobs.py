@@ -60,6 +60,17 @@ def test_oversized_customer_payload_is_rejected_before_persistence(tmp_path: Pat
         assert ledger.customer_job_counts()["queued"] == 0
 
 
+def test_zero_clause_customer_job_is_rejected_before_persistence(tmp_path: Path) -> None:
+    # _item()'s `clauses or default` treats [] as "not provided", so build
+    # the zero-clause item directly rather than through that helper.
+    instance = SatInstance(n_vars=3, clauses=[])
+    item = SatWorkItem(instance, 7, _compute_challenge_id(instance, 7))
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        with pytest.raises(LedgerError, match="invalid SAT clauses"):
+            ledger.enqueue_customer_job(item)
+        assert ledger.customer_job_counts()["queued"] == 0
+
+
 def test_two_ledger_connections_cannot_double_claim(tmp_path: Path) -> None:
     path = tmp_path / "ledger.sqlite"
     first = Ledger(path)

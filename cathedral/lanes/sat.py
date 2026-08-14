@@ -79,7 +79,10 @@ def validate_sat_instance(instance: SatInstance) -> None:
     clauses = instance.clauses
     if isinstance(n_vars, bool) or not isinstance(n_vars, int) or not 1 <= n_vars <= MAX_N_VARS:
         raise ValueError("invalid SAT n_vars")
-    if not isinstance(clauses, list) or len(clauses) > MAX_CLAUSES:
+    # A zero-clause instance is satisfied by any assignment, and the
+    # independent replayer (cathedral/workproof.py) already refuses it, so
+    # the producer must refuse it at the same bound.
+    if not isinstance(clauses, list) or not clauses or len(clauses) > MAX_CLAUSES:
         raise ValueError("invalid SAT clauses")
     literal_count = 0
     for clause in clauses:

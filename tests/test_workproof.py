@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import pytest
 
-from cathedral.lanes.sat import _compute_challenge_id
+from cathedral.lanes.sat import _compute_challenge_id, validate_sat_work_item
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.runtime import _sat_manifest_bytes, _sat_result_bytes
 from cathedral.workproof import WorkProofError, verify_work_artifacts
@@ -115,6 +115,27 @@ def test_out_of_producer_bounds_items_never_replay():
             expected_challenge_id=challenge,
             expected_units=Decimal(8193),
         )
+
+
+def test_zero_clause_item_never_replays_and_never_produces():
+    """A zero-clause instance is satisfied by any assignment, so it can never
+    be a genuine solve. The producer contract (validate_sat_work_item) and
+    the independent replayer must refuse it identically."""
+    item_bytes, result_bytes = _artifacts(n_clauses=0)
+    challenge = json.loads(item_bytes)["challenge_id"]
+    with pytest.raises(WorkProofError, match="producer contract"):
+        _verify(
+            item_bytes,
+            result_bytes,
+            expected_manifest_digest=_digest(item_bytes),
+            expected_result_digest=_digest(result_bytes),
+            expected_challenge_id=challenge,
+            expected_units=Decimal(0),
+        )
+    instance = SatInstance(n_vars=3, clauses=[])
+    item = SatWorkItem(instance=instance, seed=7, challenge_id=challenge)
+    with pytest.raises(ValueError):
+        validate_sat_work_item(item)
 
 
 def test_corrupted_bytes_fail_the_digest_binding():
