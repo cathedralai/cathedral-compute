@@ -694,7 +694,28 @@ class ConfidentialRuntime:
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
         outcomes = {**lifecycle_outcomes, **outcomes}
         if canary_endpoint in enrolled_endpoints:
-            raise RuntimeError("canary endpoint must be dedicated and not enrolled")
+            # One signed enrollment request must not stall every published
+            # weight: exclude the claimant instead of raising, mirroring the
+            # duplicate_endpoint pattern above. The excluded row is never
+            # probed, attested, or scored, so the canary stays dedicated.
+            # This is not a weakened check: the enforced property (canary
+            # work is never scored as a miner's) is preserved by exclusion;
+            # only the availability blast radius changes. The chip-identity
+            # guard below and the canary-hotkey guard above remain hard
+            # failures, since no miner can satisfy the chip guard without
+            # running on the canary's own physical socket. Claimants that
+            # duplicated the canary endpoint with each other never reach
+            # `prepared` at all: _prepare_targets already dropped them as
+            # duplicate_endpoint, so the epoch proceeds in that case too.
+            for target, endpoint in [pair for pair in prepared if pair[1] == canary_endpoint]:
+                outcomes[target.hotkey] = MinerOutcome(
+                    target.hotkey,
+                    endpoint,
+                    "canary_endpoint_conflict",
+                    error="enrolled endpoint collides with the dedicated canary endpoint; excluded this epoch",
+                )
+                self.reattestor.cancel(target.hotkey)
+            prepared = [pair for pair in prepared if pair[1] != canary_endpoint]
 
         canary_result = self._check_canary_result(canary_target)
         canary_reservation = self._reserve_gpu_canary(canary_result)

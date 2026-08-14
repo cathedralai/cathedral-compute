@@ -400,9 +400,12 @@ The compatibility test above uses one in-process miner and predates the full
 production topology. The final CPU acceptance canary requires two different
 disposable TDX platforms: one dedicated canary and one enrolled worker. Each
 must expose a public-IP HTTPS endpoint whose private key terminates inside its
-guest and whose SPKI digest is configured on the loopback worker. After those
-endpoints are ready, run the production parent path from a separate Linux
-validator host:
+guest and whose SPKI digest is configured on the loopback worker. If an
+enrollment ever claims `--canary-endpoint` for itself, that claimant is
+excluded from the epoch with a `canary_endpoint_conflict` outcome; it never
+blocks the epoch, so one miner cannot wedge every published weight by
+enrolling at the canary's own address. After those endpoints are ready, run
+the production parent path from a separate Linux validator host:
 
 ```bash
 sudo env \
