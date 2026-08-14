@@ -902,6 +902,73 @@ def test_a_retiring_worker_cannot_lift_its_retirement_by_re_enrolling(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# 8b. Production launch arguments
+# ---------------------------------------------------------------------------
+
+def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monkeypatch):
+    """The documented --admission-policy production launch must not demand
+    --enroll-allowlist-digest: that artifact is never loaded on this path.
+    """
+    import hashlib
+
+    import cathedral.enroll
+
+    keys_path = tmp_path / "admission-policy-keys.json"
+    keys_bytes = json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}).encode("utf-8")
+    keys_path.write_bytes(keys_bytes)
+    keys_digest = "sha256:" + hashlib.sha256(keys_bytes).hexdigest()
+
+    policy_path = tmp_path / "admission-policy.json"
+    policy_path.write_bytes(policy_bytes())
+
+    registered_path = snapshot_file(tmp_path, {HOTKEY: COLDKEY})
+
+    argv = [
+        "cathedral-enroll",
+        "--db", str(tmp_path / "registry.sqlite"),
+        "--production-mode",
+        "--network", NETWORK,
+        "--netuid", str(NETUID),
+        "--registered-hotkeys-file", registered_path,
+        "--admission-policy", str(policy_path),
+        "--admission-policy-keys", str(keys_path),
+        "--admission-policy-keys-digest", keys_digest,
+        "--admission-policy-state", str(tmp_path / "admission-policy-state.json"),
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    def _raise_reached(*args, **kwargs):
+        raise RuntimeError("server reached")
+
+    monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
+
+    with pytest.raises(RuntimeError, match="server reached"):
+        cathedral.enroll.main()
+
+
+def test_production_allowlist_launch_still_requires_the_artifact_digest(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The fix narrows the guard; it must not delete the allowlist pin."""
+    import cathedral.enroll
+
+    argv = [
+        "cathedral-enroll",
+        "--production-mode",
+        "--registered-hotkeys-file", str(tmp_path / "registered.json"),
+        "--enroll-allowlist", str(tmp_path / "allowlist.json"),
+        "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),
+        "--enroll-allowlist-keys-digest", "sha256:" + "a" * 64,
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cathedral.enroll.main()
+    assert exc_info.value.code == 2
+    assert "--production-mode requires --enroll-allowlist-digest" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # 9. Reconcile is reachable under a policy
 # ---------------------------------------------------------------------------
 

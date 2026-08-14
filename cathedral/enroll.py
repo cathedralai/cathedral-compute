@@ -2829,7 +2829,7 @@ def main() -> None:
     # monotonicity alone is in-process and resets on restart, so a superseded
     # but still validly signed release could be replayed to re-admit a revoked
     # coldkey. Pinning the artifact digest is what makes revocation durable.
-    if args.production_mode and not args.enroll_allowlist_digest:
+    if args.production_mode and args.enroll_allowlist and not args.enroll_allowlist_digest:
         parser.error("--production-mode requires --enroll-allowlist-digest")
     if args.enroll_allowlist and not args.enroll_allowlist_keys:
         parser.error("--enroll-allowlist requires --enroll-allowlist-keys")
