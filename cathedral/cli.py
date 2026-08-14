@@ -3251,6 +3251,23 @@ def cmd_runtime_recover_gpu_identities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_runtime_release_gpu_identities(args: argparse.Namespace) -> int:
+    """Authenticate and audit an explicit release of one worker's GPU claims."""
+
+    registry = GpuIdentityRegistry(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+    )
+    outcome = registry.release_worker(args.hotkey, reason=args.reason)
+    print(json.dumps(dict(outcome), sort_keys=True))
+    return 0
+
+
 def cmd_runtime_initialize_gpu_identities(args: argparse.Namespace) -> int:
     """Perform the explicit one-time creation of production GPU identity state."""
 
@@ -3975,6 +3992,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="relax production ownership checks for a local recovery exercise",
     )
     p_gpu_recovery.set_defaults(func=cmd_runtime_recover_gpu_identities)
+
+    p_gpu_release = runtime_sub.add_parser(
+        "release-gpu-identities",
+        help="release one worker's committed GPU identity claims and audit it",
+    )
+    p_gpu_release.add_argument("--gpu-identity-db", required=True)
+    p_gpu_release.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_release.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_release.add_argument("--hotkey", required=True)
+    p_gpu_release.add_argument(
+        "--reason",
+        required=True,
+        help="operator justification recorded in the GPU identity audit trail",
+    )
+    p_gpu_release.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production ownership checks for a local release exercise",
+    )
+    p_gpu_release.set_defaults(func=cmd_runtime_release_gpu_identities)
 
     p_gpu_initialize = runtime_sub.add_parser(
         "initialize-gpu-identities",

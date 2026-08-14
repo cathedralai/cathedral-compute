@@ -53,6 +53,8 @@ from cathedral.gpu import (
     ExternalGpuCollector,
     ExternalGpuVerifier,
     GpuAttestationError,
+    GpuComponentVerdict,
+    GpuDeviceClaim,
     GpuIdentityRegistry,
     GpuProfile,
     gpu_challenge,
@@ -1565,6 +1567,145 @@ def test_gpu_identity_recovery_releases_only_interrupted_canary(tmp_path: Path):
     assert outcome["canary_identities_released"] == 2
     recovered = GpuIdentityRegistry(database, identity_digest_key=b"i" * 32)
     recovered.claim("worker-a", component, at=NOW)
+
+
+def test_gpu_identity_release_frees_gpus_for_a_rotated_hotkey(tmp_path: Path):
+    registry = GpuIdentityRegistry(
+        tmp_path / "gpu-identities.sqlite", identity_digest_key=b"i" * 32
+    )
+    component = _component()
+
+    registry.claim("hotkey-old", component, at=NOW)
+    with pytest.raises(GpuAttestationError) as conflict:
+        registry.claim("hotkey-new", component, at=NOW)
+    assert conflict.value.category == "identity_conflict"
+
+    outcome = registry.release_worker("hotkey-old", reason="hotkey rotation")
+    assert outcome["released_identities"] == 2
+    assert outcome["hotkey"] == "hotkey-old"
+
+    registry.claim("hotkey-new", component, at=NOW)
+    with pytest.raises(GpuAttestationError) as reclaimed:
+        registry.claim("hotkey-old", component, at=NOW)
+    assert reclaimed.value.category == "identity_conflict"
+
+
+def test_gpu_identity_release_requires_committed_claims(tmp_path: Path):
+    registry = GpuIdentityRegistry(
+        tmp_path / "gpu-identities.sqlite", identity_digest_key=b"i" * 32
+    )
+    component = _component()
+
+    with pytest.raises(GpuAttestationError) as empty:
+        registry.release_worker("worker-nobody", reason="typo cleanup")
+    assert empty.value.category == "identity_release_not_required"
+
+    registry.claim("worker-a", component, at=NOW)
+    with pytest.raises(GpuAttestationError) as other:
+        registry.release_worker("worker-b", reason="typo cleanup")
+    assert other.value.category == "identity_release_not_required"
+
+    with pytest.raises(GpuAttestationError) as still_owned:
+        registry.claim("worker-b", component, at=NOW)
+    assert still_owned.value.category == "identity_conflict"
+
+
+def test_gpu_identity_release_refuses_interrupted_admission(tmp_path: Path):
+    registry = GpuIdentityRegistry(
+        tmp_path / "gpu-identities.sqlite", identity_digest_key=b"i" * 32
+    )
+    component = _component()
+    registry.begin_claim("worker-a", component, at=NOW)
+
+    with pytest.raises(GpuAttestationError) as blocked:
+        registry.release_worker("worker-a", reason="hotkey rotation")
+    assert blocked.value.category == "identity_recovery_required"
+
+    outcome = GpuIdentityRegistry.recover_interrupted(
+        registry.path,
+        identity_digest_key=b"i" * 32,
+        reason="validator terminated during worker admission",
+    )
+    assert outcome["worker_claims_committed"] == 1
+
+
+def test_gpu_identity_release_records_durable_audit_event(tmp_path: Path):
+    database = tmp_path / "gpu-identities.sqlite"
+    registry = GpuIdentityRegistry(database, identity_digest_key=b"i" * 32)
+    component = _component()
+    registry.claim("worker-a", component, at=NOW)
+
+    outcome = registry.release_worker("worker-a", reason="hotkey rotation")
+
+    history = registry.recovery_history()
+    assert len(history) == 1
+    event = history[0]
+    assert event["reason"].startswith("worker identity release: ")
+    assert event["reason"] == "worker identity release: hotkey rotation"
+    assert event["worker_claims_committed"] == 0
+    assert event["worker_identities_committed"] == 0
+    assert event["canary_reservations_released"] == 0
+    assert event["canary_identities_released"] == 0
+    assert sorted(event["claim_token_digests"]) == sorted(
+        registry._claim_material("worker-a", component, NOW)[1]
+    )
+    assert event["event_id"] == outcome["event_id"]
+
+    reopened = GpuIdentityRegistry(database, identity_digest_key=b"i" * 32)
+    assert reopened.recovery_history()[0]["event_id"] == outcome["event_id"]
+
+
+def test_gpu_identity_release_leaves_other_workers_claims(tmp_path: Path):
+    registry = GpuIdentityRegistry(
+        tmp_path / "gpu-identities.sqlite", identity_digest_key=b"i" * 32
+    )
+    device_a = GpuDeviceClaim(
+        "GPU-33333333-3333-4333-8333-333333333333",
+        "NVIDIA-H100-80GB-HBM3",
+        "CC-On",
+        "550.90.07",
+        "96.00.5E.00.01",
+        "Secure",
+        True,
+    )
+    device_b = GpuDeviceClaim(
+        "GPU-44444444-4444-4444-8444-444444444444",
+        "NVIDIA-H100-80GB-HBM3",
+        "CC-On",
+        "550.90.07",
+        "96.00.5E.00.01",
+        "Secure",
+        True,
+    )
+    verdict_a = GpuComponentVerdict(
+        devices=(device_a,),
+        evidence_digest="sha256:" + "1" * 64,
+        challenge_digest="sha256:" + "2" * 64,
+        host_session_digest="sha256:" + "3" * 64,
+        profile_digest="sha256:" + "4" * 64,
+        tdx_component_digest="sha256:" + "5" * 64,
+        topology_digest=None,
+    )
+    verdict_b = GpuComponentVerdict(
+        devices=(device_b,),
+        evidence_digest="sha256:" + "6" * 64,
+        challenge_digest="sha256:" + "7" * 64,
+        host_session_digest="sha256:" + "8" * 64,
+        profile_digest="sha256:" + "9" * 64,
+        tdx_component_digest="sha256:" + "0" * 64,
+        topology_digest=None,
+    )
+
+    registry.claim("worker-a", verdict_a, at=NOW)
+    registry.claim("worker-b", verdict_b, at=NOW)
+
+    registry.release_worker("worker-a", reason="hotkey rotation")
+
+    with pytest.raises(GpuAttestationError) as still_owned:
+        registry.claim("worker-c", verdict_b, at=NOW)
+    assert still_owned.value.category == "identity_conflict"
+
+    registry.claim("worker-c", verdict_a, at=NOW)
 
 
 def test_gpu_identity_registry_rejects_identity_key_rotation(tmp_path: Path):

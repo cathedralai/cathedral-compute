@@ -128,7 +128,12 @@ public status response.
 
 Reenrollment is the explicit recovery mechanism after a terminal failure or
 revocation. It clears the current generation's evidence and retry fields and
-starts a new `pending` generation without modifying prior events. `retire`
+starts a new `pending` generation without modifying prior events. For a
+CC_GPU worker revoked by a GPU identity conflict after a hotkey rotation,
+reenrollment alone is not enough: the old hotkey's GPU identity claims must
+first be released with `cathedral runtime release-gpu-identities` (see
+[docs/GPU_ATTESTATION.md](GPU_ATTESTATION.md)), or the next attestation
+revokes the new generation again. `retire`
 stops network refresh and score eligibility in `retiring`; add `--removed` once
 the worker has been removed to finish in `retired`. Runtime-driven retirement
 also cancels local in-flight work. A late result from another process loses the
