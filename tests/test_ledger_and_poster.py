@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import socketserver
 import sqlite3
 import threading
+import time
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1258,6 +1260,63 @@ def make_poster(**kwargs) -> Poster:
     )
 
 
+def _read_request(handler: socketserver.StreamRequestHandler) -> None:
+    """Consume the request line, headers, and body so the client's write
+    completes even though the response is what's under test.
+    """
+    handler.rfile.readline()
+    content_length = 0
+    while True:
+        line = handler.rfile.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1].strip())
+    if content_length:
+        handler.rfile.read(content_length)
+
+
+class _TricklingBodyHandler(socketserver.StreamRequestHandler):
+    """Replies with a declared Content-Length, then drips the body one byte
+    at a time. Each byte arrives well inside the per-recv socket timeout, so
+    only a deadline check spanning the whole read (not just between reads)
+    catches it.
+    """
+
+    def handle(self) -> None:
+        _read_request(self)
+        try:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 30\r\nConnection: close\r\n\r\n")
+            self.wfile.flush()
+            for _ in range(30):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.15)
+        except BrokenPipeError:
+            pass
+
+
+class _TricklingHeadersHandler(socketserver.StreamRequestHandler):
+    """Sends the status line, then drips header lines one at a time before
+    ever completing the header block. The header-read phase has no deadline
+    reader at all before the fix.
+    """
+
+    def handle(self) -> None:
+        _read_request(self)
+        try:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            self.wfile.flush()
+            for _ in range(28):
+                self.wfile.write(b"X-Pad: " + b"a" * 20 + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.15)
+            self.wfile.write(b"Content-Length: 2\r\n\r\n{}")
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass
+
+
 class TestPoster:
     def test_requires_https_and_fixed_public_route(self) -> None:
         with pytest.raises(PosterError, match="HTTPS"):
@@ -1427,6 +1486,73 @@ class TestPoster:
         poster = make_poster()
         with pytest.raises(PosterError, match="exact persisted bytes"):
             poster.post({"scores": []})  # type: ignore[arg-type]
+
+    def test_trickling_body_is_cut_at_the_total_deadline(self) -> None:
+        """A response body that trickles in slower than total_timeout, but with
+        each individual recv() landing inside the per-recv socket timeout,
+        must not hold post() past the total deadline. Before the fix, only
+        the gap between whole response.read() calls was deadline-checked, so
+        one read() call spanning many small trickled recv()s absorbed the
+        whole trickle.
+        """
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _TricklingBodyHandler)
+        server.daemon_threads = True
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            poster = Poster(
+                f"http://127.0.0.1:{port}/v1/external-scores/violet",
+                "bearer-token",
+                "hmac-secret",
+                network="finney",
+                netuid=39,
+                allow_http_for_tests=True,
+                connect_timeout=5.0,
+                read_timeout=5.0,
+                total_timeout=0.5,
+            )
+            start = time.monotonic()
+            with pytest.raises(PosterError):
+                poster.post(VALID_REPORT)
+            elapsed = time.monotonic() - start
+        finally:
+            server.shutdown()
+            thread.join(timeout=5.0)
+            server.server_close()
+        assert elapsed < 2.0
+
+    def test_trickling_headers_are_cut_at_the_total_deadline(self) -> None:
+        """The header-read phase, which had no deadline-aware reader
+        installed at all before the fix, must also be bounded by
+        total_timeout.
+        """
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _TricklingHeadersHandler)
+        server.daemon_threads = True
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            poster = Poster(
+                f"http://127.0.0.1:{port}/v1/external-scores/violet",
+                "bearer-token",
+                "hmac-secret",
+                network="finney",
+                netuid=39,
+                allow_http_for_tests=True,
+                connect_timeout=5.0,
+                read_timeout=5.0,
+                total_timeout=0.5,
+            )
+            start = time.monotonic()
+            with pytest.raises(PosterError):
+                poster.post(VALID_REPORT)
+            elapsed = time.monotonic() - start
+        finally:
+            server.shutdown()
+            thread.join(timeout=5.0)
+            server.server_close()
+        assert elapsed < 2.0
 
 
 def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
