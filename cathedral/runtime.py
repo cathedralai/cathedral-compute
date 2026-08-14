@@ -89,6 +89,7 @@ def _producer_boot_id() -> str:
         return _process_boot_id
 
 from cathedral.score_audience import validate_score_audience
+from cathedral.score_class import validate_candidate_snapshot
 from cathedral.verify import preflight_tdx_verifier, verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
@@ -314,6 +315,7 @@ class ConfidentialRuntime:
         remote_factory: RemoteFactory = RemoteMiner,
         config: RuntimeConfig | None = None,
         receipt_issuer: ReceiptIssuer | None = None,
+        candidate_snapshot: Mapping[str, object] | None = None,
         reattestor: SingleFlightReattestor[_AttestationResult] | None = None,
         gpu_profile=None,
         gpu_verifier=None,
@@ -394,6 +396,27 @@ class ConfidentialRuntime:
                         "audience (--score-network/--score-netuid)"
                     )
                 self._config_challenge_anchor()
+        self._candidate_hotkeys: frozenset[str] | None = None
+        if candidate_snapshot is not None:
+            if self.config.score_network is None or self.config.score_netuid is None:
+                raise ValueError(
+                    "a candidate snapshot requires the score audience "
+                    "(score_network/score_netuid)"
+                )
+            binding = validate_candidate_snapshot(
+                candidate_snapshot,
+                network=self.config.score_network,
+                netuid=int(self.config.score_netuid),
+            )
+            anchor = self._config_challenge_anchor()
+            if anchor is not None and (anchor["block"], anchor["block_hash"]) != (
+                binding["block"],
+                binding["block_hash"],
+            ):
+                raise ValueError(
+                    "candidate snapshot block/hash does not match the configured challenge anchor"
+                )
+            self._candidate_hotkeys = frozenset(binding["hotkeys"])
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -570,6 +593,18 @@ class ConfidentialRuntime:
         self._require_admission_enabled()
         if self.config.production_mode and self.config.score_network is None:
             raise RuntimeError("production epoch requires an explicit score network and netuid")
+        if (
+            self.config.production_mode
+            and self.config.expected_tier is Tier.CC_CPU_TDX
+            and self._candidate_hotkeys is None
+        ):
+            raise RuntimeError(
+                "production CPU scoring requires the anchored candidate "
+                "snapshot (--candidate-snapshot): without it the runtime "
+                "cannot tell a still-registered hotkey from a deregistered "
+                "one, and an epoch that credits positive work to a hotkey "
+                "outside the snapshot can never be exported"
+            )
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("an epoch run is already in progress")
         try:
@@ -655,6 +690,21 @@ class ConfidentialRuntime:
         targets: list[MinerTarget] = []
         lifecycle_outcomes: dict[str, MinerOutcome] = {}
         for enrollment in enrollments:
+            if (
+                self._candidate_hotkeys is not None
+                and enrollment.hotkey not in self._candidate_hotkeys
+            ):
+                lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
+                    enrollment.hotkey,
+                    enrollment.endpoint_url,
+                    "not_registered",
+                    error=(
+                        "hotkey is not in the anchored candidate snapshot for "
+                        "this epoch; it is excluded from attestation and work"
+                    ),
+                )
+                self.reattestor.cancel(enrollment.hotkey)
+                continue
             snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
             if snapshot.state not in NETWORK_ELIGIBLE_STATES:
                 lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
