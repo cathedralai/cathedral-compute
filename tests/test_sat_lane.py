@@ -24,6 +24,7 @@ from cathedral.lanes.sat import (
     _derive_canonical_seed,
     solve_sat,
     validate_sat_instance,
+    validate_sat_work_item,
 )
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
@@ -65,6 +66,18 @@ def test_customer_variable_bound_stays_below_recursive_solver_limit():
     validate_sat_instance(SatInstance(MAX_N_VARS, [[MAX_N_VARS]]))
     with pytest.raises(ValueError, match="n_vars"):
         validate_sat_instance(SatInstance(MAX_N_VARS + 1, [[MAX_N_VARS + 1]]))
+
+
+def test_zero_clause_instance_is_rejected():
+    # A zero-clause instance is satisfied by any assignment; the producer
+    # must refuse it at the same bound the independent replayer enforces.
+    with pytest.raises(ValueError, match="invalid SAT clauses"):
+        validate_sat_instance(SatInstance(n_vars=4, clauses=[]))
+    inst = SatInstance(n_vars=4, clauses=[])
+    seed = 0
+    item = SatWorkItem(instance=inst, seed=seed, challenge_id=_compute_challenge_id(inst, seed))
+    with pytest.raises(ValueError, match="invalid SAT clauses"):
+        validate_sat_work_item(item)
 
 
 def test_verify_accepts_true_certificate():

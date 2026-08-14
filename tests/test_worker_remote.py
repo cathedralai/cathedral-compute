@@ -565,6 +565,30 @@ def test_sat_work_rejects_invalid_variable_and_literal_bounds(instance):
     assert code == 400
 
 
+def test_sat_work_rejects_zero_clause_instance():
+    # The bounds table above uses a fixed, deliberately mismatched
+    # challenge_id: every genuinely invalid instance there is caught by
+    # _parse_instance before the challenge_id binding is even checked. A
+    # zero-clause instance needs its OWN request with a matching challenge_id,
+    # because a bug that lets validate_sat_instance accept clauses=[] would
+    # let this request reach solve_sat and return 200, not 400.
+    instance = SatInstance(n_vars=1, clauses=[])
+    seed = 0
+    challenge_id = _compute_challenge_id(instance, seed)
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        payload = json.dumps(
+            {
+                "challenge_id": challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {"n_vars": instance.n_vars, "clauses": instance.clauses},
+                "seed": seed,
+            }
+        ).encode()
+        code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+    assert code == 400
+
+
 def test_unknown_path_returns_404():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
