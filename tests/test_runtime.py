@@ -180,6 +180,7 @@ def make_runtime(
     receipt_issuer: ReceiptIssuer | None = None,
     registry_clock: Callable[[], datetime] | None = None,
     max_workers: int = 4,
+    candidate_snapshot: dict | None = None,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     if registry_clock is None:
         registry = RegistryStore(str(tmp_path / "registry.sqlite"))
@@ -209,6 +210,7 @@ def make_runtime(
             score_netuid=39,
         ),
         receipt_issuer=receipt_issuer,
+        candidate_snapshot=candidate_snapshot,
     )
     return runtime, actual_ledger, factory
 
@@ -298,6 +300,7 @@ def _production_runtime(
     enrolled_token: str | None,
     monkeypatch,
     extra_miners: tuple[tuple[str, str, str, str | None], ...] = (),
+    include_candidate_snapshot: bool = True,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     """A production runtime with one enrolled miner, plus any extra
     (hotkey, endpoint, chip, token) miners. Tokens are served the way the CLI
@@ -310,14 +313,26 @@ def _production_runtime(
         "https://1.1.1.1:9001": MinerSpec("miner-chip"),
     }
     tokens: dict[str, str | None] = {"miner": enrolled_token}
+    hotkeys = ["miner"]
     for hotkey, endpoint, chip, token in extra_miners:
         registry.enroll(hotkey, endpoint)
         specs[endpoint] = MinerSpec(chip)
         tokens[hotkey] = token
+        hotkeys.append(hotkey)
     factory = FakeFactory(specs)
     policy = production_policy()
     monkeypatch.setattr(runtime_module, "verify", verifier)
     monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
+    candidate_snapshot = None
+    if include_candidate_snapshot:
+        candidate_snapshot = {
+            "schema": "cathedral_candidate_snapshot_v1",
+            "network": "finney",
+            "netuid": 39,
+            "block": 100,
+            "block_hash": "0x" + "ab" * 32,
+            "hotkeys": hotkeys,
+        }
     runtime = ConfidentialRuntime(
         registry,
         ledger,
@@ -335,6 +350,7 @@ def _production_runtime(
             challenge_anchor_block=100,
             challenge_anchor_hash="0x" + "ab" * 32,
         ),
+        candidate_snapshot=candidate_snapshot,
     )
     return runtime, ledger, factory
 
@@ -384,6 +400,67 @@ def test_direct_production_epoch_requires_audience_before_network_or_epoch(
                 challenge_anchor_hash="0x" + "ab" * 32,
             ),
         )
+    assert factory.log == {}
+    assert ledger.blocking_epoch() is None
+
+
+def test_candidate_snapshot_must_match_the_configured_challenge_anchor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The candidate snapshot's block/hash is validated against the
+    configured challenge anchor at construction, before any epoch: a
+    snapshot captured at the wrong block would silently let the runtime
+    score against a candidate set the epoch's nonces were never derived
+    from."""
+    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    policy = production_policy()
+    monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
+    mismatched_snapshot = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": "finney",
+        "netuid": 39,
+        "block": 101,
+        "block_hash": "0x" + "ab" * 32,
+        "hotkeys": [],
+    }
+    with pytest.raises(ValueError, match="does not match the configured challenge anchor"):
+        ConfidentialRuntime(
+            registry,
+            ledger,
+            policy,
+            token_provider=lambda _hotkey: "token",
+            policy_refresher=lambda: policy,
+            config=RuntimeConfig(
+                production_mode=True,
+                score_network="finney",
+                score_netuid=39,
+                evidence_retention_dir=str(tmp_path / "retained-evidence"),
+                challenge_anchor_block=100,
+                challenge_anchor_hash="0x" + "ab" * 32,
+            ),
+            candidate_snapshot=mismatched_snapshot,
+        )
+    assert ledger.blocking_epoch() is None
+
+
+def test_production_cpu_epoch_requires_the_candidate_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Without an anchored candidate snapshot the runtime cannot tell a
+    still-registered hotkey from a deregistered one, so production CPU
+    scoring refuses to start at all rather than let the export-side
+    backstop (score_class.py) discover the problem after the epoch already
+    scored positive work for an off-snapshot hotkey."""
+    runtime, ledger, factory = _production_runtime(
+        tmp_path,
+        enrolled_token="miner-token",
+        monkeypatch=monkeypatch,
+        include_candidate_snapshot=False,
+    )
+    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+    with pytest.raises(RuntimeError, match="candidate snapshot"):
+        runtime.run_epoch(1, canary)
     assert factory.log == {}
     assert ledger.blocking_epoch() is None
 
@@ -797,6 +874,112 @@ def test_epoch_survives_a_mid_epoch_reenrollment_after_receipt_issuance(
     blocking = ledger.blocking_epoch()
     assert blocking is not None
     assert blocking["status"] == "complete"
+
+
+def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding: a hotkey the chain has deregistered but that is still
+    enrolled used to be attested, dispatched work, and scored verified with
+    positive units, which then made score_class.py permanently refuse the
+    export ('frozen epoch carries POSITIVE work for a hotkey that is not
+    registered in the anchored candidate snapshot'), and the refusal
+    repeated every following epoch because the hotkey stayed enrolled. The
+    runtime must exclude a hotkey outside the anchored candidate snapshot
+    BEFORE any attestation or work, so no positive ledger row can ever
+    exist for it and the export-side backstop is never actually needed."""
+    from cathedral.score_class import export_score_class_report
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, RECEIPT_SEED_2, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    candidate_snapshot = {
+        "schema": "cathedral_candidate_snapshot_v1",
+        "network": "finney",
+        "netuid": 39,
+        "block": 100,
+        "block_hash": "0x" + "ab" * 32,
+        # miner-a is enrolled but the chain has deregistered it: it is
+        # absent from the anchored snapshot, unlike miner-b.
+        "hotkeys": ["miner-b"],
+    }
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+        candidate_snapshot=candidate_snapshot,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+    run = runtime.run_epoch(11, CANARY)
+
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["miner-a"].status == "not_registered"
+    assert outcomes["miner-a"].admitted is False
+    assert outcomes["miner-a"].score == 0.0
+    # Never contacted at all: no evidence request, no SAT dispatch.
+    assert "nonce:miner-a" not in factory.log
+    assert "sat:miner-a" not in factory.log
+
+    assert outcomes["miner-b"].status == "verified"
+    stored = ledger.receipt_for_challenge(outcomes["miner-b"].challenge_id or "")
+    assert stored is not None
+
+    report = json.loads(
+        export_score_class_report(
+            ledger,
+            run.epoch_id,
+            network="finney",
+            netuid=39,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=RECEIPT_SEED_2,
+            generated_at=ISSUED,
+            valid_until=ISSUED + timedelta(minutes=5),
+            valid_from_block=100,
+            valid_until_block=200,
+            verifier_digest="sha256:" + "d" * 64,
+            # make_runtime epochs carry no durable challenge anchor (dev mode).
+            candidate_snapshot=candidate_snapshot,
+            require_epoch_anchor=False,
+        )
+    )
+    entries = {entry["miner_hotkey"]: entry for entry in report["entries"]}
+    assert set(entries) == {"miner-b"}
+    assert entries["miner-b"]["reason_codes"] == ["receipt_verified", "work_verified"]
 
 
 def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> None:

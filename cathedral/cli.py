@@ -1027,6 +1027,12 @@ def _build_runtime(
             production_mode=config.production_mode,
             generation_anchor_path=gpu_identity_anchor_file,
         )
+    candidate_snapshot_path = getattr(args, "candidate_snapshot", None)
+    candidate_snapshot = None
+    if candidate_snapshot_path is not None:
+        candidate_snapshot = _strict_json_object(
+            Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
+        )
     ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
@@ -1037,6 +1043,7 @@ def _build_runtime(
         policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,
+        candidate_snapshot=candidate_snapshot,
         gpu_profile=gpu_profile,
         gpu_verifier=gpu_verifier,
         gpu_identity_registry=gpu_identity_registry,
@@ -3813,6 +3820,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_runtime_common(p_run)
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
+    p_run.add_argument(
+        "--candidate-snapshot",
+        default=None,
+        help="cathedral_candidate_snapshot_v1 JSON captured at the challenge "
+        "anchor block (cathedral-candidate-snapshot --network ... --netuid "
+        "... --block <the same --challenge-anchor-block>); REQUIRED for "
+        "production CPU scoring, and it must be the exact file later passed "
+        "to export-score-class, or that export refuses a still-enrolled "
+        "hotkey the chain has since deregistered",
+    )
     p_run.add_argument("--publish", action="store_true")
     p_run.add_argument(
         "--pretty",
