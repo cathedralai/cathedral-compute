@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import socket
 import time
@@ -12,6 +13,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from cathedral.remote import _deadline_response_class
 from cathedral.score_audience import validate_score_audience
 
 
@@ -22,6 +24,40 @@ class PosterError(Exception):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
         return None
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline_source) -> None:  # type: ignore[no-untyped-def]
+        super().__init__()
+        self._deadline_source = deadline_source
+
+    def http_open(self, req):  # type: ignore[no-untyped-def]
+        deadline = self._deadline_source()
+
+        def factory(host, **kwargs):  # type: ignore[no-untyped-def]
+            connection = http.client.HTTPConnection(host, **kwargs)
+            if deadline is not None:
+                connection.response_class = _deadline_response_class(deadline)
+            return connection
+
+        return self.do_open(factory, req)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline_source) -> None:  # type: ignore[no-untyped-def]
+        super().__init__()
+        self._deadline_source = deadline_source
+
+    def https_open(self, req):  # type: ignore[no-untyped-def]
+        deadline = self._deadline_source()
+
+        def factory(host, **kwargs):  # type: ignore[no-untyped-def]
+            connection = http.client.HTTPSConnection(host, **kwargs)
+            if deadline is not None:
+                connection.response_class = _deadline_response_class(deadline)
+            return connection
+
+        return self.do_open(factory, req)
 
 
 class Poster:
@@ -74,7 +110,12 @@ class Poster:
         self.read_timeout = read_timeout
         self.total_timeout = total_timeout
         self.response_cap_bytes = response_cap_bytes
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        self._request_deadline: float | None = None
+        self._opener = urllib.request.build_opener(
+            _NoRedirect(),
+            _DeadlineHTTPHandler(lambda: self._request_deadline),
+            _DeadlineHTTPSHandler(lambda: self._request_deadline),
+        )
 
     def post(self, report_body: bytes) -> dict[str, Any]:
         if not isinstance(report_body, bytes):
@@ -103,6 +144,7 @@ class Poster:
             },
         )
         deadline = time.monotonic() + self.total_timeout
+        self._request_deadline = deadline
         try:
             response = self._opener.open(
                 request,

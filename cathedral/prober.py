@@ -104,14 +104,13 @@ class _PreResolvedHTTPSConnection(http.client.HTTPSConnection):
             timeout=self.timeout,
             source_address=self.source_address,
         )
+        self.sock = sock
         if self._tunnel_host:
-            self.sock = sock
             self._tunnel()
-            return
-        self.sock = self._wrap_socket(
-            sock,
-            server_hostname=self.host,
-        )
+            server_hostname = self._tunnel_host
+        else:
+            server_hostname = self.host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
 
 
 def _resolve_endpoint(
