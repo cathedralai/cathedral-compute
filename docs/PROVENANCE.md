@@ -110,6 +110,21 @@ reports acceptance: a reservation conflict aborts the run with a terminal
 `FAIL` only — no accepting event or audit record can precede a failed
 reservation.
 
+An explicitly requested `--source-epoch` that resolves to an epoch other
+than the index's current latest pointer is a historical audit, not a
+frontier observation: it passes or fails on that epoch's own evidence, and
+it is never classified as a report or policy rollback merely for naming an
+epoch older than a previously recorded fence. A historical audit neither
+lowers nor establishes any fence: it may only advance or reconfirm an
+existing report or policy fence, and it never writes the index fence,
+because a historical run never fetches or checks the latest pointer's
+manifest. The index high-water advances only on a run that verified the
+latest pointer. Equal-epoch equivocation and the sequential forward-chain
+rule still hold unconditionally in historical mode, so a stale or
+rolled-back report is still rejected and sequential catch-up through
+repeated `--source-epoch` runs still advances the report fence one epoch
+at a time.
+
 ## Signed-vector comparison binding (`--publisher-url`)
 
 `compare_with_vector` reports agreement ONLY when the signed subnet vector

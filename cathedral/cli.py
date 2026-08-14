@@ -2497,6 +2497,7 @@ def _reserve_fences(
     report_id: str,
     previous_report_id: str | None,
     source_epoch: int,
+    historical: bool = False,
 ) -> None:
     """ONE atomic lock/check/reserve transaction executed BEFORE PASS.
 
@@ -2505,6 +2506,17 @@ def _reserve_fences(
     recorded predecessor - RAISES. There is no silent keep-newer path: a
     concurrent fork writing a conflicting reservation is an error, never an
     accepted state.
+
+    `historical` marks a run whose --source-epoch selected an epoch other
+    than the index's current latest pointer: a verification of the past,
+    not a frontier observation. A historical audit never lowers or
+    establishes a fence, and it never writes the index fence, because this
+    run did not verify the latest pointer's manifest (that check only runs
+    when the frontier is selected). It still enforces equal-epoch
+    equivocation and the forward chain rule unconditionally, so a stale or
+    rolled-back report is still rejected and sequential catch-up through
+    --source-epoch still advances the report fence forward one epoch at a
+    time.
     """
     import fcntl
 
@@ -2531,7 +2543,7 @@ def _reserve_fences(
                 )
         stored_release = current.get("policy_release")
         if isinstance(stored_release, int):
-            if policy_release < stored_release:
+            if not historical and policy_release < stored_release:
                 raise ValueError(
                     f"policy rollback: release {policy_release} < reserved {stored_release}"
                 )
@@ -2547,23 +2559,29 @@ def _reserve_fences(
         ):
             raise ValueError("report does not chain from the reserved predecessor")
         if isinstance(stored_source, int):
-            if source_epoch < stored_source:
+            if not historical and source_epoch < stored_source:
                 raise ValueError(
                     f"report rollback: source epoch {source_epoch} < reserved {stored_source}"
                 )
             if source_epoch == stored_source and stored_report != report_id:
                 raise ValueError("report equivocation: same source epoch, different report")
 
-        current.update(
-            {
-                "index_source_epoch": index_epoch,
-                "index_manifest": index_manifest,
-                "policy_release": policy_release,
-                "policy_digest": policy_digest,
-                "report_id": report_id,
-                "report_source_epoch": source_epoch,
-            }
-        )
+        # A historical audit is a verification of the past: it may advance
+        # or reconfirm an existing fence, but it never lowers one and never
+        # establishes one from nothing, and it never writes the index
+        # fence, because this run never fetched or checked the latest
+        # pointer's manifest.
+        if not historical:
+            current["index_source_epoch"] = index_epoch
+            current["index_manifest"] = index_manifest
+        if not historical or (
+            isinstance(stored_release, int) and policy_release >= stored_release
+        ):
+            current["policy_release"] = policy_release
+            current["policy_digest"] = policy_digest
+        if not historical or (isinstance(stored_source, int) and source_epoch >= stored_source):
+            current["report_id"] = report_id
+            current["report_source_epoch"] = source_epoch
         for stale in fence_path.parent.glob(fence_path.name + ".*.tmp"):
             if not stale.is_symlink():
                 try:
@@ -3116,6 +3134,12 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         # failure path below, which emits ONLY a terminal FAIL — an
         # accepting terminal event can never precede a failed reservation.
         if fence_path is not None:
+            # A historical audit is one whose selected manifest is not the
+            # index's current latest pointer: nothing in this run verified
+            # the latest pointer's manifest (the consistency check above
+            # only runs when the frontier is selected), so this run must
+            # not be treated as a frontier observation of the index.
+            historical_audit = str(manifest_digest) != str(index_document["latest"]["manifest"])
             _reserve_fences(
                 fence_path,
                 index_epoch=int(index_document["latest"]["source_epoch"]),
@@ -3124,6 +3148,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 policy_digest=str(result.policy_digest),
                 report_id=str(result.report_id),
                 previous_report_id=result.previous_report_id,
+                historical=historical_audit,
                 source_epoch=int(result.source_epoch),
             )
         if not full:
@@ -4038,7 +4063,14 @@ def build_parser() -> argparse.ArgumentParser:
         "the exact (id, revision) pair and refuses any other",
     )
     p_prov_verify.add_argument(
-        "--source-epoch", type=int, help="verify a specific epoch (default: index latest)"
+        "--source-epoch",
+        type=int,
+        help=(
+            "verify a specific epoch (default: index latest). Auditing an "
+            "epoch older than the state file's high-water is a historical "
+            "audit: it passes or fails on that epoch's own evidence and "
+            "does not move the fences."
+        ),
     )
     p_prov_verify.add_argument("--index-max-age-secs", type=float, default=3600.0)
     p_prov_verify.add_argument(
