@@ -30,6 +30,7 @@ from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
+from cathedral.lifecycle import WorkerLifecycleState
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.remote import RemoteError
 from cathedral.runtime import (
@@ -770,6 +771,109 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
     assert customer_snapshot.status == ("queued" if invalid_sat else "succeeded")
     assert customer_snapshot.attempt_count == 1
     assert (customer_snapshot.result is not None) is (not invalid_sat)
+
+
+def test_epoch_survives_a_mid_epoch_reenrollment_after_receipt_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+
+    class HookLedger(Ledger):
+        """Fires a one-shot hook right after a receipt is durably stored.
+
+        This lands a concurrent registry write deterministically inside the
+        window between receipt persistence and the epoch's post-SAT
+        lifecycle-recording loop, without patching the runtime code under
+        test.
+        """
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.post_receipt_hook: Callable[[], None] | None = None
+
+        def resolve_challenge_with_receipt(self, *args: object, **kwargs: object) -> None:
+            super().resolve_challenge_with_receipt(*args, **kwargs)  # type: ignore[arg-type]
+            hook, self.post_receipt_hook = self.post_receipt_hook, None
+            if hook is not None:
+                hook()
+
+    ledger = HookLedger(tmp_path / "ledger.sqlite")
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+        ledger=ledger,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+
+    # The miner-controlled trigger from the finding: an endpoint change,
+    # which RegistryStore.enroll routes through reenroll_lifecycle to
+    # pending/endpoint_changed, generation 2.
+    ledger.post_receipt_hook = lambda: runtime.registry.enroll(
+        "miner", "http://127.0.0.1:9003"
+    )
+
+    # On unpatched code this raises LedgerError("receipt does not match the
+    # epoch worker lifecycle snapshot") and the epoch row is aborted -- that
+    # is the failure this test pins. The run itself must not raise.
+    run = runtime.run_epoch(11, CANARY)
+
+    assert run.status == "complete"
+    assert run.scores["miner"] == 1.0
+
+    report = json.loads(ledger.get_epoch(run.epoch_id)["report_body"])
+    lifecycle_by_hotkey = {
+        row["hotkey"]: row for row in report["metadata"]["worker_lifecycle"]
+    }
+    assert lifecycle_by_hotkey["miner"]["state"] == "attested"
+    assert lifecycle_by_hotkey["miner"]["generation"] == 1
+
+    # The concurrent re-enrollment is preserved in the registry and takes
+    # effect next epoch; the fix must not clobber it.
+    live = runtime.registry.lifecycle_snapshot("miner")
+    assert live.state is WorkerLifecycleState.PENDING
+    assert live.generation == 2
+
+    # No aborted retry pin: the next run is not forced to replay source_epoch 11.
+    blocking = ledger.blocking_epoch()
+    assert blocking is not None
+    assert blocking["status"] == "complete"
 
 
 def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(

@@ -19,7 +19,7 @@ implemented-but-unproven, and what is NOT PROVEN, per launch item.
 | 3. Versioned reward mechanisms | IMPLEMENTED | `validated_supply_v1` (units-proportional shares + fixed 10% burn) pinned in manifests, provenance recompute, and validator config; work units derive under the versioned `sat_work_units_v1` rule shared VERBATIM by the producer lane and the independent replayer (canonical audit work = clause count; customer jobs = fixed CUSTOMER_SAT_WORK_UNITS) — never a signer or miner claim; replayed work items must satisfy the FULL producer contract (recomputed challenge_id from canonical instance+seed, clause/total-literal/per-clause/seed/size bounds) |
 | 4. Public artifact/index surfaces | IMPLEMENTED, NOT DEPLOYED | content-addressed store + signed index with full recent-row validation and verified history carry; manifests carry a versioned `candidate_set` anchored to an independently fetched SN39 metagraph snapshot (`cathedral_candidate_snapshot_v1`: network/netuid/block/block_hash + exact hotkeys, no machine identity); deploy blocked pending review |
 | 5. TTY + JSONL logs | IMPLEMENTED, locally tested | hardened EventLoggers both repos (recursive redaction, control-char neutralization, 0600 O_NOFOLLOW) |
-| 6. Adversarial + live proof | PARTIAL | adversarial suites green (confidential 1649 tests collected; subnet two-mode 24 incl. work-replay, derived-challenge, and fence counterexamples); LIVE mainnet proof NOT PROVEN (deploy blocked) |
+| 6. Adversarial + live proof | PARTIAL | adversarial suites green (confidential 1647 tests collected; subnet two-mode 24 incl. work-replay, derived-challenge, and fence counterexamples); LIVE mainnet proof NOT PROVEN (deploy blocked) |
 | 7. Clean external reproduction | NOT PROVEN | docs/PROVENANCE.md documents the one-command path; requires deployed evidence surface + published key bundle |
 | 8. Operator/release docs + checklist | THIS FILE + docs/PROVENANCE.md (one-command reproduction + acceptance semantics) + docs/MRTD.md (measurement/TCB policy + rollback) + docs/BUDGET.md (fixed spend/burn controls + security exceptions); reference integrity enforced by tests/test_docs_integrity.py; release pinning pending review |
 
@@ -97,24 +97,16 @@ recorded, justified exception — not a silent suppression.
 - **Independent candidate set.** The finalized-block challenge anchor is
   persisted ON THE EPOCH at `begin_epoch` (validated block+hash pair with
   its audience); nonce derivation and the durable record are read-back
-  asserted equal. `runtime run-epoch` itself consumes the same
-  `cathedral_candidate_snapshot_v1` (captured with the supported
-  `cathedral-candidate-snapshot` command) via `--candidate-snapshot`:
-  production CPU scoring refuses to start without it, any enrolled hotkey
-  outside the snapshot's hotkey set is excluded from attestation and work
-  for that epoch (status `not_registered`, scored zero), and a snapshot
-  whose block/hash differ from the configured `--challenge-anchor-block`/
-  `--challenge-anchor-hash` is refused at construction, before any network
-  activity. This means a frozen epoch can never carry positive work for a
-  hotkey the chain has since deregistered. `runtime export-score-class`
-  requires the same `cathedral_candidate_snapshot_v1` the epoch observed,
-  refuses any snapshot whose block/hash differ from the epoch's stored
-  anchor, accounts for EVERY historically registered hotkey with an
-  explicit row, and binds the snapshot's digest/block/hash/full sorted
-  hotkey set into the SIGNED report. `runtime export-evidence` must reuse
-  that exact snapshot (digest equality); a later, unrelated snapshot can
-  never be substituted. Full validators verify candidates by EXACT equality
-  against `Subtensor.metagraph(netuid, block=anchored_block)` +
+  asserted equal. `runtime export-score-class` requires the
+  `cathedral_candidate_snapshot_v1` the epoch observed (captured with the
+  supported `cathedral-candidate-snapshot` command), refuses any snapshot
+  whose block/hash differ from the epoch's stored anchor, accounts for
+  EVERY historically registered hotkey with an explicit row, and binds the
+  snapshot's digest/block/hash/full sorted hotkey set into the SIGNED
+  report. `runtime export-evidence` must reuse that exact snapshot (digest
+  equality) — a later, unrelated snapshot can never be substituted. Full
+  validators verify candidates by EXACT equality against
+  `Subtensor.metagraph(netuid, block=anchored_block)` +
   `get_block_hash(block)` from their own chain connection; unavailable or
   malformed history is NOT_PROVEN, omission or fabrication FAILS.
 
@@ -125,9 +117,8 @@ Registry freshness hotfix (owner-managed, separate); confidential branch
 (provenance extra pinned to the immutable confidential commit); epoch-loop
 update (export-score-class + export-evidence + retention env; per-epoch
 `cathedral-candidate-snapshot --network finney --netuid 39 --block <final>`
-feeding `--challenge-anchor-block/--challenge-anchor-hash` AND
-`--candidate-snapshot` at epoch begin (`runtime run-epoch`), and the
-identical snapshot file again at export time; both run-epoch and the
-exporter enforce that the snapshot agrees with the epoch's anchor); nginx
-`/v1/evidence/` location; score-class/index signing keys created on the VM;
-key bundle + digests published into docs and `config/provenance/`.
+feeding BOTH `--challenge-anchor-block/--challenge-anchor-hash` at epoch
+begin and `--candidate-snapshot` at export time — the exporter enforces
+that they agree); nginx `/v1/evidence/` location; score-class/index signing
+keys created on the VM; key bundle + digests published into docs and
+`config/provenance/`.
