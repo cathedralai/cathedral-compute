@@ -332,8 +332,8 @@ Build and test the static Linux x86-64 artifact:
 
 ```bash
 cd cmd/cathedral-tdx-verifier
-export GOTOOLCHAIN=go1.25.12
-test "$(go env GOVERSION)" = go1.25.12
+export GOTOOLCHAIN=go1.25.13
+test "$(go env GOVERSION)" = go1.25.13
 go mod verify
 go test -race ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
@@ -343,7 +343,7 @@ file cathedral-tdx-verifier
 readelf -l cathedral-tdx-verifier
 ```
 
-The module, documented build, and CI require exactly Go 1.25.12 so a verifier
+The module, documented build, and CI require exactly Go 1.25.13 so a verifier
 cannot be released from an older standard library with known reachable TLS,
 X.509, or HTTP advisories. CI uses `GOTOOLCHAIN=local`, checks the exact compiler
 version, and fails if the artifact contains either an ELF interpreter or
