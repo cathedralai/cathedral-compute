@@ -47,12 +47,13 @@ from cathedral.common import (
     is_globally_routable,
     issue_nonce,
 )
-from cathedral.enroll import RegistryStore
+from cathedral.enroll import Enrollment, RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import CustomerJobLease, Ledger, LedgerError
 from cathedral.lifecycle import (
+    CAPACITY_CONSUMING_STATES,
     NETWORK_ELIGIBLE_STATES,
     LifecycleError,
     LifecycleReason,
@@ -654,8 +655,18 @@ class ConfidentialRuntime:
         }
         targets: list[MinerTarget] = []
         lifecycle_outcomes: dict[str, MinerOutcome] = {}
+        # Captured at epoch start, not recomputed after SAT: a worker that
+        # participates and then dies mid-epoch must stay in the universe (its
+        # receipt cross-check at ledger.py add_lifecycle_snapshot and its
+        # explicit zero both need it), while a worker already dead before the
+        # epoch began (FAILED or RETIRED) is excluded so append-only,
+        # never-deleted enrollment rows cannot grow the frozen report past
+        # MAX_LAUNCH_CANDIDATES as the subnet churns.
+        epoch_candidates: list[Enrollment] = []
         for enrollment in enrollments:
             snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+            if snapshot.state in CAPACITY_CONSUMING_STATES:
+                epoch_candidates.append(enrollment)
             if snapshot.state not in NETWORK_ELIGIBLE_STATES:
                 lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
                     enrollment.hotkey,
@@ -747,13 +758,13 @@ class ConfidentialRuntime:
                 self._run_sat(epoch_id, source_epoch, admitted, outcomes)
                 self._require_live_gpu_profile()
 
-                for enrollment in enrollments:
+                for enrollment in epoch_candidates:
                     self.ledger.add_lifecycle_snapshot(
                         epoch_id,
                         self.registry.lifecycle_snapshot(enrollment.hotkey),
                     )
 
-                all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
+                all_hotkeys = {enrollment.hotkey for enrollment in epoch_candidates}
                 self._require_live_gpu_profile()
                 score_authority_valid_until = None
                 if self.config.expected_tier is Tier.CC_GPU and self.config.production_mode:

@@ -493,8 +493,11 @@ Launch acceptance requires all of the following:
    measurement, TCB, and platform policy.
 2. Cathedral dispatches useful work plus an unpredictable audit task,
    independently verifies both, and derives all credit itself.
-3. The publisher freezes and signs a complete epoch stream. Missing, failed,
-   stale, and revoked miners are present with explicit zero scores.
+3. The publisher freezes and signs a complete epoch stream. Every worker that
+   was live when the epoch began, and every revoked or retiring worker,
+   carries an explicit score, including zero. Workers already failed or
+   retired before the epoch began leave the report entirely; the full-vector
+   weight submission zeroes an absent hotkey.
 4. Every signed hotkey maps to exactly one current metagraph UID. Missing and
    duplicate mappings fail closed before submission.
 5. The thin validator consumes the compute vector as its sole score input,

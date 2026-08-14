@@ -156,6 +156,14 @@ itself by re-enrolling into its own row. It would not mint weight, because
 every attestation gate re-runs, but a revocation a miner can lift is not a
 revocation.
 
+The same "consumes capacity" set also defines the epoch report universe: the
+runtime freezes a score row only for hotkeys whose lifecycle state consumed a
+capacity slot at epoch start. Enrollment rows are never deleted, so without
+that shared boundary a subnet's worth of dead `FAILED`/`RETIRED` rows would
+accumulate in the frozen report forever; tying both to one definition keeps
+the report bounded by `max_admitted_workers_total` for as long as the cap
+holds.
+
 One further rule applies only under a policy: an endpoint already enrolled by
 a different live worker is refused (`endpoint_claimed`). This is the
 pre-attestation proxy for one physical machine; true platform uniqueness

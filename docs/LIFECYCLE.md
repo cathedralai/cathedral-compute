@@ -22,6 +22,12 @@ requires explicit reenrollment, which creates a new generation in `pending`;
 it never rewrites the old history. Identity conflicts remain terminal for the
 generation in which they were detected.
 
+A worker already `failed` or `retired` before an epoch begins also leaves
+that epoch's frozen score report, since neither state consumes admission
+capacity; `revoked` does consume capacity and keeps its explicit zero row.
+Enrollment rows are never deleted, so this is what keeps the report bounded
+as workers churn through the subnet over time.
+
 ## Freshness and retries
 
 Freshness is calculated from the attestation verification time plus the

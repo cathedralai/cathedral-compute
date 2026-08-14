@@ -46,6 +46,7 @@ from cathedral.coldkey_allowlist import (
 )
 from cathedral.common import Attested, is_globally_routable
 from cathedral.lifecycle import (
+    CAPACITY_CONSUMING_STATES,
     NETWORK_ELIGIBLE_STATES,
     TERMINAL_STATES,
     LifecycleError,
@@ -1690,10 +1691,7 @@ class RegistryStore:
         these rules and is left exactly as it was; only a request governed by
         an admission policy opts in.
         """
-        consuming = (
-            set(NETWORK_ELIGIBLE_STATES)
-            | {WorkerLifecycleState.REVOKED, WorkerLifecycleState.RETIRING}
-        )
+        consuming = set(CAPACITY_CONSUMING_STATES)
         live = ", ".join(f"'{state.value}'" for state in sorted(consuming, key=lambda s: s.value))
         # A worker with no lifecycle row yet (legacy data) counts as live.
         live_join = f"""

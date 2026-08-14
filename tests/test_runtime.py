@@ -610,6 +610,49 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
 
 
+def test_retired_enrollment_leaves_the_report_universe(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+    )
+    # remove_enrollment is the strongest removal the API offers: it lands
+    # RETIRING lifecycle to RETIRED and clears the stored verdict. The row
+    # itself is never deleted (enrollments are append-only), so miner-b stays
+    # in the registry forever.
+    runtime.registry.remove_enrollment("miner-b")
+
+    run = runtime.run_epoch(1, CANARY)
+
+    report = json.loads(ledger.report_bytes(run.epoch_id))
+    assert {row["miner_hotkey"] for row in report["scores"]} == {"miner-a"}
+    assert "miner-b" not in run.scores
+    # Operator visibility survives the universe change: the run's own
+    # outcomes still surface the retired worker, just not the frozen report.
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["miner-b"].status == "retired"
+
+
+def test_failed_enrollment_leaves_the_report_universe(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+    )
+    # Drive miner-b to FAILED before the epoch begins, the same terminal-ish
+    # state a probe reaches after its retry ladder is exhausted.
+    runtime.registry.record_verdict("miner-b", None)
+
+    run = runtime.run_epoch(1, CANARY)
+
+    report = json.loads(ledger.report_bytes(run.epoch_id))
+    assert {row["miner_hotkey"] for row in report["scores"]} == {"miner-a"}
+    outcomes = {outcome.hotkey: outcome for outcome in run.outcomes}
+    assert outcomes["miner-b"].status == "failed"
+
+
 @pytest.mark.parametrize(
     ("invalid_sat", "expected_outcome", "expected_claim", "expected_units"),
     [
