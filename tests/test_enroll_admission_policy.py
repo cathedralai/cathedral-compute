@@ -876,6 +876,98 @@ def test_a_live_worker_can_still_re_enroll_after_an_ip_rotation(tmp_path: Path):
     assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT_TWO
 
 
+def test_a_retiring_worker_cannot_lift_its_retirement_by_re_enrolling(tmp_path: Path):
+    """RETIRING is operator intent and is not in TERMINAL_STATES, but a miner
+    must not be able to reverse it by re-enrolling at a new endpoint.
+
+    Uses the real `cathedral lifecycle retire` edge (store.retire_lifecycle
+    with removed=False), not a raw sqlite UPDATE, so the transition is the
+    one an operator actually performs.
+    """
+    app, store, _ = build_app(tmp_path)
+    assert call(app, v2_payload())[0] == 200
+
+    store.retire_lifecycle(HOTKEY, removed=False)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.RETIRING
+
+    status, body = call(
+        app, v2_payload(nonce="92" * 16, endpoint_url=ENDPOINT_TWO)
+    )
+    assert status == 403
+    assert body["error"] == "worker is retiring; re-enrollment is an operator action"
+
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.RETIRING
+    assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT
+    assert store.due_refreshes(refresh_ahead_seconds=60) == ()
+
+
+# ---------------------------------------------------------------------------
+# 8b. Production launch arguments
+# ---------------------------------------------------------------------------
+
+def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monkeypatch):
+    """The documented --admission-policy production launch must not demand
+    --enroll-allowlist-digest: that artifact is never loaded on this path.
+    """
+    import hashlib
+
+    import cathedral.enroll
+
+    keys_path = tmp_path / "admission-policy-keys.json"
+    keys_bytes = json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}).encode("utf-8")
+    keys_path.write_bytes(keys_bytes)
+    keys_digest = "sha256:" + hashlib.sha256(keys_bytes).hexdigest()
+
+    policy_path = tmp_path / "admission-policy.json"
+    policy_path.write_bytes(policy_bytes())
+
+    registered_path = snapshot_file(tmp_path, {HOTKEY: COLDKEY})
+
+    argv = [
+        "cathedral-enroll",
+        "--db", str(tmp_path / "registry.sqlite"),
+        "--production-mode",
+        "--network", NETWORK,
+        "--netuid", str(NETUID),
+        "--registered-hotkeys-file", registered_path,
+        "--admission-policy", str(policy_path),
+        "--admission-policy-keys", str(keys_path),
+        "--admission-policy-keys-digest", keys_digest,
+        "--admission-policy-state", str(tmp_path / "admission-policy-state.json"),
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    def _raise_reached(*args, **kwargs):
+        raise RuntimeError("server reached")
+
+    monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
+
+    with pytest.raises(RuntimeError, match="server reached"):
+        cathedral.enroll.main()
+
+
+def test_production_allowlist_launch_still_requires_the_artifact_digest(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The fix narrows the guard; it must not delete the allowlist pin."""
+    import cathedral.enroll
+
+    argv = [
+        "cathedral-enroll",
+        "--production-mode",
+        "--registered-hotkeys-file", str(tmp_path / "registered.json"),
+        "--enroll-allowlist", str(tmp_path / "allowlist.json"),
+        "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),
+        "--enroll-allowlist-keys-digest", "sha256:" + "a" * 64,
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cathedral.enroll.main()
+    assert exc_info.value.code == 2
+    assert "--production-mode requires --enroll-allowlist-digest" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # 9. Reconcile is reachable under a policy
 # ---------------------------------------------------------------------------
@@ -954,6 +1046,46 @@ def test_open_mode_reconcile_reclaims_only_deregistered_workers(tmp_path: Path, 
     assert report["admission_mode"] == "all_registered"
     assert [entry["hotkey"] for entry in report["flagged"]] == [HOTKEY_TWO]
     assert report["flagged"][0]["status"] == "not_registered"
+
+
+def test_open_mode_reconcile_aborts_on_empty_snapshot(tmp_path: Path):
+    """Finding: a torn or failed rotation write of the registration
+    snapshot must abort reconcile loudly in open mode too, not flag and
+    (with --remove) retire every enrolled hotkey as not_registered."""
+    import argparse
+
+    from cathedral.cli import cmd_enroll_reconcile
+
+    app, store, policy_path = build_app(
+        tmp_path,
+        policy=policy_bytes(mode="all_registered", coldkeys=[]),
+        registered={HOTKEY: COLDKEY, HOTKEY_TWO: COLDKEY},
+    )
+    assert call(app, v2_payload())[0] == 200
+    assert call(app, v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT_TWO, nonce="a0" * 16))[0] == 200
+
+    # Torn rotation write: zero bytes, fresh mtime.
+    (tmp_path / "registered.json").write_bytes(b"")
+
+    keys = tmp_path / "policy-keys.json"
+    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
+    args = argparse.Namespace(
+        registry_db=str(store.path),
+        allowlist=None,
+        admission_policy=str(policy_path),
+        admission_policy_keys=str(keys),
+        admission_policy_keys_digest=None,
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=True,
+    )
+    with pytest.raises(ValueError, match="registration snapshot"):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(HOTKEY_TWO).state is WorkerLifecycleState.PENDING
 
 
 def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):

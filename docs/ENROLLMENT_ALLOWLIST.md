@@ -26,7 +26,10 @@ the durable owner identity: hotkeys rotate and one operator may run several.
 Hotkeys-only snapshots keep working for the registration gate, but they carry
 no ownership data, so coldkey resolution fails closed until the rotation cron
 emits the extended format. The same mtime-based `max_age_seconds` staleness
-bound applies to every format.
+bound applies to every format. A snapshot that parses to zero hotkeys is
+never treated as valid, in any format: on a live subnet the validator itself
+is always registered, so an empty snapshot can only be a torn or failed
+rotation write, and is refused the same as a stale or malformed one.
 
 ## Allowlist artifact format
 
@@ -188,5 +191,8 @@ survives while the worker leaves the refresh set, the epoch target list, and
 the public verified count.
 
 The command aborts, touching nothing, when the allowlist fails verification
-or when the registration snapshot is stale, malformed, or hotkeys-only:
-those states must never be interpreted as "nobody is approved".
+or when the registration snapshot is stale, empty, malformed, or
+hotkeys-only: those states must never be interpreted as "nobody is
+approved". An empty snapshot in particular is always treated as a torn or
+failed rotation write, never a truthful metagraph view, because it would
+otherwise read as "nobody is registered" and retire the entire board.

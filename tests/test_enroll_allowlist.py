@@ -552,8 +552,25 @@ def test_reconcile_aborts_on_stale_snapshot(tmp_path: Path) -> None:
     _reconcile_fixture(tmp_path)
     stale = time.time() - 7200
     os.utime(tmp_path / "registered-hotkeys.json", (stale, stale))
-    with pytest.raises(ValueError, match="missing, stale, or malformed"):
+    with pytest.raises(ValueError, match="missing, stale, empty, or malformed"):
         cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=True))
+
+
+def test_reconcile_aborts_on_empty_snapshot(tmp_path: Path) -> None:
+    """Finding: a torn or failed rotation write (zero-byte redirect, or a
+    well-formed but empty extended snapshot) must abort reconcile loudly,
+    the same as a stale or malformed one. It must never be read as 'nobody
+    is registered' and retire the whole board."""
+    import os
+
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    (tmp_path / "registered-hotkeys.json").write_text('{"hotkeys": {}}')
+    fresh = time.time()
+    os.utime(tmp_path / "registered-hotkeys.json", (fresh, fresh))
+    with pytest.raises(ValueError, match="registration snapshot"):
+        cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=True))
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
 
 
 # ---------------------------------------------------------------------------

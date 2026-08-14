@@ -150,11 +150,20 @@ What consumes capacity is deliberate in both directions:
 | `RETIRED` | no | the operator's own act of freeing capacity |
 
 A worker in a terminal state (`REVOKED`, `RETIRED`) is refused if it tries to
-re-enroll. `reenroll_lifecycle` writes `PENDING` directly without consulting
-the transition table, so without that gate a revoked worker would rehabilitate
-itself by re-enrolling into its own row. It would not mint weight, because
-every attestation gate re-runs, but a revocation a miner can lift is not a
-revocation.
+re-enroll, and so is a worker in `RETIRING` even though `RETIRING` is not
+terminal. `reenroll_lifecycle` writes `PENDING` directly without consulting
+the transition table, so without that gate a revoked or retiring worker would
+rehabilitate itself by re-enrolling into its own row. It would not mint
+weight, because every attestation gate re-runs, but a revocation, or a
+retirement, that a miner can lift is not a revocation or a retirement.
+
+The same "consumes capacity" set also defines the epoch report universe: the
+runtime freezes a score row only for hotkeys whose lifecycle state consumed a
+capacity slot at epoch start. Enrollment rows are never deleted, so without
+that shared boundary a subnet's worth of dead `FAILED`/`RETIRED` rows would
+accumulate in the frozen report forever; tying both to one definition keeps
+the report bounded by `max_admitted_workers_total` for as long as the cap
+holds.
 
 One further rule applies only under a policy: an endpoint already enrolled by
 a different live worker is refused (`endpoint_claimed`). This is the
@@ -174,6 +183,17 @@ remains the chip-id gate at admission.
 > invoked from the epoch attestation path). It enforces chip-id uniqueness
 > and chip-to-hotkey rotation binding. What is missing is only the
 > admitted-count cap, not the gate.
+>
+> Both chip rules **refuse for the epoch rather than revoke** (#138). A
+> `chip_id` is a domain-separated hash of the PCK PPID, which names a physical
+> platform and not a guest, so two miners whose confidential VMs land on one
+> cloud host collide without either of them misbehaving. The uniqueness
+> property is unchanged -- at most one hotkey holds a live binding to a chip,
+> and no duplicate claimant is admitted or scored -- but the penalty is now a
+> lost epoch instead of a terminal state that only an operator can lift.
+> Recovery is automatic: the gates re-run next epoch. GPU identity conflicts
+> stay terminal, because an exclusively passed-through GPU cannot be claimed by
+> two workers innocently.
 >
 > Two related limits worth knowing before enabling open mode. The per-pass
 > probe budget bounds the standalone prober; the validator's own epoch
@@ -195,15 +215,24 @@ python -m cathedral.enroll \
   --admission-policy /etc/cathedral/admission-policy-sn39.json \
   --admission-policy-keys /etc/cathedral/admission-policy-keys.json \
   --admission-policy-keys-digest sha256:<digest of the key file> \
-  --admission-policy-digest sha256:<digest of the policy artifact>
+  --admission-policy-state /var/lib/cathedral/admission-policy-state.json
 ```
 
-Production requires both digests. The key digest pins the root of trust, not
-the document; the `config_version` guard is in-process and resets on restart,
-so a superseded but still validly signed policy could otherwise be replayed
-to re-open a mode or restore a revoked coldkey. **Pinning the artifact digest
-is what makes revocation durable.** Rotating a pinned policy is deliberately
-a restart with the new digest.
+Production requires the key digest plus the state file, not an artifact
+digest pin. The key digest pins the root of trust, not the document; without
+it a superseded but still validly signed policy could be replayed with a
+compromised or stale key. The state file records the highest accepted
+`config_version` durably across restarts, which is what actually makes
+revocation and rollback resistance survive a restart: an in-process-only
+guard forgets on every restart.
+
+Pinning the policy artifact itself with `--admission-policy-digest` is
+optional and not part of the production requirement, because it conflicts
+with rotation: the staleness ceiling forces a re-sign before `issued_at` goes
+stale, a re-sign changes the canonical document and therefore the digest, and
+a service with a required artifact pin would then refuse every enrollment
+until an operator restarted it with the new digest. Use it only for a policy
+that is deliberately frozen and not expected to rotate.
 
 ## Rejection reasons
 

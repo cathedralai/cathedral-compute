@@ -84,7 +84,11 @@ rows cost manifest bytes only). These values are imported from the same
 frozen launch-limit module by the score producer and evidence grammar.
 Epoch completion refuses a 4,097th candidate or 29th positive score, and
 the exact frozen bytes are checked again before `Poster.post`, so an
-accepted producer report cannot later become unexportable. The manifest
+accepted producer report cannot later become unexportable. The runtime feeds
+completion only the hotkeys whose lifecycle state was still consuming
+capacity at epoch start (`cathedral.lifecycle.CAPACITY_CONSUMING_STATES`), so
+enrollment rows that failed or retired before the epoch began, which are
+never deleted from the registry, cannot accumulate toward that refusal. The manifest
 grammar independently rejects a 29th receipt row or `verified` outcome.
 Raising any number here is a reviewed contract change, never a config
 drift — and never a multi-gigabyte cap.

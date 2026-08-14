@@ -282,6 +282,105 @@ def _completed_fresh_epoch(tmp_path: Path) -> tuple[Ledger, int]:
     return ledger, epoch_id
 
 
+def _completed_second_epoch_report(ledger: Ledger) -> int:
+    """Mirrors _completed_fresh_epoch for a SECOND source_epoch=12 on the
+    SAME open ledger, with a distinct challenge id, and exports its signed
+    score-class report chained (automatically, via the ledger's own
+    previous_score_class_export lookup) from source_epoch 11's report.
+    Used to build a real two-row evidence index (latest=12, recent=[11])."""
+    # A genuinely different SAT instance (21 clauses, not 20) so the
+    # challenge id independently replays correctly instead of merely being
+    # relabeled: _compute_challenge_id is a hash of (n_vars, clauses, seed),
+    # and _work_fixture's producer bytes must match it exactly. Neither this
+    # instance nor epoch 11's is the seed's canonical derivation, so both
+    # replay as the fixed CUSTOMER_SAT_WORK_UNITS regardless of clause count
+    # (cathedral.lanes.sat.derived_work_units); 20.0 stays correct here.
+    n_clauses = 21
+    challenge_id = _compute_challenge_id(
+        _SatInstance(n_vars=3, clauses=[[1, 2, -3]] * n_clauses), 7
+    )
+    epoch_id = ledger.begin_epoch(
+        12,
+        policy_registry_release=SNAPSHOT.release,
+        policy_registry_digest=SNAPSHOT.digest,
+        network=NETWORK,
+        netuid=NETUID,
+        challenge_anchor_block=100,
+        challenge_anchor_hash="0x" + "ab" * 32,
+    )
+    policy = SNAPSHOT.to_policy(at=NOW)
+    work_item_bytes, result_bytes = _work_fixture(challenge_id, "public-hotkey", n_clauses=n_clauses)
+    from cathedral.assurance import sha256_digest as _sha
+
+    claims = _fresh_claims(policy, result_bytes)
+    receipt = ReceiptIssuer(SNAPSHOT, "receipt-test-1", RECEIPT_SEED).issue(
+        epoch_id=epoch_id,
+        source_epoch=12,
+        subject_hotkey="public-hotkey",
+        attested=_fresh_attested(claims),
+        policy=policy,
+        assurance=claims,
+        worker_lifecycle=_fresh_lifecycle(claims, policy, "public-hotkey"),
+        challenge_id=challenge_id,
+        manifest_digest=_sha(work_item_bytes),
+        work_units=20.0,
+        issued_at=NOW,
+    )
+    ledger.record_work_artifacts(challenge_id, work_item_bytes, result_bytes)
+    ledger.issue_challenge(challenge_id, "public-hotkey", epoch_id)
+    ledger.resolve_challenge_with_receipt(
+        challenge_id,
+        "verified",
+        20.0,
+        validator_derived=True,
+        receipt_id=receipt.receipt_id,
+        receipt_body=receipt.receipt_bytes,
+        receipt_digest=receipt.receipt_digest,
+        issued_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    )
+    ledger.add_attestation(
+        epoch_id,
+        "public-hotkey",
+        verdict="VERIFIED",
+        tee_type="TDX",
+        workload="CPU",
+        evidence_digest=claims.hardware.evidence_digest,
+        policy_mode="strict",
+        envelope_digest="sha256:" + "e" * 64,
+    )
+    ledger.add_lifecycle_snapshot(
+        epoch_id,
+        _fresh_lifecycle(claims, policy, "public-hotkey"),
+        snapshot_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"public-hotkey"},
+        generated_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
+    ledger.mark_published(epoch_id)
+    export_score_class_report(
+        ledger,
+        epoch_id,
+        network=NETWORK,
+        netuid=NETUID,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=REPORT_SEED,
+        generated_at=NOW,
+        valid_until=NOW + timedelta(minutes=30),
+        valid_from_block=100,
+        valid_until_block=10_000_000_000,
+        verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+    return epoch_id
+
+
 # ---------------------------------------------------------------------------
 # Store primitives
 # ---------------------------------------------------------------------------
@@ -572,6 +671,90 @@ def test_cli_export_then_receipts_only_verify_is_not_proven(
     assert acknowledged == 0
     audit2 = json.loads((tmp_path / "audit2.json").read_text())
     assert audit2["result"] == "NOT_PROVEN"  # never upgraded by the flag
+
+
+def test_source_epoch_audit_after_a_latest_run_passes_and_leaves_fences(
+    tmp_path: Path, capsys
+):
+    """Finding: --source-epoch naming an epoch older than the state file's
+    recorded high-water is a historical audit. After a frontier run has
+    reserved fences at the live epoch, auditing an earlier, still-indexed
+    epoch by name must still PASS (not fail as a report rollback) and must
+    leave the fences exactly where the frontier run left them."""
+    ledger, epoch_11 = _completed_fresh_epoch(tmp_path)
+    export_score_class_report(
+        ledger,
+        epoch_11,
+        network=NETWORK,
+        netuid=NETUID,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=REPORT_SEED,
+        generated_at=NOW,
+        valid_until=NOW + timedelta(minutes=30),
+        valid_from_block=100,
+        valid_until_block=10_000_000_000,
+        verifier_digest=VERIFIER_DIGEST,
+        candidate_snapshot=CANDIDATE_SNAPSHOT_DOC,
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+    _completed_second_epoch_report(ledger)
+    ledger.close()
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_bytes(REGISTRY_BYTES)
+    _write_key_file(tmp_path / "index-signing.key", INDEX_SEED)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(CANDIDATE_SNAPSHOT_DOC, sort_keys=True, separators=(",", ":"))
+    )
+    evidence_dir = tmp_path / "evidence"
+    export_args = _export_evidence_args(tmp_path, snapshot_path, evidence_dir=evidence_dir)
+
+    # Export epoch 11 first (it is "latest-published" at this point), then
+    # epoch 12 (now "latest-published"): the index ends up latest=12,
+    # recent=[11], exactly cli.py:1846-1862's carry-forward behaviour.
+    assert cli_main(export_args + ["--epoch-id", str(epoch_11)]) == 0
+    capsys.readouterr()
+    assert cli_main(export_args) == 0
+    capsys.readouterr()
+
+    index_document = json.loads((evidence_dir / "index.json").read_text())
+    assert int(index_document["latest"]["source_epoch"]) == 12
+    assert [int(row["source_epoch"]) for row in index_document["recent"]] == [11]
+
+    state_file = tmp_path / "fences.json"
+    audit_path = tmp_path / "audit.json"
+    verify_args = _verify_cli_args(tmp_path, evidence_dir) + [
+        "--allow-receipts-only",
+        "--state-file",
+        str(state_file),
+        "--audit-out",
+        str(audit_path),
+    ]
+
+    # Run 1: verify the live epoch (12). This is a frontier observation and
+    # reserves fences at 12.
+    code = cli_main(verify_args)
+    capsys.readouterr()
+    assert code == 0
+    state = json.loads(state_file.read_text())
+    assert state["index_source_epoch"] == 12
+    assert state["report_source_epoch"] == 12
+    before = state_file.read_bytes()
+
+    # Run 2: audit the OLDER, already-indexed epoch 11 by name with the SAME
+    # state file. On today's code this is misclassified as a report
+    # rollback (source epoch 11 < reserved 12) and exits 1. It must PASS as
+    # a historical audit and must not move the fences at all.
+    code2 = cli_main(verify_args + ["--source-epoch", "11"])
+    capsys.readouterr()
+    assert code2 == 0
+    audit = json.loads(audit_path.read_text())
+    assert audit["result"] == "NOT_PROVEN"
+    assert audit["source_epoch"] == 11
+    assert state_file.read_bytes() == before
 
 
 def test_cli_verify_fails_closed_on_tampered_receipt_blob(
@@ -878,6 +1061,102 @@ def test_fence_reservation_conflicts_fail_never_keep_silently(tmp_path: Path):
         source_epoch=13,
     )
     assert json.loads(fence.read_text())["index_source_epoch"] == 13
+
+
+def test_historical_audit_neither_lowers_nor_establishes_fences(tmp_path: Path):
+    """Finding: an explicitly requested --source-epoch older than the state
+    file's high-water is a historical audit, not a frontier observation. It
+    must never raise a report/policy rollback, must never establish a fence
+    from nothing, must still enforce equal-epoch equivocation, and must
+    still let sequential catch-up through --source-epoch advance the report
+    fence forward while leaving the index fence untouched."""
+    from cathedral.cli import _reserve_fences
+
+    fence = tmp_path / "fences.json"
+    _reserve_fences(
+        fence,
+        index_epoch=12,
+        index_manifest="sha256:" + "a" * 64,
+        policy_release=6,
+        policy_digest="sha256:" + "0" * 64,
+        report_id="sha256:" + "1" * 64,
+        previous_report_id=None,
+        source_epoch=12,
+    )
+    before = fence.read_bytes()
+
+    # (a) An older source epoch and an older policy release, run as a
+    # historical audit, must not raise and must not touch the state file.
+    _reserve_fences(
+        fence,
+        index_epoch=12,
+        index_manifest="sha256:" + "a" * 64,
+        policy_release=5,
+        policy_digest="sha256:" + "9" * 64,
+        report_id="sha256:" + "2" * 64,
+        previous_report_id=None,
+        source_epoch=11,
+        historical=True,
+    )
+    assert fence.read_bytes() == before
+
+    # (b) Historical mode does not disable equal-epoch equivocation
+    # detection: a different report at the SAME reserved source epoch
+    # still raises.
+    with pytest.raises(ValueError, match="report equivocation"):
+        _reserve_fences(
+            fence,
+            index_epoch=12,
+            index_manifest="sha256:" + "a" * 64,
+            policy_release=6,
+            policy_digest="sha256:" + "0" * 64,
+            report_id="sha256:" + "9" * 64,
+            previous_report_id=None,
+            source_epoch=12,
+            historical=True,
+        )
+    assert fence.read_bytes() == before
+
+    # (c) A historical audit against a fence path with no prior report or
+    # policy entries never establishes one: none of report_id,
+    # report_source_epoch or index_source_epoch get written.
+    bare_fence = tmp_path / "bare_fences.json"
+    _reserve_fences(
+        bare_fence,
+        index_epoch=5,
+        index_manifest="sha256:" + "e" * 64,
+        policy_release=1,
+        policy_digest="sha256:" + "1" * 64,
+        report_id="sha256:" + "3" * 64,
+        previous_report_id=None,
+        source_epoch=5,
+        historical=True,
+    )
+    bare_state = json.loads(bare_fence.read_text())
+    assert "report_id" not in bare_state
+    assert "report_source_epoch" not in bare_state
+    assert "index_source_epoch" not in bare_state
+
+    # (d) Sequential catch-up through --source-epoch keeps working: a
+    # historical run that chains from the reserved report and lands one
+    # epoch ahead advances the report fence, while the index fence (which
+    # only a frontier run may move) stays untouched.
+    _reserve_fences(
+        fence,
+        index_epoch=12,
+        index_manifest="sha256:" + "a" * 64,
+        policy_release=6,
+        policy_digest="sha256:" + "0" * 64,
+        report_id="sha256:" + "4" * 64,
+        previous_report_id="sha256:" + "1" * 64,
+        source_epoch=13,
+        historical=True,
+    )
+    state = json.loads(fence.read_text())
+    assert state["report_id"] == "sha256:" + "4" * 64
+    assert state["report_source_epoch"] == 13
+    assert state["index_source_epoch"] == 12
+    assert state["index_manifest"] == "sha256:" + "a" * 64
 
 
 def test_retention_store_rejects_drifted_blob_permissions(tmp_path: Path):

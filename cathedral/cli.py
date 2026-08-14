@@ -1027,6 +1027,12 @@ def _build_runtime(
             production_mode=config.production_mode,
             generation_anchor_path=gpu_identity_anchor_file,
         )
+    candidate_snapshot_path = getattr(args, "candidate_snapshot", None)
+    candidate_snapshot = None
+    if candidate_snapshot_path is not None:
+        candidate_snapshot = _strict_json_object(
+            Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
+        )
     ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
@@ -1037,6 +1043,7 @@ def _build_runtime(
         policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,
+        candidate_snapshot=candidate_snapshot,
         gpu_profile=gpu_profile,
         gpu_verifier=gpu_verifier,
         gpu_identity_registry=gpu_identity_registry,
@@ -2497,6 +2504,7 @@ def _reserve_fences(
     report_id: str,
     previous_report_id: str | None,
     source_epoch: int,
+    historical: bool = False,
 ) -> None:
     """ONE atomic lock/check/reserve transaction executed BEFORE PASS.
 
@@ -2505,6 +2513,17 @@ def _reserve_fences(
     recorded predecessor - RAISES. There is no silent keep-newer path: a
     concurrent fork writing a conflicting reservation is an error, never an
     accepted state.
+
+    `historical` marks a run whose --source-epoch selected an epoch other
+    than the index's current latest pointer: a verification of the past,
+    not a frontier observation. A historical audit never lowers or
+    establishes a fence, and it never writes the index fence, because this
+    run did not verify the latest pointer's manifest (that check only runs
+    when the frontier is selected). It still enforces equal-epoch
+    equivocation and the forward chain rule unconditionally, so a stale or
+    rolled-back report is still rejected and sequential catch-up through
+    --source-epoch still advances the report fence forward one epoch at a
+    time.
     """
     import fcntl
 
@@ -2531,7 +2550,7 @@ def _reserve_fences(
                 )
         stored_release = current.get("policy_release")
         if isinstance(stored_release, int):
-            if policy_release < stored_release:
+            if not historical and policy_release < stored_release:
                 raise ValueError(
                     f"policy rollback: release {policy_release} < reserved {stored_release}"
                 )
@@ -2547,23 +2566,29 @@ def _reserve_fences(
         ):
             raise ValueError("report does not chain from the reserved predecessor")
         if isinstance(stored_source, int):
-            if source_epoch < stored_source:
+            if not historical and source_epoch < stored_source:
                 raise ValueError(
                     f"report rollback: source epoch {source_epoch} < reserved {stored_source}"
                 )
             if source_epoch == stored_source and stored_report != report_id:
                 raise ValueError("report equivocation: same source epoch, different report")
 
-        current.update(
-            {
-                "index_source_epoch": index_epoch,
-                "index_manifest": index_manifest,
-                "policy_release": policy_release,
-                "policy_digest": policy_digest,
-                "report_id": report_id,
-                "report_source_epoch": source_epoch,
-            }
-        )
+        # A historical audit is a verification of the past: it may advance
+        # or reconfirm an existing fence, but it never lowers one and never
+        # establishes one from nothing, and it never writes the index
+        # fence, because this run never fetched or checked the latest
+        # pointer's manifest.
+        if not historical:
+            current["index_source_epoch"] = index_epoch
+            current["index_manifest"] = index_manifest
+        if not historical or (
+            isinstance(stored_release, int) and policy_release >= stored_release
+        ):
+            current["policy_release"] = policy_release
+            current["policy_digest"] = policy_digest
+        if not historical or (isinstance(stored_source, int) and source_epoch >= stored_source):
+            current["report_id"] = report_id
+            current["report_source_epoch"] = source_epoch
         for stale in fence_path.parent.glob(fence_path.name + ".*.tmp"):
             if not stale.is_symlink():
                 try:
@@ -3116,6 +3141,12 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
         # failure path below, which emits ONLY a terminal FAIL — an
         # accepting terminal event can never precede a failed reservation.
         if fence_path is not None:
+            # A historical audit is one whose selected manifest is not the
+            # index's current latest pointer: nothing in this run verified
+            # the latest pointer's manifest (the consistency check above
+            # only runs when the frontier is selected), so this run must
+            # not be treated as a frontier observation of the index.
+            historical_audit = str(manifest_digest) != str(index_document["latest"]["manifest"])
             _reserve_fences(
                 fence_path,
                 index_epoch=int(index_document["latest"]["source_epoch"]),
@@ -3124,6 +3155,7 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
                 policy_digest=str(result.policy_digest),
                 report_id=str(result.report_id),
                 previous_report_id=result.previous_report_id,
+                historical=historical_audit,
                 source_epoch=int(result.source_epoch),
             )
         if not full:
@@ -3247,6 +3279,23 @@ def cmd_runtime_recover_gpu_identities(args: argparse.Namespace) -> int:
         production_mode=not args.development,
         generation_anchor_path=args.gpu_identity_anchor_file,
     )
+    print(json.dumps(dict(outcome), sort_keys=True))
+    return 0
+
+
+def cmd_runtime_release_gpu_identities(args: argparse.Namespace) -> int:
+    """Authenticate and audit an explicit release of one worker's GPU claims."""
+
+    registry = GpuIdentityRegistry(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+    )
+    outcome = registry.release_worker(args.hotkey, reason=args.reason)
     print(json.dumps(dict(outcome), sort_keys=True))
     return 0
 
@@ -3386,7 +3435,7 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     # A broken snapshot must abort loudly: treating every enrollment as
     # unresolvable would flag (and with --remove retire) the whole board.
     if registration is None:
-        raise ValueError("registration snapshot is missing, stale, or malformed")
+        raise ValueError("registration snapshot is missing, stale, empty, or malformed")
     registered_hotkeys, coldkey_map = registration
     if coldkey_map is None and approved is not None:
         raise ValueError(
@@ -3813,6 +3862,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_runtime_common(p_run)
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
+    p_run.add_argument(
+        "--candidate-snapshot",
+        default=None,
+        help="cathedral_candidate_snapshot_v1 JSON captured at the challenge "
+        "anchor block (cathedral-candidate-snapshot --network ... --netuid "
+        "... --block <the same --challenge-anchor-block>); REQUIRED for "
+        "production CPU scoring, and it must be the exact file later passed "
+        "to export-score-class, or that export refuses a still-enrolled "
+        "hotkey the chain has since deregistered",
+    )
     p_run.add_argument("--publish", action="store_true")
     p_run.add_argument(
         "--pretty",
@@ -3976,6 +4035,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gpu_recovery.set_defaults(func=cmd_runtime_recover_gpu_identities)
 
+    p_gpu_release = runtime_sub.add_parser(
+        "release-gpu-identities",
+        help="release one worker's committed GPU identity claims and audit it",
+    )
+    p_gpu_release.add_argument("--gpu-identity-db", required=True)
+    p_gpu_release.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_release.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_release.add_argument("--hotkey", required=True)
+    p_gpu_release.add_argument(
+        "--reason",
+        required=True,
+        help="operator justification recorded in the GPU identity audit trail",
+    )
+    p_gpu_release.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production ownership checks for a local release exercise",
+    )
+    p_gpu_release.set_defaults(func=cmd_runtime_release_gpu_identities)
+
     p_gpu_initialize = runtime_sub.add_parser(
         "initialize-gpu-identities",
         help="perform one-time creation of the GPU identity database and external anchor",
@@ -4038,7 +4117,14 @@ def build_parser() -> argparse.ArgumentParser:
         "the exact (id, revision) pair and refuses any other",
     )
     p_prov_verify.add_argument(
-        "--source-epoch", type=int, help="verify a specific epoch (default: index latest)"
+        "--source-epoch",
+        type=int,
+        help=(
+            "verify a specific epoch (default: index latest). Auditing an "
+            "epoch older than the state file's high-water is a historical "
+            "audit: it passes or fails on that epoch's own evidence and "
+            "does not move the fences."
+        ),
     )
     p_prov_verify.add_argument("--index-max-age-secs", type=float, default=3600.0)
     p_prov_verify.add_argument(
