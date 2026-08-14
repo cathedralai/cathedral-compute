@@ -2365,6 +2365,109 @@ class GpuIdentityRegistry:
             self.rollback_claim(pending)
             raise
 
+    def release_worker(self, hotkey: str, *, reason: str) -> Mapping[str, object]:
+        """Authenticated operator ceremony that frees a worker's committed claims.
+
+        Committed GPU identity claims are permanent by design: nothing else in
+        this module deletes a `worker_admission` row. That is correct while the
+        owning hotkey is live, but it means routine Bittensor hotkey churn
+        (deregistration and re-registration, key rotation, coldkey change)
+        would otherwise permanently disqualify the physical GPUs, because the
+        next attestation under the new hotkey hits the identity_conflict at
+        begin_claim and is revoked. This method is the explicit escape: it
+        deletes only the calling operator's named hotkey's own committed
+        claims, authenticated by the same identity key as every other mutation
+        here, and records a durable audit event before the generation and
+        state MAC advance.
+        """
+
+        if not isinstance(hotkey, str) or not hotkey:
+            raise GpuAttestationError("identity_config_invalid", "GPU worker hotkey is invalid")
+        if (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= _MAX_RECOVERY_REASON_LENGTH
+            or any(ord(character) < 0x20 for character in reason)
+        ):
+            raise GpuAttestationError(
+                "identity_config_invalid", "GPU identity release reason is invalid"
+            )
+        hotkey_digest = self._private_digest(b"cathedral-gpu-hotkey-v1\0", hotkey)
+        with self._connect() as connection:
+            database_generation = self._begin_authenticated(connection, "BEGIN IMMEDIATE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM gpu_identity_claims_v3 "
+                    "WHERE hotkey_digest=? AND claim_token IS NOT NULL LIMIT 1",
+                    (hotkey_digest,),
+                ).fetchone()
+                is not None
+            ):
+                raise GpuAttestationError(
+                    "identity_recovery_required",
+                    "GPU identity registry contains an interrupted admission",
+                )
+            identity_digests = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT gpu_identity_digest FROM gpu_identity_claims_v3 "
+                    "WHERE hotkey_digest=? AND claim_kind=? AND claim_token IS NULL "
+                    "ORDER BY gpu_identity_digest",
+                    (hotkey_digest, _GPU_WORKER_CLAIM),
+                ).fetchall()
+            ]
+            if not identity_digests:
+                raise GpuAttestationError(
+                    "identity_release_not_required",
+                    "worker holds no committed GPU identity claims",
+                )
+            cursor = connection.execute(
+                "DELETE FROM gpu_identity_claims_v3 "
+                "WHERE hotkey_digest=? AND claim_kind=? AND claim_token IS NULL",
+                (hotkey_digest, _GPU_WORKER_CLAIM),
+            )
+            if cursor.rowcount != len(identity_digests) or (
+                connection.execute(
+                    "SELECT 1 FROM gpu_identity_claims_v3 WHERE hotkey_digest=? LIMIT 1",
+                    (hotkey_digest,),
+                ).fetchone()
+                is not None
+            ):
+                raise GpuAttestationError(
+                    "identity_config_invalid", "GPU identity release was incomplete"
+                )
+            event_id = uuid.uuid4().hex
+            released_at = canonical_utc(datetime.now(UTC))
+            token_digests_json = json.dumps(
+                sorted(identity_digests), separators=(",", ":"), ensure_ascii=True
+            )
+            connection.execute(
+                "INSERT INTO gpu_identity_recovery_events_v1("
+                "event_id,recovered_at,reason,worker_claims_committed,"
+                "worker_identities_committed,canary_reservations_released,"
+                "canary_identities_released,claim_token_digests_json) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    released_at,
+                    "worker identity release: " + reason,
+                    0,
+                    0,
+                    0,
+                    0,
+                    token_digests_json,
+                ),
+            )
+            self._commit_authenticated_state(connection, database_generation)
+        return MappingProxyType(
+            {
+                "event_id": event_id,
+                "released_at": released_at,
+                "hotkey": hotkey,
+                "released_identities": len(identity_digests),
+            }
+        )
+
 
 @dataclass(frozen=True)
 class CompositeGpuResult:

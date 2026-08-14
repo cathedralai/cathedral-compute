@@ -1027,6 +1027,12 @@ def _build_runtime(
             production_mode=config.production_mode,
             generation_anchor_path=gpu_identity_anchor_file,
         )
+    candidate_snapshot_path = getattr(args, "candidate_snapshot", None)
+    candidate_snapshot = None
+    if candidate_snapshot_path is not None:
+        candidate_snapshot = _strict_json_object(
+            Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
+        )
     ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
@@ -1037,6 +1043,7 @@ def _build_runtime(
         policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,
+        candidate_snapshot=candidate_snapshot,
         gpu_profile=gpu_profile,
         gpu_verifier=gpu_verifier,
         gpu_identity_registry=gpu_identity_registry,
@@ -3251,6 +3258,23 @@ def cmd_runtime_recover_gpu_identities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_runtime_release_gpu_identities(args: argparse.Namespace) -> int:
+    """Authenticate and audit an explicit release of one worker's GPU claims."""
+
+    registry = GpuIdentityRegistry(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+    )
+    outcome = registry.release_worker(args.hotkey, reason=args.reason)
+    print(json.dumps(dict(outcome), sort_keys=True))
+    return 0
+
+
 def cmd_runtime_initialize_gpu_identities(args: argparse.Namespace) -> int:
     """Perform the explicit one-time creation of production GPU identity state."""
 
@@ -3813,6 +3837,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_runtime_common(p_run)
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
+    p_run.add_argument(
+        "--candidate-snapshot",
+        default=None,
+        help="cathedral_candidate_snapshot_v1 JSON captured at the challenge "
+        "anchor block (cathedral-candidate-snapshot --network ... --netuid "
+        "... --block <the same --challenge-anchor-block>); REQUIRED for "
+        "production CPU scoring, and it must be the exact file later passed "
+        "to export-score-class, or that export refuses a still-enrolled "
+        "hotkey the chain has since deregistered",
+    )
     p_run.add_argument("--publish", action="store_true")
     p_run.add_argument(
         "--pretty",
@@ -3975,6 +4009,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="relax production ownership checks for a local recovery exercise",
     )
     p_gpu_recovery.set_defaults(func=cmd_runtime_recover_gpu_identities)
+
+    p_gpu_release = runtime_sub.add_parser(
+        "release-gpu-identities",
+        help="release one worker's committed GPU identity claims and audit it",
+    )
+    p_gpu_release.add_argument("--gpu-identity-db", required=True)
+    p_gpu_release.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_release.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_release.add_argument("--hotkey", required=True)
+    p_gpu_release.add_argument(
+        "--reason",
+        required=True,
+        help="operator justification recorded in the GPU identity audit trail",
+    )
+    p_gpu_release.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production ownership checks for a local release exercise",
+    )
+    p_gpu_release.set_defaults(func=cmd_runtime_release_gpu_identities)
 
     p_gpu_initialize = runtime_sub.add_parser(
         "initialize-gpu-identities",

@@ -50,6 +50,7 @@ from cathedral.enroll import (
     now_iso,
     validate_endpoint_url,
 )
+from cathedral.lifecycle import TERMINAL_STATES, WorkerLifecycleState
 from cathedral.prober import (
     _PreResolvedHTTPConnection,
     _PreResolvedHTTPSConnection,
@@ -316,6 +317,12 @@ def test_registry_chip_rotation_conflict_does_not_publish_rejected_identity(
     assert miners[claimant]["verification_status"] == "FAILED"
     assert miners[claimant]["chip_id_prefix"] is None
     assert miners[claimant]["tier"] is None
+    # The rejected identity costs the claimant its verdict, not its worker.
+    # chip_id derives from a per-host PPID, so a co-resident cloud tenant can
+    # land here innocently and must stay recoverable without an operator (#138).
+    claimant_lifecycle = store.lifecycle_snapshot(claimant)
+    assert claimant_lifecycle.state is WorkerLifecycleState.FAILED
+    assert claimant_lifecycle.state not in TERMINAL_STATES
 
 
 # ---------------------------------------------------------------------------

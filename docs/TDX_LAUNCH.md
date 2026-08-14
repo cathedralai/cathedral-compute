@@ -400,9 +400,12 @@ The compatibility test above uses one in-process miner and predates the full
 production topology. The final CPU acceptance canary requires two different
 disposable TDX platforms: one dedicated canary and one enrolled worker. Each
 must expose a public-IP HTTPS endpoint whose private key terminates inside its
-guest and whose SPKI digest is configured on the loopback worker. After those
-endpoints are ready, run the production parent path from a separate Linux
-validator host:
+guest and whose SPKI digest is configured on the loopback worker. If an
+enrollment ever claims `--canary-endpoint` for itself, that claimant is
+excluded from the epoch with a `canary_endpoint_conflict` outcome; it never
+blocks the epoch, so one miner cannot wedge every published weight by
+enrolling at the canary's own address. After those endpoints are ready, run
+the production parent path from a separate Linux validator host:
 
 ```bash
 sudo env \
@@ -493,8 +496,11 @@ Launch acceptance requires all of the following:
    measurement, TCB, and platform policy.
 2. Cathedral dispatches useful work plus an unpredictable audit task,
    independently verifies both, and derives all credit itself.
-3. The publisher freezes and signs a complete epoch stream. Missing, failed,
-   stale, and revoked miners are present with explicit zero scores.
+3. The publisher freezes and signs a complete epoch stream. Every worker that
+   was live when the epoch began, and every revoked or retiring worker,
+   carries an explicit score, including zero. Workers already failed or
+   retired before the epoch began leave the report entirely; the full-vector
+   weight submission zeroes an absent hotkey.
 4. Every signed hotkey maps to exactly one current metagraph UID. Missing and
    duplicate mappings fail closed before submission.
 5. The thin validator consumes the compute vector as its sole score input,
