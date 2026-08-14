@@ -290,6 +290,32 @@ def test_policy_revocation_is_offline_terminal_until_explicit_reenrollment(tmp_p
     assert pending.generation == revoked[0].generation + 1
 
 
+def test_a_retiring_worker_cannot_reenroll_itself_but_the_operator_can(tmp_path: Path):
+    """RETIRING is operator intent, not TERMINAL, but it must not be
+    miner-reversible either: retirement the miner can lift is not retirement.
+    """
+    clock = MutableClock()
+    store = _store(tmp_path, clock)
+    _record_attested(store)
+
+    clock.advance(1)
+    retiring = store.retire_lifecycle("worker", removed=False)
+    assert retiring.state is WorkerLifecycleState.RETIRING
+    assert store.due_refreshes(refresh_ahead_seconds=60) == ()
+
+    with pytest.raises(LifecycleError, match="cannot re-enroll itself"):
+        store.enroll("worker", "https://8.8.8.8:8444")
+    assert store.lifecycle_snapshot("worker").state is WorkerLifecycleState.RETIRING
+    assert store.due_refreshes(refresh_ahead_seconds=60) == ()
+
+    clock.advance(1)
+    # the operator recovery still works: retirement is reversible, but only
+    # deliberately.
+    pending = store.reenroll_lifecycle("worker", operator=True)
+    assert pending.state is WorkerLifecycleState.PENDING
+    assert pending.generation == retiring.generation + 1
+
+
 def test_legacy_verified_rows_backfill_stale_without_exact_measurement(tmp_path: Path):
     clock = MutableClock()
     store = _store(tmp_path, clock)

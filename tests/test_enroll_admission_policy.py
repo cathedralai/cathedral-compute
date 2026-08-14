@@ -876,6 +876,31 @@ def test_a_live_worker_can_still_re_enroll_after_an_ip_rotation(tmp_path: Path):
     assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT_TWO
 
 
+def test_a_retiring_worker_cannot_lift_its_retirement_by_re_enrolling(tmp_path: Path):
+    """RETIRING is operator intent and is not in TERMINAL_STATES, but a miner
+    must not be able to reverse it by re-enrolling at a new endpoint.
+
+    Uses the real `cathedral lifecycle retire` edge (store.retire_lifecycle
+    with removed=False), not a raw sqlite UPDATE, so the transition is the
+    one an operator actually performs.
+    """
+    app, store, _ = build_app(tmp_path)
+    assert call(app, v2_payload())[0] == 200
+
+    store.retire_lifecycle(HOTKEY, removed=False)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.RETIRING
+
+    status, body = call(
+        app, v2_payload(nonce="92" * 16, endpoint_url=ENDPOINT_TWO)
+    )
+    assert status == 403
+    assert body["error"] == "worker is retiring; re-enrollment is an operator action"
+
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.RETIRING
+    assert row(store, HOTKEY)["endpoint_url"] == ENDPOINT
+    assert store.due_refreshes(refresh_ahead_seconds=60) == ()
+
+
 # ---------------------------------------------------------------------------
 # 9. Reconcile is reachable under a policy
 # ---------------------------------------------------------------------------

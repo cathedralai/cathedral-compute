@@ -1423,6 +1423,10 @@ class RegistryStore:
         retire-without-firewall) and for an identity-conflict revoked claimant,
         which can re-queue itself and take a chip once the honest binding lapses
         -- the one-machine-one-UID sybil defence.
+
+        RETIRING is not in TERMINAL_STATES but must be refused the same way:
+        it is operator intent to stop the worker (docs/LIFECYCLE.md), and a
+        retirement the miner can lift by re-enrolling is not a retirement.
         """
         if reason not in {LifecycleReason.REENROLLED, LifecycleReason.ENDPOINT_CHANGED}:
             raise LifecycleError("reenrollment lifecycle reason is invalid")
@@ -1431,9 +1435,12 @@ class RegistryStore:
             current = self._lifecycle_snapshot_from_row(
                 self._lifecycle_row(conn, hotkey)
             )
-            if current.state in TERMINAL_STATES and not operator:
+            if (
+                current.state in TERMINAL_STATES
+                or current.state is WorkerLifecycleState.RETIRING
+            ) and not operator:
                 raise LifecycleError(
-                    f"worker {hotkey!r} is {current.state.value}; a terminal worker "
+                    f"worker {hotkey!r} is {current.state.value}; it "
                     "cannot re-enroll itself. Recovery is an operator action: "
                     "`cathedral lifecycle reenroll --hotkey <hotkey>`")
             generation = current.generation + 1
@@ -1717,6 +1724,16 @@ class RegistryStore:
                 raise EnrollmentRejected(
                     "worker is in a terminal lifecycle state",
                     reason=f"lifecycle_{row['state']}",
+                )
+            if row is not None and row["state"] == WorkerLifecycleState.RETIRING.value:
+                # RETIRING is operator intent, not a terminal state, but the
+                # same rehabilitation-by-re-enroll hole applies: refuse it
+                # here too so the policy path returns a structured 403
+                # instead of reenroll_lifecycle's LifecycleError escaping as
+                # an unhandled 500.
+                raise EnrollmentRejected(
+                    "worker is retiring; re-enrollment is an operator action",
+                    reason="lifecycle_retiring",
                 )
 
         canonical = canonical_endpoint_key(endpoint_url)
@@ -2446,8 +2463,9 @@ class RegistryApp:
         try:
             self.store.enroll(hotkey, endpoint_url, nonce=nonce)
         except LifecycleError as exc:
-            # A terminal worker (revoked / retired) may not re-enroll itself by
-            # changing its endpoint; recovery is an operator action (#85). 409:
+            # A terminal worker (revoked / retired / retiring) may not
+            # re-enroll itself by changing its endpoint; recovery is an
+            # operator action (#85). 409:
             # the request is well-formed and authenticated, it conflicts with
             # durable state.
             logger.info("enroll refused hotkey=%s reason=terminal_state", hotkey)

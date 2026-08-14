@@ -22,6 +22,12 @@ requires explicit reenrollment, which creates a new generation in `pending`;
 it never rewrites the old history. Identity conflicts remain terminal for the
 generation in which they were detected.
 
+`retiring` cannot be lifted by the worker either. It is not a terminal state,
+but it is operator intent to stop the worker: a re-enrollment request, even at
+a new endpoint, is refused. Returning a `retiring` worker to service is the
+operator's own action (`cathedral lifecycle reenroll`), not something the
+worker can trigger by changing its endpoint URL.
+
 ## Freshness and retries
 
 Freshness is calculated from the attestation verification time plus the
@@ -126,13 +132,15 @@ measurement and digest references, retry metadata, and bounded failure detail.
 Operator output should remain access-controlled and must not be copied into a
 public status response.
 
-Reenrollment is the explicit recovery mechanism after a terminal failure or
-revocation. It clears the current generation's evidence and retry fields and
-starts a new `pending` generation without modifying prior events. `retire`
-stops network refresh and score eligibility in `retiring`; add `--removed` once
-the worker has been removed to finish in `retired`. Runtime-driven retirement
-also cancels local in-flight work. A late result from another process loses the
-generation/revision comparison and cannot restore eligibility.
+Reenrollment is the explicit recovery mechanism after a terminal failure,
+revocation, or retirement. It clears the current generation's evidence and
+retry fields and starts a new `pending` generation without modifying prior
+events. `retire` stops network refresh and score eligibility in `retiring`;
+add `--removed` once the worker has been removed to finish in `retired`. A
+worker cannot reverse its own `retiring` by re-enrolling; only this operator
+command does. Runtime-driven retirement also cancels local in-flight work. A
+late result from another process loses the generation/revision comparison and
+cannot restore eligibility.
 
 ## Upgrade and rollback
 

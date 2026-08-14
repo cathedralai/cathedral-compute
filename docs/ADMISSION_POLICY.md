@@ -150,11 +150,12 @@ What consumes capacity is deliberate in both directions:
 | `RETIRED` | no | the operator's own act of freeing capacity |
 
 A worker in a terminal state (`REVOKED`, `RETIRED`) is refused if it tries to
-re-enroll. `reenroll_lifecycle` writes `PENDING` directly without consulting
-the transition table, so without that gate a revoked worker would rehabilitate
-itself by re-enrolling into its own row. It would not mint weight, because
-every attestation gate re-runs, but a revocation a miner can lift is not a
-revocation.
+re-enroll, and so is a worker in `RETIRING` even though `RETIRING` is not
+terminal. `reenroll_lifecycle` writes `PENDING` directly without consulting
+the transition table, so without that gate a revoked or retiring worker would
+rehabilitate itself by re-enrolling into its own row. It would not mint
+weight, because every attestation gate re-runs, but a revocation, or a
+retirement, that a miner can lift is not a revocation or a retirement.
 
 One further rule applies only under a policy: an endpoint already enrolled by
 a different live worker is refused (`endpoint_claimed`). This is the
