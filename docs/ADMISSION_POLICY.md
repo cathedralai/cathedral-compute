@@ -176,6 +176,17 @@ remains the chip-id gate at admission.
 > and chip-to-hotkey rotation binding. What is missing is only the
 > admitted-count cap, not the gate.
 >
+> Both chip rules **refuse for the epoch rather than revoke** (#138). A
+> `chip_id` is a domain-separated hash of the PCK PPID, which names a physical
+> platform and not a guest, so two miners whose confidential VMs land on one
+> cloud host collide without either of them misbehaving. The uniqueness
+> property is unchanged -- at most one hotkey holds a live binding to a chip,
+> and no duplicate claimant is admitted or scored -- but the penalty is now a
+> lost epoch instead of a terminal state that only an operator can lift.
+> Recovery is automatic: the gates re-run next epoch. GPU identity conflicts
+> stay terminal, because an exclusively passed-through GPU cannot be claimed by
+> two workers innocently.
+>
 > Two related limits worth knowing before enabling open mode. The per-pass
 > probe budget bounds the standalone prober; the validator's own epoch
 > attestation loop is **not** bounded by it, and that is the loop whose

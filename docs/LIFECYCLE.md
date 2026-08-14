@@ -88,9 +88,14 @@ eligible for re-attestation in the next cycle.
 ## Policy and concurrency safety
 
 A measurement removed from the active policy moves directly to `revoked`
-without contacting the worker. Identity conflicts do the same. Terminal
-transitions cancel local refresh work; generation and revision checks discard
-late results from another thread or process before they can restore eligibility.
+without contacting the worker. A GPU identity conflict does the same, because a
+passed-through GPU identity claimed by two workers has no innocent reading.
+Chip contention does not: a duplicate or already-bound `chip_id` is refused for
+the epoch and the worker stays eligible, since `chip_id` derives from a
+per-host PPID that co-resident cloud guests share through no fault of their own.
+Terminal transitions cancel local refresh work; generation and revision checks
+discard late results from another thread or process before they can restore
+eligibility.
 
 Each state change appends an event and updates the current projection in one
 database transaction. Clock rollback, an illegal transition, or a stale
@@ -100,6 +105,16 @@ Every completed epoch includes the state, reason, generation, revision, event
 ID, evidence-expiry time, and snapshot time used for score gating. Receipt v2
 signs the same lifecycle identifiers and expiry. When a receipt exists, the
 ledger rejects an epoch snapshot that does not match those signed fields.
+
+For a worker that holds a receipt, the runtime records the exact lifecycle
+snapshot the receipt signed, captured once at receipt issuance, rather than
+re-reading the registry after the epoch's work is resolved. A registry
+lifecycle change that lands after that worker's own receipt was issued
+(self-service re-enrollment, a prober verdict, an operator retire) therefore
+takes effect at the next epoch instead of aborting the running one. A change
+that lands earlier in the epoch, before that worker's receipt is issued,
+still fails the whole epoch: the ledger rejects the mismatched snapshot and
+the epoch aborts.
 
 ## Public and operator views
 

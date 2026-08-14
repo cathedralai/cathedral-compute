@@ -1420,13 +1420,18 @@ class RegistryStore:
 
         That matters most for an operator-retired worker that is still
         hardware-valid (it re-attests and is fully back, defeating
-        retire-without-firewall) and for an identity-conflict revoked claimant,
-        which can re-queue itself and take a chip once the honest binding lapses
-        -- the one-machine-one-UID sybil defence.
+        retire-without-firewall) and for a GPU identity-conflict revoked
+        claimant, which could otherwise re-queue itself against an identity
+        another worker already holds.
 
         RETIRING is not in TERMINAL_STATES but must be refused the same way:
         it is operator intent to stop the worker (docs/LIFECYCLE.md), and a
         retirement the miner can lift by re-enrolling is not a retirement.
+
+        Chip contention is deliberately not in that set. A duplicate or
+        already-bound chip_id is refused rather than revoked (#138), so those
+        claimants stay non-terminal and re-queue on their own -- the chip gates
+        run again every epoch and still admit only one hotkey per chip.
         """
         if reason not in {LifecycleReason.REENROLLED, LifecycleReason.ENDPOINT_CHANGED}:
             raise LifecycleError("reenrollment lifecycle reason is invalid")
@@ -1979,15 +1984,18 @@ class RegistryStore:
                 raise LifecycleError(
                     "GPU profile is not active at lifecycle commit time"
                 )
-            identity_conflict = False
             if status == "VERIFIED" and chip_id is not None:
                 conflict = self._chip_rotation_owner(conn, chip_id, hotkey)
                 if conflict is not None:
+                    # Refuse the verdict so a live chip binding stays with one
+                    # hotkey, but treat it as an ordinary verification failure
+                    # rather than an identity conflict. Contention for a chip_id
+                    # is not proof of misuse: the PPID it derives from names a
+                    # physical host shared by co-resident cloud guests (#138).
                     status = "FAILED"
                     chip_id = None
                     tier = None
                     error = f"chip_id already bound to hotkey {conflict}"
-                    identity_conflict = True
             conn.execute(
                 """
                 INSERT INTO attestations(
@@ -2031,16 +2039,8 @@ class RegistryStore:
                 self._transition_lifecycle_in_connection(
                     conn,
                     hotkey,
-                    (
-                        WorkerLifecycleState.REVOKED
-                        if identity_conflict
-                        else WorkerLifecycleState.FAILED
-                    ),
-                    (
-                        LifecycleReason.IDENTITY_CONFLICT
-                        if identity_conflict
-                        else LifecycleReason.VERIFICATION_FAILED
-                    ),
+                    WorkerLifecycleState.FAILED,
+                    LifecycleReason.VERIFICATION_FAILED,
                     lifecycle_when,
                     operator_detail=error,
                     expected_generation=(
