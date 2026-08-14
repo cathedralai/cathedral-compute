@@ -703,6 +703,76 @@ def test_initialize_gpu_identities_cli_is_explicit_and_one_time(tmp_path: Path, 
     }
 
 
+def test_release_gpu_identities_cli_frees_a_rotated_worker(tmp_path: Path, capsys):
+    database_parent = tmp_path / "database"
+    anchor_parent = tmp_path / "anchor"
+    database_parent.mkdir(mode=0o700)
+    anchor_parent.mkdir(mode=0o700)
+    database = database_parent / "gpu-identities.sqlite"
+    anchor = anchor_parent / "generation.anchor"
+    key_path = tmp_path / "gpu-identity.key"
+    key_path.write_bytes(base64.b64encode(b"i" * 32) + b"\n")
+    key_path.chmod(0o600)
+    tmp_path.chmod(0o700)
+    verdict = GpuComponentVerdict(
+        devices=(
+            GpuDeviceClaim(
+                "GPU-11111111-1111-4111-8111-111111111111",
+                "NVIDIA-H100-80GB-HBM3",
+                "CC-On",
+                "550.90.07",
+                "96.00.5E.00.01",
+                "Secure",
+                True,
+            ),
+        ),
+        evidence_digest="sha256:" + "1" * 64,
+        challenge_digest="sha256:" + "2" * 64,
+        host_session_digest="sha256:" + "3" * 64,
+        profile_digest="sha256:" + "4" * 64,
+        tdx_component_digest="sha256:" + "5" * 64,
+        topology_digest=None,
+    )
+    identity_registry = GpuIdentityRegistry(
+        database,
+        identity_digest_key=b"i" * 32,
+        production_mode=True,
+        generation_anchor_path=anchor,
+        initialize=True,
+    )
+    identity_registry.claim("worker-old", verdict)
+
+    assert main(
+        [
+            "runtime",
+            "release-gpu-identities",
+            "--gpu-identity-db",
+            str(database),
+            "--gpu-identity-key-file",
+            str(key_path),
+            "--gpu-identity-anchor-file",
+            str(anchor),
+            "--hotkey",
+            "worker-old",
+            "--reason",
+            "hotkey rotation",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "event_id" in payload
+    assert payload["released_identities"] == 1
+    assert payload["hotkey"] == "worker-old"
+
+    reopened = GpuIdentityRegistry(
+        database,
+        identity_digest_key=b"i" * 32,
+        production_mode=True,
+        generation_anchor_path=anchor,
+    )
+    reopened.claim("worker-new", verdict)
+
+
 # ---------------------------------------------------------------------------
 # runtime abandon-complete: audited recovery for a stuck 'complete' epoch
 # ---------------------------------------------------------------------------
