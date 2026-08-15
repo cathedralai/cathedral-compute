@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import ssl
@@ -822,6 +823,62 @@ def _load_production_tokens(path: str) -> object:
             os.close(descriptor)
 
 
+_LOGGER = logging.getLogger("cathedral.cli")
+
+# hotkey -> {(file digest, minted digest)} already reported.
+_WARNED_TOKEN_CONFLICTS: dict[str, set[tuple[str, str]]] = {}
+
+
+def resolve_worker_token(
+    tokens: Mapping[str, str], registry: RegistryStore, hotkey: str
+) -> str | None:
+    """The bearer token the validator should present to *hotkey*.
+
+    The operator's token file first, then the token minted at enrollment.
+    File first is the safe direction during migration, and the reasoning
+    matters because the obvious alternative breaks a running miner.
+
+    A worker enrolled before tokens were minted is configured with the value in
+    the operator's file. Enrollment is re-run on an endpoint change, which
+    happens without human involvement when a worker restarts onto a new address
+    (#61). If the registry won, that automatic re-enrollment would mint a
+    token, the validator would immediately start sending it, and the worker,
+    still running its original credential, would 401 on every request. Nobody
+    would have touched anything.
+
+    File first inverts that: the legacy worker keeps working, and a miner that
+    enrols fresh has no file entry so its minted token is used. The remaining
+    hazard is a stale file entry for a worker that HAS adopted its minted
+    token, which needs an operator to half-finish a migration. That case cannot
+    be resolved automatically, because both values are credible, so it is
+    reported rather than guessed at.
+    """
+    from_file = tokens.get(hotkey)
+    minted = registry.worker_token(hotkey)
+    if from_file is not None and minted is not None and from_file != minted:
+        # Warn once per distinct conflict. A legacy worker's first
+        # re-enrollment creates a mismatch that persists until an operator
+        # resolves it, and repeating the same line every epoch buries the
+        # alerts that still need reading. Keyed on the pair so a changed value
+        # on either side is reported again.
+        seen = _WARNED_TOKEN_CONFLICTS.setdefault(hotkey, set())
+        fingerprint = (
+            hashlib.sha256(from_file.encode()).hexdigest()[:16],
+            hashlib.sha256(minted.encode()).hexdigest()[:16],
+        )
+        if fingerprint in seen:
+            return from_file
+        seen.add(fingerprint)
+        _LOGGER.warning(
+            "worker %s has a token file entry that differs from the token minted "
+            "at enrollment; sending the file value. If this worker was "
+            "reconfigured with the minted token, remove its entry from the "
+            "token file.",
+            hotkey,
+        )
+    return from_file or minted
+
+
 def _valid_bearer_token(token: object) -> bool:
     return (
         isinstance(token, str)
@@ -1034,12 +1091,20 @@ def _build_runtime(
             Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
         )
     ledger = Ledger(args.ledger_db)
+    registry = RegistryStore(
+        getattr(args, "registry_db", ":memory:"),
+        production_mode=config.production_mode,
+    )
+
+    def token_provider(hotkey: str) -> str | None:
+        return resolve_worker_token(tokens, registry, hotkey)
+
     runtime = ConfidentialRuntime(
-        RegistryStore(getattr(args, "registry_db", ":memory:")),
+        registry,
         ledger,
         policy,
         _publisher_from_args(args),
-        token_provider=tokens.get,
+        token_provider=token_provider,
         policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,

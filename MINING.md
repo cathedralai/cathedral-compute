@@ -216,19 +216,63 @@ export HOTKEY_ADDRESS='<ss58-hotkey-address>'
 Registration does not prove reachability, admission, verified work, positive
 weight, or earnings.
 
-## 4. Create worker credentials
+## 4. Where the worker credential comes from
 
-Use a unique random credential for each worker. Store it with mode `0600`:
+**Enrollment mints it. You do not create one.** A successful `POST /v1/enroll`
+returns `worker_token` in its response body, and the validator already holds
+the same value, so nothing is exchanged out of band and no operator transcribes
+a secret.
+
+That changes the order of the remaining steps. Enrollment is step 7 and the
+protected worker in step 6 refuses to start without the credential, so on a
+minted deployment **do step 7 before step 6**. The steps below are numbered in
+the order they were written, not the order you run them:
+
+```
+2 check the machine -> 3 register -> 5 prove evidence locally
+  -> 7 enrol, save the returned worker_token -> 6 start the protected worker
+```
+
+Store what enrollment returned with mode `0600`:
+
+```bash
+install -d -m 700 "$HOME/.config/cathedral"
+umask 077
+# paste the worker_token value from the enrollment response
+cat > "$HOME/.config/cathedral/worker-token"
+chmod 600 "$HOME/.config/cathedral/worker-token"
+export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
+```
+
+The token is minted once and is preserved across re-enrollment, deliberately:
+the validator is already holding it, and minting a new one on every endpoint
+change would break a running worker that has not been reconfigured. If you lose
+the value, enrol again at the same endpoint and the response returns the same
+one.
+
+**There is no self-service rotation.** If the token is exposed, you cannot
+replace it by re-enrolling, because re-enrollment returns the same value. Ask
+the operator: they can override or revoke a single worker through the
+validator's own token file, which takes precedence over the minted value. A
+signed rotation protocol is tracked separately.
+
+### If your deployment predates minted tokens
+
+Some deployments still expect the miner to generate the credential and send it
+to the operator out of band. That path is self-contained, and the directory and
+mode steps matter as much as the random value:
 
 ```bash
 install -d -m 700 "$HOME/.config/cathedral"
 umask 077
 openssl rand -hex 32 > "$HOME/.config/cathedral/worker-token"
+chmod 600 "$HOME/.config/cathedral/worker-token"
 export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 ```
 
-Keep the value out of command arguments, shell history, screenshots, public
-issues, and ordinary logs. A validator does not need any wallet private key.
+Either way, keep the value out of command arguments, shell history,
+screenshots, public issues, and ordinary logs. A validator does not need any
+wallet private key.
 
 ## 5. Prove local TDX evidence first
 
@@ -345,8 +389,11 @@ endpoint: https://<accepted worker endpoint>
 token:    <unique worker bearer token>
 ```
 
-Rotate the token immediately if it appears in a screenshot, shared shell
-history, public message, or unprotected log.
+If the token appears in a screenshot, shared shell history, public message or
+unprotected log, tell the operator. On a minted deployment you cannot rotate it
+yourself: re-enrolling returns the same value, and only the operator can
+override or revoke it from the validator side. Treat that as an incident to
+report, not a step you can perform.
 
 The validator operator then checks:
 

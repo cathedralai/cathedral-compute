@@ -413,7 +413,9 @@ def test_registration_gate(tmp_path: Path) -> None:
     )
     status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="44" * 16))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled"
+    # The token is minted at enrollment and handed back here (#60 interim).
+    assert body["worker_token"]
 
     # production_mode=False (default) with no provider -> allow (backward compat)
     app = RegistryApp(RegistryStore(f"{base}/r6.sqlite"))
@@ -775,7 +777,9 @@ def test_production_mode_file_provider_allows_registered(tmp_path: Path) -> None
     )
     status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="e0" * 16, endpoint_url="https://8.8.8.8:8090"))
     assert status == 200
-    assert body == {"status": "enrolled"}
+    assert body["status"] == "enrolled"
+    # The token is minted at enrollment and handed back here (#60 interim).
+    assert body["worker_token"]
 
 
 def test_production_mode_file_provider_rejects_unregistered(tmp_path: Path) -> None:

@@ -13,12 +13,15 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections import defaultdict, deque
@@ -84,6 +87,49 @@ REJECTED_HOSTS = {"localhost", "metadata.google.internal"}
 DEFAULT_HOTKEY_ENROLL_LIMIT = 20
 DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS = 3600
 _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
+
+# The bearer token the validator presents to a worker. Kept well inside
+# runtime.MAX_BEARER_TOKEN_LENGTH (4096) and restricted to the printable
+# ASCII the runtime's own validator accepts, so a minted token can never be
+# the thing that makes a miner unreachable.
+WORKER_TOKEN_BYTES = 32
+
+
+def generate_worker_token() -> str:
+    """Mint one bearer token for a worker.
+
+    ``secrets.token_urlsafe`` yields url-safe base64, which is a strict subset
+    of the printable-ASCII range ``_validate_bearer_token`` requires.
+    """
+    return secrets.token_urlsafe(WORKER_TOKEN_BYTES)
+
+
+def _is_loopback_host(host: object) -> bool:
+    """True only for an address that cannot receive traffic off the machine.
+
+    An empty host and ``0.0.0.0`` / ``::`` are wildcards, not loopback, and a
+    hostname is refused rather than resolved: resolution is not stable and a
+    name that resolves to loopback today is not a guarantee.
+    """
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # IPv6 loopback is refused rather than accepted: the WSGI server used below
+    # is AF_INET only, so accepting ::1 would pass validation and then die at
+    # bind time with an address-family error, taking enrollment offline for a
+    # reason the operator was told nothing about.
+    return address.is_loopback and address.version == 4
+
+
+def _valid_worker_token(token: object) -> bool:
+    return (
+        isinstance(token, str)
+        and 0 < len(token) <= 4096
+        and all(0x21 <= ord(character) <= 0x7E for character in token)
+    )
 
 
 class RegistrationProvider(Protocol):
@@ -526,8 +572,17 @@ class RegistryStore:
         *,
         verification_ttl_seconds: int | None = None,
         clock: Callable[[], datetime] | None = None,
+        production_mode: bool = False,
     ) -> None:
         self.path = path
+        # Deployment policy, not a library invariant. The ancestor-chain trust
+        # check below applies only in production, the same way the operator
+        # token file is only fstat-and-mode checked in production
+        # (cli.py::_load_tokens). Enforcing it unconditionally puts a
+        # machine-wide filesystem policy inside a constructor that tests, five
+        # operator CLIs and the prober all call, and it rejects any database
+        # under a world-writable temp directory.
+        self.production_mode = bool(production_mode)
         if verification_ttl_seconds is None:
             verification_ttl_seconds = _positive_int_from_env(
                 VERIFICATION_TTL_ENV,
@@ -544,7 +599,9 @@ class RegistryStore:
             raise ValueError("clock must be callable")
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lifecycle_lock = threading.RLock()
+        self._precreate_database()
         self._init()
+        self._restrict_database_mode()
 
     def _lifecycle_now(self) -> datetime:
         when = self._clock()
@@ -561,6 +618,148 @@ class RegistryStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def _precreate_database(self) -> None:
+        """Create the database file owner-only before SQLite opens it.
+
+        SQLite creates a new database 0644 regardless of umask, so narrowing it
+        afterwards leaves a window on a fresh install where a local account can
+        open a handle that keeps reading every token written later. Creating it
+        ourselves first closes that window; on an existing database this is a
+        no-op.
+        """
+        if self.path == ":memory:" or self.path.startswith("file::memory:"):
+            return
+
+        # Refuse a path that is not a plain file we own, BEFORE SQLite opens it.
+        # SQLite follows a symlink, so a link here silently redirects worker
+        # bearer tokens to its target and the chmod below lands on the target
+        # too. The path is operator configuration rather than miner input, so
+        # this is not a miner-reachable attack; it is refused because a link or
+        # a foreign-owned file at this path is never intentional and the file
+        # now holds credentials.
+        # SQLite opens by path, so a check that is not bound to the file it
+        # actually opens is advisory. What makes it real is the whole ancestor
+        # chain being untamperable, which this repo already has a policy for:
+        # ownership, mode, ACLs and symlink components, every component, not
+        # just the immediate parent. Hand-rolling a subset of that got the
+        # sticky-bit case wrong (see below) and ignored parent ownership
+        # entirely, so an attacker-owned 0700 directory passed.
+        # Root and the running user are the only uids that may own the database
+        # or anything above it. There is deliberately no sticky-bit exemption:
+        # in a 01777 directory an untrusted account can PRE-CREATE
+        # registry.sqlite-journal and keep the descriptor, and SQLite reuses
+        # that inode, so a sidecar leaks minted tokens even though sticky stops
+        # the attacker deleting a file they do not own.
+        if self.production_mode:
+            from cathedral.privileged_paths import inspect_creatable_file
+
+            verdict = inspect_creatable_file(
+                self.path, trusted_uids=frozenset({0, os.getuid()})
+            )
+            if not verdict.trusted:
+                raise PermissionError(
+                    f"registry database path {self.path!r} is not trustworthy: "
+                    + "; ".join(verdict.violations)
+                    + ". It holds worker bearer tokens, so it and every directory "
+                    "above it must be owned by root or this service and writable "
+                    "by no one else."
+                )
+
+        try:
+            existing = os.lstat(self.path)
+        except FileNotFoundError:
+            existing = None
+        except OSError as exc:
+            raise ValueError(
+                f"registry database path {self.path!r} cannot be inspected"
+            ) from exc
+
+        if existing is not None:
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(
+                    f"registry database path {self.path!r} is not a regular file"
+                )
+            # Stricter than the chain policy on purpose. That policy trusts root
+            # and this user; here the file must be OURS. A root service that
+            # initialises a database an untrusted user pre-created leaves that
+            # user as the owner, and chmod 0600 then locks read and write to
+            # them rather than to root.
+            if existing.st_uid != os.getuid():
+                raise PermissionError(
+                    f"registry database {self.path!r} is owned by uid "
+                    f"{existing.st_uid} but this process runs as uid "
+                    f"{os.getuid()}. It holds worker bearer tokens, so every "
+                    "process that opens it must run as its owner."
+                )
+            return
+
+        # Create it ourselves, exclusively, so the inode is known to be ours.
+        # Bounded: an attacker who can win this race repeatedly must already
+        # have write access to a directory the chain check just refused, but a
+        # recursive retry would turn that into a RecursionError at startup
+        # rather than a clean refusal.
+        for _ in range(8):
+            try:
+                descriptor = os.open(
+                    self.path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    landed = os.lstat(self.path)
+                except FileNotFoundError:
+                    continue  # gone again; try to create it once more
+                if stat.S_ISREG(landed.st_mode) and landed.st_uid == os.getuid():
+                    return  # someone equivalent won the race; validated above
+                raise PermissionError(
+                    f"registry database {self.path!r} appeared during creation "
+                    "and is not a regular file owned by this process"
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"registry database {self.path!r} could not be created securely"
+                ) from exc
+            else:
+                os.close(descriptor)
+                return
+        raise PermissionError(
+            f"registry database {self.path!r} could not be created after "
+            "repeated races; refusing rather than retrying forever"
+        )
+
+    def _restrict_database_mode(self) -> None:
+        """Make the database owner-only.
+
+        This file now holds worker bearer tokens. The operator's token file
+        carries the same credential class and is refused unless it is
+        owner-only (``cli.py::_load_production_tokens``), so leaving this one
+        at whatever the process umask produced would be an asymmetry with a
+        real consequence: any local account that can read the file reads every
+        worker's token and can impersonate the validator to those workers.
+
+        The journal, WAL and shared-memory siblings hold the same rows and are
+        created by SQLite rather than by us, so they are narrowed too. A
+        sibling that does not exist is not an error.
+        """
+        if self.path == ":memory:" or self.path.startswith("file::memory:"):
+            return
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.chmod(self.path + suffix, 0o600)
+            except FileNotFoundError:
+                continue
+            except PermissionError as exc:
+                # Refusing is deliberate. The alternative is running with worker
+                # bearer tokens in a file this process cannot secure, and no
+                # signal that anything is wrong.
+                raise PermissionError(
+                    f"cannot restrict {self.path + suffix} to owner-only: it is "
+                    "owned by another user. The registry holds worker bearer "
+                    "tokens, so every process that opens it must run as that "
+                    "owner."
+                ) from exc
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -597,6 +796,13 @@ class RegistryStore:
                     "UPDATE enrollments SET endpoint_canonical = endpoint_url"
                     " WHERE endpoint_canonical IS NULL"
                 )
+            # The bearer token the validator presents to this worker. Minted
+            # once at enrollment and returned to the miner in that response,
+            # so no operator has to transcribe a secret by hand. NULL for rows
+            # written before this existed; those keep working from the
+            # operator's token file, which still wins on lookup.
+            if "worker_token" not in enrollment_columns:
+                conn.execute("ALTER TABLE enrollments ADD COLUMN worker_token TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS enrollments_endpoint_canonical_idx
@@ -644,6 +850,18 @@ class RegistryStore:
                 )
                 """
             )
+            nonce_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(enroll_nonces)")
+            }
+            # A digest of the exact signed bytes this nonce was spent on. A
+            # retransmission is a retransmission of ONE request, so the match
+            # has to cover every signed field. Comparing the endpoint alone let
+            # a miner re-sign the same nonce and endpoint with a fresh
+            # timestamp and take an uncharged trip through every gate. NULL on
+            # rows written before this column, which are therefore never
+            # treated as retransmissions.
+            if "request_digest" not in nonce_columns:
+                conn.execute("ALTER TABLE enroll_nonces ADD COLUMN request_digest TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hotkey_enroll_attempts (
@@ -1584,6 +1802,7 @@ class RegistryStore:
         endpoint_url: str,
         *,
         nonce: str | None = None,
+        request_digest: str | None = None,
         coldkey: str | None = None,
         requested_profile_id: str | None = None,
         max_endpoints_per_coldkey: int | None = None,
@@ -1619,10 +1838,10 @@ class RegistryStore:
                 try:
                     conn.execute(
                         """
-                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso)
-                        VALUES (?, ?, ?)
+                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso, request_digest)
+                        VALUES (?, ?, ?, ?)
                         """,
-                        (hotkey, nonce, ts),
+                        (hotkey, nonce, ts, request_digest),
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ValueError("enroll nonce already used") from exc
@@ -1638,9 +1857,9 @@ class RegistryStore:
                 """
                 INSERT INTO enrollments(
                     hotkey, endpoint_url, enrolled_at_iso, updated_at_iso,
-                    coldkey, requested_profile_id, endpoint_canonical
+                    coldkey, requested_profile_id, endpoint_canonical, worker_token
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hotkey) DO UPDATE SET
                     endpoint_url=excluded.endpoint_url,
                     updated_at_iso=excluded.updated_at_iso,
@@ -1648,7 +1867,8 @@ class RegistryStore:
                     requested_profile_id=COALESCE(
                         excluded.requested_profile_id, enrollments.requested_profile_id
                     ),
-                    endpoint_canonical=excluded.endpoint_canonical
+                    endpoint_canonical=excluded.endpoint_canonical,
+                    worker_token=COALESCE(enrollments.worker_token, excluded.worker_token)
                 """,
                 (
                     hotkey,
@@ -1658,6 +1878,7 @@ class RegistryStore:
                     coldkey,
                     requested_profile_id,
                     canonical_endpoint_key(endpoint_url),
+                    generate_worker_token(),
                 ),
             )
 
@@ -1827,6 +2048,44 @@ class RegistryStore:
                 "SELECT hotkey, endpoint_url FROM enrollments ORDER BY updated_at_iso, hotkey"
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
+
+    def is_completed_enrollment(self, hotkey: str, nonce: str, request_digest: str) -> bool:
+        """True when this exact signed request has already been completed.
+
+        A retransmission is a signed request whose ``(hotkey, nonce)`` pair is
+        already recorded AND whose endpoint still matches what is enrolled. The
+        caller uses this to avoid charging the durable per-hotkey limiter for a
+        request the miner already paid for; the replay itself is still refused.
+
+        The endpoint match is what keeps this narrow. A miner that signs a
+        *different* endpoint under an already-used nonce is not retransmitting,
+        and is charged and refused exactly as before.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT request_digest FROM enroll_nonces
+                WHERE hotkey = ? AND nonce = ?
+                """,
+                (hotkey, nonce),
+            ).fetchone()
+        return row is not None and row["request_digest"] == request_digest
+
+    def worker_token(self, hotkey: str) -> str | None:
+        """Return the bearer token minted for *hotkey* at enrollment.
+
+        None for a hotkey that is not enrolled, and for rows written before
+        the column existed. Both cases fall back to the operator's token file,
+        so an existing deployment keeps working untouched.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT worker_token FROM enrollments WHERE hotkey = ?", (hotkey,)
+            ).fetchone()
+        if row is None:
+            return None
+        token = row["worker_token"]
+        return token if _valid_worker_token(token) else None
 
     def remove_enrollment(self, hotkey: str) -> None:
         """Retire *hotkey* and clear its published attestation verdict.
@@ -2292,8 +2551,24 @@ class RegistryApp:
         # binding, profiles, and caps. It is loaded before anything is parsed
         # so an unavailable policy rejects uniformly rather than leaking which
         # request shapes the service would otherwise have accepted.
+        # Load order, and the tradeoff behind it, stated once so it is not
+        # re-litigated. Two costs pull in opposite directions:
+        #
+        #   - an exact replay should not pay for reading and verifying the
+        #     signed policy artifact, and
+        #   - a policy OUTAGE should not pay for sr25519 verification on every
+        #     request before it is refused.
+        #
+        # Satisfying both needs a negative cache with bounded revalidation.
+        # This orders the load first instead, which matches the pre-existing
+        # behaviour exactly for an outage and is strictly cheaper than it for a
+        # replay, because the replay is still answered before the registration
+        # and allowlist gates below. No case here is more expensive than it was
+        # before this change, which is the bar that matters; the cache is a
+        # separate piece of work, not a prerequisite.
         policy = None
-        if self.admission_policy is not None:
+        policy_configured = self.admission_policy is not None
+        if policy_configured:
             policy = self.admission_policy.load()
             if policy is None:
                 return self._reject(
@@ -2319,11 +2594,12 @@ class RegistryApp:
 
         claimed_coldkey: str | None = None
         requested_profile_id: str | None = None
-        if policy is None:
+        if not policy_configured:
+            signed_bytes = canonical_enroll_payload(
+                hotkey, endpoint_url, nonce, timestamp
+            )
             verify_enroll_signature(
-                hotkey,
-                canonical_enroll_payload(hotkey, endpoint_url, nonce, timestamp),
-                payload.get("signature_b64"),
+                hotkey, signed_bytes, payload.get("signature_b64")
             )
         else:
             # v2 request. Every field the registry acts on is inside the
@@ -2339,32 +2615,20 @@ class RegistryApp:
                 timestamp,
                 max_ttl_seconds=self.enroll_signature_ttl_seconds,
             )
-            verify_enroll_signature(
-                hotkey,
-                canonical_enroll_payload_v2(
-                    hotkey=hotkey,
-                    coldkey=claimed_coldkey,
-                    network=network,
-                    netuid=netuid,
-                    endpoint_url=endpoint_url,
-                    requested_profile_id=requested_profile_id,
-                    nonce=nonce,
-                    timestamp=timestamp,
-                    expires_at=expires_at,
-                ),
-                payload.get("signature_b64"),
+            signed_bytes = canonical_enroll_payload_v2(
+                hotkey=hotkey,
+                coldkey=claimed_coldkey,
+                network=network,
+                netuid=netuid,
+                endpoint_url=endpoint_url,
+                requested_profile_id=requested_profile_id,
+                nonce=nonce,
+                timestamp=timestamp,
+                expires_at=expires_at,
             )
-            # The signature proves the miner meant *this* subnet. The policy
-            # verifier has already proven the artifact means this subnet. A
-            # mismatch here is a request aimed somewhere else.
-            if network != policy.network or netuid != policy.netuid:
-                return self._reject(
-                    start_response,
-                    403,
-                    "request is bound to a different network or netuid",
-                    hotkey=hotkey,
-                    reason="network_mismatch",
-                )
+            verify_enroll_signature(
+                hotkey, signed_bytes, payload.get("signature_b64")
+            )
 
         # Per-hotkey durable enrollment rate limit. Backed by SQLite so the
         # bound survives restarts and is consistent across app instances that
@@ -2377,6 +2641,44 @@ class RegistryApp:
         # allowlist), so a rejected request is not free. The in-memory IP
         # limiter is per-process and per-address and cannot bound a distributed
         # caller on its own; only this durable per-hotkey record can.
+        # A retransmission of a request that already succeeded is still refused
+        # for reusing its nonce, but it is not CHARGED to the durable per-hotkey
+        # limiter. That is the whole fix: previously about twenty retries of a
+        # request whose 200 was lost in flight consumed the hotkey's entire
+        # enrollment budget, so the fresh request that would have recovered the
+        # token was itself rate limited for the rest of the window.
+        #
+        # Deliberately not answered with the token. Replaying a captured signed
+        # request would then disclose a bearer credential to whoever captured
+        # it, inside the request's own expiry window. Refusing the replay and
+        # sparing the budget lets the miner recover with a new nonce, which
+        # costs one round trip and discloses nothing.
+        request_digest = hashlib.sha256(signed_bytes).hexdigest()
+        if self.store.is_completed_enrollment(hotkey, nonce, request_digest):
+            # Answer here, before the registration and allowlist gates. Those
+            # gates each read and verify an operator-controlled artifact, and
+            # letting an exact replay reach them uncharged hands a miner free
+            # work from as many addresses as it likes for the whole signature
+            # validity window. The outcome is the same 400 the nonce insert
+            # would have produced; only the cost changes.
+            logger.info("enroll retransmission hotkey=%s", hotkey)
+            return self._json(
+                start_response, 400, {"error": "enroll nonce already used"}
+            )
+
+        if policy_configured:
+            # The signature proves the miner meant *this* subnet. The policy
+            # verifier has already proven the artifact means this subnet. A
+            # mismatch here is a request aimed somewhere else.
+            if network != policy.network or netuid != policy.netuid:
+                return self._reject(
+                    start_response,
+                    403,
+                    "request is bound to a different network or netuid",
+                    hotkey=hotkey,
+                    reason="network_mismatch",
+                )
+
         if not self.store.check_and_record_hotkey_attempt(
             hotkey,
             limit=self.hotkey_enroll_limit,
@@ -2423,6 +2725,7 @@ class RegistryApp:
                 endpoint_url=endpoint_url,
                 requested_profile_id=requested_profile_id,
                 nonce=nonce,
+                request_digest=request_digest,
             )
 
         # Approved-coldkey gate: active whenever an allowlist is configured,
@@ -2470,7 +2773,9 @@ class RegistryApp:
                 )
 
         try:
-            self.store.enroll(hotkey, endpoint_url, nonce=nonce)
+            self.store.enroll(
+                hotkey, endpoint_url, nonce=nonce, request_digest=request_digest
+            )
         except LifecycleError as exc:
             # A terminal worker (revoked / retired / retiring) may not
             # re-enroll itself by changing its endpoint; recovery is an
@@ -2483,7 +2788,11 @@ class RegistryApp:
                 hotkey=hotkey, reason="terminal_state",
             )
         logger.info("enroll accepted hotkey=%s", hotkey)
-        return self._json(start_response, 200, {"status": "enrolled"})
+        return self._json(
+            start_response,
+            200,
+            self._with_worker_token({"status": "enrolled"}, hotkey),
+        )
 
     def _enroll_under_policy(
         self,
@@ -2495,6 +2804,7 @@ class RegistryApp:
         endpoint_url: str,
         requested_profile_id: str | None,
         nonce: str,
+        request_digest: str,
     ) -> list[bytes]:
         """Apply the admission policy and write the pending record.
 
@@ -2552,6 +2862,7 @@ class RegistryApp:
                 hotkey,
                 endpoint_url,
                 nonce=nonce,
+                request_digest=request_digest,
                 coldkey=coldkey,
                 requested_profile_id=requested_profile_id,
                 max_endpoints_per_coldkey=policy.max_enrolled_endpoints_per_coldkey,
@@ -2582,12 +2893,30 @@ class RegistryApp:
         return self._json(
             start_response,
             200,
-            {
-                "status": "pending",
-                "lifecycle_state": WorkerLifecycleState.PENDING.value,
-                "admission_config_version": policy.config_version,
-            },
+            self._with_worker_token(
+                {
+                    "status": "pending",
+                    "lifecycle_state": WorkerLifecycleState.PENDING.value,
+                    "admission_config_version": policy.config_version,
+                },
+                hotkey,
+            ),
         )
+
+    def _with_worker_token(self, body: dict[str, Any], hotkey: str) -> dict[str, Any]:
+        """Attach the worker's bearer token to a successful enrollment response.
+
+        The request that produced this response was signed by the hotkey, so
+        only its owner can reach here. Returning the token on every successful
+        enrollment (not just the first) is deliberate: a miner that lost it
+        re-enrols to recover it rather than asking an operator, and the token
+        itself does not change, so the validator's stored copy stays valid.
+        """
+        token = self.store.worker_token(hotkey)
+        if token is not None:
+            body = dict(body)
+            body["worker_token"] = token
+        return body
 
     def _resolve_coldkey(self, hotkey: str) -> str | None:
         """Resolve the coldkey owning *hotkey* via the registration provider.
@@ -2818,6 +3147,17 @@ def main() -> None:
         parser.error("--admission-policy requires --admission-policy-keys")
     if args.production_mode and not (args.admission_policy or args.enroll_allowlist):
         parser.error("--production-mode requires --admission-policy or --enroll-allowlist")
+    # This listener speaks plaintext HTTP and its success response now carries
+    # the worker's bearer token. Binding it anywhere but loopback in production
+    # puts a credential on the wire in cleartext, where the hotkey signature on
+    # the request protects nothing: it authenticates the sender, not the
+    # response bytes. Terminate TLS in front and proxy to loopback.
+    if args.production_mode and not _is_loopback_host(args.host):
+        parser.error(
+            f"--production-mode refuses to bind {args.host!r}: this listener is "
+            "plaintext HTTP and its response carries the worker bearer token. "
+            "Bind a loopback address and terminate TLS in front of it."
+        )
     if args.production_mode and args.admission_policy:
         if not args.admission_policy_keys_digest:
             parser.error("--production-mode requires --admission-policy-keys-digest")
@@ -2887,7 +3227,7 @@ def main() -> None:
         )
 
     app = RegistryApp(
-        RegistryStore(args.db),
+        RegistryStore(args.db, production_mode=args.production_mode),
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,

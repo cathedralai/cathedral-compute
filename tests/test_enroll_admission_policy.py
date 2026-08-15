@@ -21,6 +21,8 @@ Covers:
 from __future__ import annotations
 
 import base64
+import contextlib
+from unittest import mock
 import io
 import json
 import sqlite3
@@ -905,6 +907,25 @@ def test_a_retiring_worker_cannot_lift_its_retirement_by_re_enrolling(tmp_path: 
 # 8b. Production launch arguments
 # ---------------------------------------------------------------------------
 
+
+@contextlib.contextmanager
+def _trusted_registry_path():
+    """Neutralise the production ancestor-chain check for launch tests.
+
+    These tests exercise argument gating, not filesystem policy, and the chain
+    policy has its own tests. Without this they fail wherever the temp
+    directory is world-writable, which is every Linux CI runner, while passing
+    on macOS where tmp_path sits under root-owned /var/folders.
+    """
+    from cathedral.privileged_paths import PathVerdict
+
+    def trusted(target, **kwargs):
+        return PathVerdict(target=str(target), violations=())
+
+    with mock.patch("cathedral.privileged_paths.inspect_creatable_file", trusted):
+        yield
+
+
 def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monkeypatch):
     """The documented --admission-policy production launch must not demand
     --enroll-allowlist-digest: that artifact is never loaded on this path.
@@ -942,8 +963,9 @@ def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monk
 
     monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
 
-    with pytest.raises(RuntimeError, match="server reached"):
-        cathedral.enroll.main()
+    with _trusted_registry_path():
+        with pytest.raises(RuntimeError, match="server reached"):
+            cathedral.enroll.main()
 
 
 def test_production_allowlist_launch_still_requires_the_artifact_digest(
@@ -1110,3 +1132,111 @@ def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):
             cmd_enroll_reconcile(
                 argparse.Namespace(allowlist=allowlist, admission_policy=policy, **base)
             )
+
+
+def test_production_refuses_a_non_loopback_bind_at_launch(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The guard must be pinned where it lives, not only in its helper.
+
+    The listener speaks plaintext HTTP and its success response carries the
+    worker's bearer token, so a non-loopback bind in production puts a
+    credential on the wire in cleartext. Testing only _is_loopback_host leaves
+    the wiring in main() free to be deleted with a green suite.
+    """
+    import cathedral.enroll
+
+    for host in ("0.0.0.0", "::", "::1", "10.0.0.5"):
+        argv = [
+            "cathedral-enroll",
+            "--db", str(tmp_path / "registry.sqlite"),
+            "--production-mode",
+            "--host", host,
+            "--registered-hotkeys-file", str(tmp_path / "registered.json"),
+            "--enroll-allowlist", str(tmp_path / "allowlist.json"),
+            "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),
+            "--enroll-allowlist-keys-digest", "sha256:" + "a" * 64,
+            "--enroll-allowlist-digest", "sha256:" + "b" * 64,
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        with pytest.raises(SystemExit) as exc_info:
+            cathedral.enroll.main()
+        assert exc_info.value.code == 2
+        assert "refuses to bind" in capsys.readouterr().err, host
+
+
+def test_production_still_launches_on_loopback(tmp_path: Path, monkeypatch):
+    """The counterexample: the guard must not refuse the real deployment.
+
+    The live unit binds 127.0.0.1 behind nginx, so a guard that rejected it
+    would take the enrollment service down on upgrade.
+    """
+    import hashlib
+
+    import cathedral.enroll
+
+    keys_path = tmp_path / "admission-policy-keys.json"
+    keys_bytes = json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}).encode("utf-8")
+    keys_path.write_bytes(keys_bytes)
+    policy_path = tmp_path / "admission-policy.json"
+    policy_path.write_bytes(policy_bytes())
+
+    argv = [
+        "cathedral-enroll",
+        "--db", str(tmp_path / "registry.sqlite"),
+        "--production-mode",
+        "--host", "127.0.0.1",
+        "--network", NETWORK,
+        "--netuid", str(NETUID),
+        "--registered-hotkeys-file", snapshot_file(tmp_path, {HOTKEY: COLDKEY}),
+        "--admission-policy", str(policy_path),
+        "--admission-policy-keys", str(keys_path),
+        "--admission-policy-keys-digest",
+        "sha256:" + hashlib.sha256(keys_bytes).hexdigest(),
+        "--admission-policy-state", str(tmp_path / "admission-policy-state.json"),
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    def _raise_reached(*args, **kwargs):
+        raise RuntimeError("server reached")
+
+    monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
+    with _trusted_registry_path():
+        with pytest.raises(RuntimeError, match="server reached"):
+            cathedral.enroll.main()
+
+
+def test_a_policy_outage_refuses_before_verifying_any_signature(tmp_path: Path, monkeypatch):
+    """An outage must not buy a miner unbounded signature verification.
+
+    The two costs here pull against each other: a replay should not pay for
+    reading the signed policy, and an outage should not pay for sr25519 on
+    every request. Doing both needs a negative cache. This orders the load
+    first, which matches the previous behaviour for an outage and is cheaper
+    than it for a replay, because the replay is still answered ahead of the
+    registration and allowlist gates. The bar is that no case got worse.
+    """
+    import cathedral.enroll as enroll_module
+
+    app, _store, _keys = build_app(tmp_path)
+
+    verifications = []
+    real_verify = enroll_module.verify_enroll_signature
+
+    def counting_verify(*args, **kwargs):
+        verifications.append(1)
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(enroll_module, "verify_enroll_signature", counting_verify)
+    monkeypatch.setattr(app.admission_policy, "load", lambda *a, **k: None)
+
+    # Stay under the per-IP limiter (10/min) so this pins the load ordering
+    # rather than the limiter, which would pass for the wrong reason.
+    for _ in range(8):
+        status, body = call(app, v2_payload())
+        assert status == 403
+        assert body["error"] == "admission policy unavailable"
+
+    assert verifications == [], (
+        "a policy outage must be refused before any signature is verified"
+    )
