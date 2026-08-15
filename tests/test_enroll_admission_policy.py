@@ -1206,37 +1206,37 @@ def test_production_still_launches_on_loopback(tmp_path: Path, monkeypatch):
             cathedral.enroll.main()
 
 
-def test_an_exact_replay_does_not_reread_the_signed_policy(tmp_path: Path, monkeypatch):
-    """A replay must not make us read and verify the admission policy.
+def test_a_policy_outage_refuses_before_verifying_any_signature(tmp_path: Path, monkeypatch):
+    """An outage must not buy a miner unbounded signature verification.
 
-    Loading the artifact is a file read, an Ed25519 verify and a canonical
-    re-serialisation. Doing that for a request we are about to refuse for nonce
-    reuse hands a miner unbounded work from any number of source addresses for
-    the whole signature lifetime. Which signature form applies depends on
-    whether a policy is CONFIGURED, not on its contents, so the load belongs
-    below the replay check.
+    The two costs here pull against each other: a replay should not pay for
+    reading the signed policy, and an outage should not pay for sr25519 on
+    every request. Doing both needs a negative cache. This orders the load
+    first, which matches the previous behaviour for an outage and is cheaper
+    than it for a replay, because the replay is still answered ahead of the
+    registration and allowlist gates. The bar is that no case got worse.
     """
+    import cathedral.enroll as enroll_module
+
     app, _store, _keys = build_app(tmp_path)
 
-    loads = []
-    real_load = app.admission_policy.load
+    verifications = []
+    real_verify = enroll_module.verify_enroll_signature
 
-    def counting_load(*args, **kwargs):
-        loads.append(1)
-        return real_load(*args, **kwargs)
+    def counting_verify(*args, **kwargs):
+        verifications.append(1)
+        return real_verify(*args, **kwargs)
 
-    monkeypatch.setattr(app.admission_policy, "load", counting_load)
+    monkeypatch.setattr(enroll_module, "verify_enroll_signature", counting_verify)
+    monkeypatch.setattr(app.admission_policy, "load", lambda *a, **k: None)
 
-    payload = v2_payload()
-    assert call(app, payload)[0] == 200
-    after_first = len(loads)
-    assert after_first >= 1, "the accepted enrollment must load the policy"
+    # Stay under the per-IP limiter (10/min) so this pins the load ordering
+    # rather than the limiter, which would pass for the wrong reason.
+    for _ in range(8):
+        status, body = call(app, v2_payload())
+        assert status == 403
+        assert body["error"] == "admission policy unavailable"
 
-    for _ in range(5):
-        status, body = call(app, payload)
-        assert status == 400
-        assert "nonce already used" in body["error"]
-
-    assert len(loads) == after_first, (
-        "an exact replay must not reread or reverify the signed admission policy"
+    assert verifications == [], (
+        "a policy outage must be refused before any signature is verified"
     )

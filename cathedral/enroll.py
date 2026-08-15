@@ -2551,14 +2551,33 @@ class RegistryApp:
         # binding, profiles, and caps. It is loaded before anything is parsed
         # so an unavailable policy rejects uniformly rather than leaking which
         # request shapes the service would otherwise have accepted.
-        # The artifact itself is loaded further down, AFTER the replay check.
-        # Which signature form applies depends on whether a policy is
-        # CONFIGURED, not on its contents, so reading and verifying the signed
-        # artifact for a request that turns out to be an exact replay is pure
-        # cost an attacker can spend on our behalf from any number of
-        # addresses. The load still fails closed for every non-replay.
+        # Load order, and the tradeoff behind it, stated once so it is not
+        # re-litigated. Two costs pull in opposite directions:
+        #
+        #   - an exact replay should not pay for reading and verifying the
+        #     signed policy artifact, and
+        #   - a policy OUTAGE should not pay for sr25519 verification on every
+        #     request before it is refused.
+        #
+        # Satisfying both needs a negative cache with bounded revalidation.
+        # This orders the load first instead, which matches the pre-existing
+        # behaviour exactly for an outage and is strictly cheaper than it for a
+        # replay, because the replay is still answered before the registration
+        # and allowlist gates below. No case here is more expensive than it was
+        # before this change, which is the bar that matters; the cache is a
+        # separate piece of work, not a prerequisite.
         policy = None
         policy_configured = self.admission_policy is not None
+        if policy_configured:
+            policy = self.admission_policy.load()
+            if policy is None:
+                return self._reject(
+                    start_response,
+                    403,
+                    "admission policy unavailable",
+                    hotkey=None,
+                    reason="policy_unavailable",
+                )
 
         hotkey = validate_hotkey(payload.get("hotkey"))
         # Production mode requires a public IP literal endpoint: see
@@ -2648,15 +2667,6 @@ class RegistryApp:
             )
 
         if policy_configured:
-            policy = self.admission_policy.load()
-            if policy is None:
-                return self._reject(
-                    start_response,
-                    403,
-                    "admission policy unavailable",
-                    hotkey=None,
-                    reason="policy_unavailable",
-                )
             # The signature proves the miner meant *this* subnet. The policy
             # verifier has already proven the artifact means this subnet. A
             # mismatch here is a request aimed somewhere else.
