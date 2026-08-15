@@ -1110,3 +1110,74 @@ def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):
             cmd_enroll_reconcile(
                 argparse.Namespace(allowlist=allowlist, admission_policy=policy, **base)
             )
+
+
+def test_production_refuses_a_non_loopback_bind_at_launch(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The guard must be pinned where it lives, not only in its helper.
+
+    The listener speaks plaintext HTTP and its success response carries the
+    worker's bearer token, so a non-loopback bind in production puts a
+    credential on the wire in cleartext. Testing only _is_loopback_host leaves
+    the wiring in main() free to be deleted with a green suite.
+    """
+    import cathedral.enroll
+
+    for host in ("0.0.0.0", "::", "10.0.0.5"):
+        argv = [
+            "cathedral-enroll",
+            "--db", str(tmp_path / "registry.sqlite"),
+            "--production-mode",
+            "--host", host,
+            "--registered-hotkeys-file", str(tmp_path / "registered.json"),
+            "--enroll-allowlist", str(tmp_path / "allowlist.json"),
+            "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),
+            "--enroll-allowlist-keys-digest", "sha256:" + "a" * 64,
+            "--enroll-allowlist-digest", "sha256:" + "b" * 64,
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        with pytest.raises(SystemExit) as exc_info:
+            cathedral.enroll.main()
+        assert exc_info.value.code == 2
+        assert "refuses to bind" in capsys.readouterr().err, host
+
+
+def test_production_still_launches_on_loopback(tmp_path: Path, monkeypatch):
+    """The counterexample: the guard must not refuse the real deployment.
+
+    The live unit binds 127.0.0.1 behind nginx, so a guard that rejected it
+    would take the enrollment service down on upgrade.
+    """
+    import hashlib
+
+    import cathedral.enroll
+
+    keys_path = tmp_path / "admission-policy-keys.json"
+    keys_bytes = json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}).encode("utf-8")
+    keys_path.write_bytes(keys_bytes)
+    policy_path = tmp_path / "admission-policy.json"
+    policy_path.write_bytes(policy_bytes())
+
+    argv = [
+        "cathedral-enroll",
+        "--db", str(tmp_path / "registry.sqlite"),
+        "--production-mode",
+        "--host", "127.0.0.1",
+        "--network", NETWORK,
+        "--netuid", str(NETUID),
+        "--registered-hotkeys-file", snapshot_file(tmp_path, {HOTKEY: COLDKEY}),
+        "--admission-policy", str(policy_path),
+        "--admission-policy-keys", str(keys_path),
+        "--admission-policy-keys-digest",
+        "sha256:" + hashlib.sha256(keys_bytes).hexdigest(),
+        "--admission-policy-state", str(tmp_path / "admission-policy-state.json"),
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    def _raise_reached(*args, **kwargs):
+        raise RuntimeError("server reached")
+
+    monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
+    with pytest.raises(RuntimeError, match="server reached"):
+        cathedral.enroll.main()

@@ -584,6 +584,7 @@ class RegistryStore:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lifecycle_lock = threading.RLock()
         self._init()
+        self._restrict_database_mode()
 
     def _lifecycle_now(self) -> datetime:
         when = self._clock()
@@ -600,6 +601,28 @@ class RegistryStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def _restrict_database_mode(self) -> None:
+        """Make the database owner-only.
+
+        This file now holds worker bearer tokens. The operator's token file
+        carries the same credential class and is refused unless it is
+        owner-only (``cli.py::_load_production_tokens``), so leaving this one
+        at whatever the process umask produced would be an asymmetry with a
+        real consequence: any local account that can read the file reads every
+        worker's token and can impersonate the validator to those workers.
+
+        The journal, WAL and shared-memory siblings hold the same rows and are
+        created by SQLite rather than by us, so they are narrowed too. A
+        sibling that does not exist is not an error.
+        """
+        if self.path == ":memory:" or self.path.startswith("file::memory:"):
+            return
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.chmod(self.path + suffix, 0o600)
+            except FileNotFoundError:
+                continue
 
     def _init(self) -> None:
         with self._connect() as conn:

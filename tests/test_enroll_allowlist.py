@@ -617,6 +617,16 @@ def test_extended_snapshot_with_invalid_values_fails_closed(tmp_path: Path) -> N
 # Worker token minted at enrollment (#60 interim: removes the manual step)
 # ---------------------------------------------------------------------------
 
+
+def _attempt_count(store: RegistryStore, hotkey: str) -> int:
+    """Rows the durable per-hotkey enrollment limiter has recorded."""
+    with sqlite3.connect(store.path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM hotkey_enroll_attempts WHERE hotkey = ?", (hotkey,)
+        ).fetchone()
+    return int(row[0])
+
+
 def test_worker_token_is_minted_once_and_survives_re_enrollment(tmp_path: Path) -> None:
     """The token must be stable across re-enrollment.
 
@@ -784,24 +794,29 @@ def test_a_retransmission_is_refused_without_consuming_the_hotkey_budget(
         assert "nonce already used" in body["error"]
         assert "worker_token" not in body
 
-    # But it cost the hotkey nothing, so recovery with a fresh nonce works.
-    assert app.store.check_and_record_hotkey_attempt(
-        HOTKEY, limit=2, window_seconds=3600
-    ), "retransmissions must not have consumed the hotkey enrollment budget"
+    # But they cost the hotkey nothing. Counted directly rather than inferred
+    # from a later success, so a limiter that charged them would fail here.
+    assert _attempt_count(app.store, HOTKEY) == 1, (
+        "only the original request may be charged; retransmissions must not be"
+    )
     status, body = _call(app, _signed_payload(nonce="32" * 16))
     assert status == 200
     assert body["worker_token"] == minted, "recovery returns the same token"
 
     # A different endpoint under an already-used nonce is not a retransmission.
     # It is charged and refused exactly as before, so this is not a bypass.
-    before = app.store.check_and_record_hotkey_attempt(
-        HOTKEY, limit=100, window_seconds=3600
-    )
-    assert before
+    # Asserting the 400 alone would not pin this: nonce reuse returns 400 either
+    # way, so an is_completed_enrollment that ignored the endpoint would pass.
+    # The charge is the property, so count attempts across the call.
+    charged_before = _attempt_count(app.store, HOTKEY)
     status, _ = _call(
         app, _signed_payload(endpoint_url="https://8.8.4.4:9443", nonce="31" * 16)
     )
     assert status == 400
+    assert _attempt_count(app.store, HOTKEY) == charged_before + 1, (
+        "a replay under a DIFFERENT endpoint is not a retransmission and must "
+        "still be charged"
+    )
 
 
 def test_production_refuses_a_non_loopback_plaintext_bind(tmp_path: Path) -> None:
@@ -812,3 +827,29 @@ def test_production_refuses_a_non_loopback_plaintext_bind(tmp_path: Path) -> Non
     assert _is_loopback_host("::1") is True
     for host in ("0.0.0.0", "::", "8.8.8.8", "", None, "localhost"):
         assert _is_loopback_host(host) is False, host
+
+
+def test_the_registry_database_is_owner_only(tmp_path: Path) -> None:
+    """The database now holds worker bearer tokens.
+
+    The operator's token file carries the same credential class and is refused
+    unless owner-only, so this file must not be left at whatever the process
+    umask produced. A world-readable database hands every worker's token to any
+    local account.
+    """
+    import os
+    import stat
+
+    db = tmp_path / "registry.sqlite"
+    previous = os.umask(0o000)  # worst case: nothing is masked off
+    try:
+        store = RegistryStore(str(db))
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
+    for suffix in ("-wal", "-shm", "-journal"):
+        sibling = Path(str(db) + suffix)
+        if sibling.exists():
+            assert stat.S_IMODE(os.stat(sibling).st_mode) == 0o600, suffix
+    assert store.worker_token("5" + "Z" * 47) is None
