@@ -672,19 +672,143 @@ def test_unenrolled_hotkey_has_no_worker_token(tmp_path: Path) -> None:
     assert app.store.worker_token("5" + "Z" * 47) is None
 
 
-def test_rows_written_before_the_column_existed_fall_back_to_the_file(
+def test_a_database_without_the_column_migrates_and_reads_as_no_token(
     tmp_path: Path,
 ) -> None:
-    """A legacy enrollment has a NULL token and must not shadow the operator's
-    file. The lookup returns None so the file-based provider still answers."""
+    """The real migration, from a schema that genuinely predates the column.
+
+    The previous version of this test created the current schema and then set
+    worker_token to NULL, which exercised neither the ALTER TABLE nor the
+    "legacy row has no token" read. Build the old table by hand instead, then
+    open it through RegistryStore and let the migration run.
+    """
+    db = tmp_path / "legacy.sqlite"
+    legacy_hotkey = "5" + "L" * 47
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE enrollments (
+                hotkey TEXT PRIMARY KEY,
+                endpoint_url TEXT NOT NULL,
+                enrolled_at_iso TEXT NOT NULL,
+                updated_at_iso TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO enrollments VALUES (?, ?, ?, ?)",
+            (legacy_hotkey, "https://8.8.8.8:8443", now_iso(), now_iso()),
+        )
+
+    store = RegistryStore(str(db))
+    columns = set()
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(enrollments)")}
+    assert "worker_token" in columns, "opening the store must add the column"
+    # The pre-existing row keeps its data and reads as having no token, which
+    # is what makes the operator's token file still answer for it.
+    assert store.worker_token(legacy_hotkey) is None
+    assert [e.hotkey for e in store.enrollments()] == [legacy_hotkey]
+
+
+def test_token_precedence_prefers_the_file_and_reports_a_conflict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The precedence the validator actually uses, exercising the real code.
+
+    File first is deliberate: a worker enrolled before minting is running the
+    file's value, and re-enrollment happens without human involvement on an
+    endpoint change (#61). Letting the minted token win there would switch the
+    validator to a credential the running worker does not have.
+    """
+    from cathedral.cli import resolve_worker_token
+
     app = _app(
         tmp_path,
         registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
         coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
     )
-    status, _ = _call(app, _signed_payload(nonce="22" * 16))
+    status, body = _call(app, _signed_payload(nonce="30" * 16))
     assert status == 200
+    minted = body["worker_token"]
 
-    with sqlite3.connect(app.store.path) as conn:
-        conn.execute("UPDATE enrollments SET worker_token = NULL WHERE hotkey = ?", (HOTKEY,))
-    assert app.store.worker_token(HOTKEY) is None
+    # No file entry: the minted token is used. This is the new-miner path, and
+    # it is the whole point of the change.
+    assert resolve_worker_token({}, app.store, HOTKEY) == minted
+
+    # Matching file entry: same answer, no conflict reported.
+    with caplog.at_level(logging.WARNING):
+        assert resolve_worker_token({HOTKEY: minted}, app.store, HOTKEY) == minted
+    assert "differs from the token" not in caplog.text
+
+    # Conflicting file entry: the file wins and the operator is told, because
+    # both values are credible and guessing silently breaks a running worker.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert (
+            resolve_worker_token({HOTKEY: "operator-set-value"}, app.store, HOTKEY)
+            == "operator-set-value"
+        )
+    assert "differs from the token" in caplog.text
+
+    # A hotkey with neither has no token at all, which the runtime reports as
+    # missing_auth for that one miner rather than failing the epoch.
+    assert resolve_worker_token({}, app.store, "5" + "Z" * 47) is None
+
+
+def test_a_retransmission_is_refused_without_consuming_the_hotkey_budget(
+    tmp_path: Path,
+) -> None:
+    """A lost 200 must not lock the hotkey out of enrollment.
+
+    Replaying the same signed request is still refused, deliberately: answering
+    it with the token would hand a bearer credential to anyone who captured the
+    request inside its expiry window. What changes is that the replay is no
+    longer CHARGED, so the fresh request that actually recovers the token is
+    not itself rate limited.
+    """
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    payload = _signed_payload(nonce="31" * 16)
+    status, body = _call(app, payload)
+    assert status == 200
+    minted = body["worker_token"]
+
+    # The replay is still refused. It must never return the credential.
+    for _ in range(5):
+        status, body = _call(app, payload)
+        assert status == 400
+        assert "nonce already used" in body["error"]
+        assert "worker_token" not in body
+
+    # But it cost the hotkey nothing, so recovery with a fresh nonce works.
+    assert app.store.check_and_record_hotkey_attempt(
+        HOTKEY, limit=2, window_seconds=3600
+    ), "retransmissions must not have consumed the hotkey enrollment budget"
+    status, body = _call(app, _signed_payload(nonce="32" * 16))
+    assert status == 200
+    assert body["worker_token"] == minted, "recovery returns the same token"
+
+    # A different endpoint under an already-used nonce is not a retransmission.
+    # It is charged and refused exactly as before, so this is not a bypass.
+    before = app.store.check_and_record_hotkey_attempt(
+        HOTKEY, limit=100, window_seconds=3600
+    )
+    assert before
+    status, _ = _call(
+        app, _signed_payload(endpoint_url="https://8.8.4.4:9443", nonce="31" * 16)
+    )
+    assert status == 400
+
+
+def test_production_refuses_a_non_loopback_plaintext_bind(tmp_path: Path) -> None:
+    """The listener speaks plaintext and its response now carries a credential."""
+    from cathedral.enroll import _is_loopback_host
+
+    assert _is_loopback_host("127.0.0.1") is True
+    assert _is_loopback_host("::1") is True
+    for host in ("0.0.0.0", "::", "8.8.8.8", "", None, "localhost"):
+        assert _is_loopback_host(host) is False, host

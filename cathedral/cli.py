@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import ssl
@@ -822,6 +823,46 @@ def _load_production_tokens(path: str) -> object:
             os.close(descriptor)
 
 
+_LOGGER = logging.getLogger("cathedral.cli")
+
+
+def resolve_worker_token(
+    tokens: Mapping[str, str], registry: RegistryStore, hotkey: str
+) -> str | None:
+    """The bearer token the validator should present to *hotkey*.
+
+    The operator's token file first, then the token minted at enrollment.
+    File first is the safe direction during migration, and the reasoning
+    matters because the obvious alternative breaks a running miner.
+
+    A worker enrolled before tokens were minted is configured with the value in
+    the operator's file. Enrollment is re-run on an endpoint change, which
+    happens without human involvement when a worker restarts onto a new address
+    (#61). If the registry won, that automatic re-enrollment would mint a
+    token, the validator would immediately start sending it, and the worker,
+    still running its original credential, would 401 on every request. Nobody
+    would have touched anything.
+
+    File first inverts that: the legacy worker keeps working, and a miner that
+    enrols fresh has no file entry so its minted token is used. The remaining
+    hazard is a stale file entry for a worker that HAS adopted its minted
+    token, which needs an operator to half-finish a migration. That case cannot
+    be resolved automatically, because both values are credible, so it is
+    reported rather than guessed at.
+    """
+    from_file = tokens.get(hotkey)
+    minted = registry.worker_token(hotkey)
+    if from_file is not None and minted is not None and from_file != minted:
+        _LOGGER.warning(
+            "worker %s has a token file entry that differs from the token minted "
+            "at enrollment; sending the file value. If this worker was "
+            "reconfigured with the minted token, remove its entry from the "
+            "token file.",
+            hotkey,
+        )
+    return from_file or minted
+
+
 def _valid_bearer_token(token: object) -> bool:
     return (
         isinstance(token, str)
@@ -1037,14 +1078,7 @@ def _build_runtime(
     registry = RegistryStore(getattr(args, "registry_db", ":memory:"))
 
     def token_provider(hotkey: str) -> str | None:
-        """The operator's token file first, then the token minted at enrollment.
-
-        File first so an operator can still override or revoke one worker's
-        token without touching the registry, which is the only manual control
-        that remains. Registry second so a miner that enrolled after this
-        landed needs no manual step at all.
-        """
-        return tokens.get(hotkey) or registry.worker_token(hotkey)
+        return resolve_worker_token(tokens, registry, hotkey)
 
     runtime = ConfidentialRuntime(
         registry,

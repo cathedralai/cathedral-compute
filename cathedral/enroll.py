@@ -102,6 +102,21 @@ def generate_worker_token() -> str:
     return secrets.token_urlsafe(WORKER_TOKEN_BYTES)
 
 
+def _is_loopback_host(host: object) -> bool:
+    """True only for an address that cannot receive traffic off the machine.
+
+    An empty host and ``0.0.0.0`` / ``::`` are wildcards, not loopback, and a
+    hostname is refused rather than resolved: resolution is not stable and a
+    name that resolves to loopback today is not a guarantee.
+    """
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _valid_worker_token(token: object) -> bool:
     return (
         isinstance(token, str)
@@ -1861,6 +1876,30 @@ class RegistryStore:
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
 
+    def is_completed_enrollment(self, hotkey: str, nonce: str, endpoint_url: str) -> bool:
+        """True when this exact signed request has already been completed.
+
+        A retransmission is a signed request whose ``(hotkey, nonce)`` pair is
+        already recorded AND whose endpoint still matches what is enrolled. The
+        caller uses this to avoid charging the durable per-hotkey limiter for a
+        request the miner already paid for; the replay itself is still refused.
+
+        The endpoint match is what keeps this narrow. A miner that signs a
+        *different* endpoint under an already-used nonce is not retransmitting,
+        and is charged and refused exactly as before.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT e.endpoint_url AS endpoint_url
+                FROM enroll_nonces AS n
+                JOIN enrollments AS e ON e.hotkey = n.hotkey
+                WHERE n.hotkey = ? AND n.nonce = ?
+                """,
+                (hotkey, nonce),
+            ).fetchone()
+        return row is not None and row["endpoint_url"] == endpoint_url
+
     def worker_token(self, hotkey: str) -> str | None:
         """Return the bearer token minted for *hotkey* at enrollment.
 
@@ -2426,7 +2465,23 @@ class RegistryApp:
         # allowlist), so a rejected request is not free. The in-memory IP
         # limiter is per-process and per-address and cannot bound a distributed
         # caller on its own; only this durable per-hotkey record can.
-        if not self.store.check_and_record_hotkey_attempt(
+        # A retransmission of a request that already succeeded is still refused
+        # for reusing its nonce, but it is not CHARGED to the durable per-hotkey
+        # limiter. That is the whole fix: previously about twenty retries of a
+        # request whose 200 was lost in flight consumed the hotkey's entire
+        # enrollment budget, so the fresh request that would have recovered the
+        # token was itself rate limited for the rest of the window.
+        #
+        # Deliberately not answered with the token. Replaying a captured signed
+        # request would then disclose a bearer credential to whoever captured
+        # it, inside the request's own expiry window. Refusing the replay and
+        # sparing the budget lets the miner recover with a new nonce, which
+        # costs one round trip and discloses nothing.
+        retransmission = self.store.is_completed_enrollment(hotkey, nonce, endpoint_url)
+        if retransmission:
+            logger.info("enroll retransmission hotkey=%s", hotkey)
+
+        if not retransmission and not self.store.check_and_record_hotkey_attempt(
             hotkey,
             limit=self.hotkey_enroll_limit,
             window_seconds=self.hotkey_enroll_window_seconds,
@@ -2889,6 +2944,17 @@ def main() -> None:
         parser.error("--admission-policy requires --admission-policy-keys")
     if args.production_mode and not (args.admission_policy or args.enroll_allowlist):
         parser.error("--production-mode requires --admission-policy or --enroll-allowlist")
+    # This listener speaks plaintext HTTP and its success response now carries
+    # the worker's bearer token. Binding it anywhere but loopback in production
+    # puts a credential on the wire in cleartext, where the hotkey signature on
+    # the request protects nothing: it authenticates the sender, not the
+    # response bytes. Terminate TLS in front and proxy to loopback.
+    if args.production_mode and not _is_loopback_host(args.host):
+        parser.error(
+            f"--production-mode refuses to bind {args.host!r}: this listener is "
+            "plaintext HTTP and its response carries the worker bearer token. "
+            "Bind a loopback address and terminate TLS in front of it."
+        )
     if args.production_mode and args.admission_policy:
         if not args.admission_policy_keys_digest:
             parser.error("--production-mode requires --admission-policy-keys-digest")
