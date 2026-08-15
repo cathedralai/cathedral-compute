@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import sqlite3
+from unittest import mock
 import time
 from base64 import b64encode
 from datetime import UTC, datetime, timedelta
@@ -618,6 +619,15 @@ def test_extended_snapshot_with_invalid_values_fails_closed(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 
+
+def _iso_seconds_from_now(offset: int) -> str:
+    """A canonical timestamp offset from now, for re-signing the same nonce."""
+    from datetime import UTC, datetime, timedelta
+
+    moment = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=offset)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _attempt_count(store: RegistryStore, hotkey: str) -> int:
     """Rows the durable per-hotkey enrollment limiter has recorded."""
     with sqlite3.connect(store.path) as conn:
@@ -892,13 +902,19 @@ def test_each_hotkey_gets_a_distinct_token(tmp_path: Path) -> None:
     assert app.store.worker_token(second.ss58_address) == second_body["worker_token"]
 
 
-def test_a_nonce_is_only_a_retransmission_for_its_own_endpoint(tmp_path: Path) -> None:
-    """The nonce is spent on one endpoint, and only that one.
+def test_a_nonce_is_only_a_retransmission_of_its_own_exact_request(
+    tmp_path: Path,
+) -> None:
+    """A retransmission is a retransmission of ONE request, byte for byte.
 
-    Comparing against the worker's CURRENT enrollment instead lets a miner
-    enrol N1 at E1, move to E2 with N2, then sign N1 at E2. That request was
-    never sent before, so treating it as a retransmission hands out an
-    uncharged trip through the registration and allowlist gates.
+    Matching on hotkey, nonce and endpoint is not enough: the timestamp is
+    signed too, so a miner can re-sign the same nonce and endpoint with a fresh
+    timestamp. That request was never sent before, and treating it as a
+    retransmission hands out an uncharged trip through the registration and
+    allowlist gates, repeatable for the whole signature TTL.
+
+    Matching on the current enrollment row is also not enough: enrol N1 at E1,
+    move to E2 with N2, then sign N1 at E2 and the row reads E2.
     """
     app = _app(
         tmp_path,
@@ -908,23 +924,32 @@ def test_a_nonce_is_only_a_retransmission_for_its_own_endpoint(tmp_path: Path) -
     first = "https://8.8.8.8:8090"
     second = "https://8.8.4.4:9443"
 
-    assert _call(app, _signed_payload(endpoint_url=first, nonce="50" * 16))[0] == 200
-    assert _call(app, _signed_payload(endpoint_url=second, nonce="51" * 16))[0] == 200
+    original = _signed_payload(endpoint_url=first, nonce="50" * 16)
+    assert _call(app, original)[0] == 200
 
+    # Byte-identical retransmission: uncharged, still refused.
     charged = _attempt_count(app.store, HOTKEY)
-    # N1 signed against the NEW endpoint. Never sent before, so it is charged.
-    status, _ = _call(app, _signed_payload(endpoint_url=second, nonce="50" * 16))
-    assert status == 400
+    assert _call(app, original)[0] == 400
+    assert _attempt_count(app.store, HOTKEY) == charged
+
+    # Same nonce and endpoint, fresh timestamp. Never sent before, so charged.
+    later = _signed_payload(
+        endpoint_url=first,
+        nonce="50" * 16,
+        timestamp=_iso_seconds_from_now(1),
+    )
+    assert later["timestamp"] != original["timestamp"]
+    charged = _attempt_count(app.store, HOTKEY)
+    assert _call(app, later)[0] == 400
     assert _attempt_count(app.store, HOTKEY) == charged + 1, (
-        "a nonce replayed against an endpoint it was never spent on is not a "
-        "retransmission and must be charged"
+        "a re-signed request is not a retransmission and must be charged"
     )
 
-    # A true retransmission of N1 at its own endpoint is still uncharged.
+    # And the endpoint-advance sequence stays closed.
+    assert _call(app, _signed_payload(endpoint_url=second, nonce="51" * 16))[0] == 200
     charged = _attempt_count(app.store, HOTKEY)
-    status, _ = _call(app, _signed_payload(endpoint_url=first, nonce="50" * 16))
-    assert status == 400
-    assert _attempt_count(app.store, HOTKEY) == charged
+    assert _call(app, _signed_payload(endpoint_url=second, nonce="50" * 16))[0] == 400
+    assert _attempt_count(app.store, HOTKEY) == charged + 1
 
 
 def test_the_runtime_is_wired_to_the_minted_token(tmp_path: Path) -> None:
@@ -965,3 +990,80 @@ def test_the_runtime_is_wired_to_the_minted_token(tmp_path: Path) -> None:
         "the runtime must read the token minted at enrollment"
     )
     assert runtime.token_provider("5" + "Z" * 47) is None
+
+
+def test_a_fresh_database_is_never_briefly_world_readable(tmp_path: Path) -> None:
+    """SQLite creates a new database 0644 regardless of umask.
+
+    Narrowing it afterwards leaves a window where a local account can open a
+    handle that keeps reading every token written later, because the mode is
+    checked at open time and not on each read. The file is therefore created
+    owner-only before SQLite ever opens it. Asserting only the final mode does
+    not catch this: that assertion passes with the precreation removed.
+    """
+    import os
+    import stat
+
+    db = tmp_path / "fresh.sqlite"
+    observed: list[int] = []
+    real_connect = sqlite3.connect
+
+    def watching_connect(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(path, str) and path == str(db) and os.path.exists(path):
+            observed.append(stat.S_IMODE(os.stat(path).st_mode))
+        return real_connect(path, *args, **kwargs)
+
+    previous = os.umask(0o000)
+    try:
+        with mock.patch.object(sqlite3, "connect", watching_connect):
+            RegistryStore(str(db))
+    finally:
+        os.umask(previous)
+
+    assert observed, "expected at least one connect against an existing file"
+    assert all(mode == 0o600 for mode in observed), (
+        f"readable by others before SQLite opened it: {[oct(m) for m in observed]}"
+    )
+
+
+def test_a_database_owned_by_another_user_fails_closed(tmp_path: Path) -> None:
+    """Refusing beats running with tokens in a file we cannot secure.
+
+    An uncaught PermissionError traceback is not a decision; this is. Every
+    process that opens the registry must run as the database's owner.
+    """
+    import os
+
+    db = tmp_path / "foreign.sqlite"
+    db.write_bytes(b"")
+    real_chmod = os.chmod
+
+    def refusing_chmod(path, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path).startswith(str(db)):
+            raise PermissionError(1, "Operation not permitted")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    with mock.patch.object(os, "chmod", refusing_chmod):
+        with pytest.raises(PermissionError, match="owned by another user"):
+            RegistryStore(str(db))
+
+
+def test_a_symlinked_database_path_is_refused(tmp_path: Path) -> None:
+    """A symlink at the database path redirects minted tokens to its target.
+
+    SQLite follows it, so the credential lands wherever the link points and the
+    chmod applies to the target rather than to anything we control. The path is
+    operator configuration, so this is not miner-reachable, but the file now
+    holds bearer tokens and a link there is never intentional.
+    """
+    real = tmp_path / "real.sqlite"
+    real.write_bytes(b"")
+    link = tmp_path / "link.sqlite"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError) as raised:
+        RegistryStore(str(link))
+    # Match a phrase that cannot appear in the path. pytest names tmp_path
+    # after the test, so a bare "symlink" pattern matches this test's own
+    # directory name and passes even when the symlink branch is gone.
+    assert "is a symlink" in str(raised.value), str(raised.value)

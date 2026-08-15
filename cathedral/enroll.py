@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import logging
@@ -20,6 +21,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections import defaultdict, deque
@@ -619,11 +621,44 @@ class RegistryStore:
         """
         if self.path == ":memory:" or self.path.startswith("file::memory:"):
             return
+
+        # Refuse a path that is not a plain file we own, BEFORE SQLite opens it.
+        # SQLite follows a symlink, so a link here silently redirects worker
+        # bearer tokens to its target and the chmod below lands on the target
+        # too. The path is operator configuration rather than miner input, so
+        # this is not a miner-reachable attack; it is refused because a link or
+        # a foreign-owned file at this path is never intentional and the file
+        # now holds credentials.
         try:
-            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
+            existing = os.lstat(self.path)
+        except FileNotFoundError:
+            existing = None
         except OSError:
-            # Anything wrong with the path surfaces from sqlite3.connect with a
+            # Anything else about the path surfaces from sqlite3.connect with a
             # better message than we could produce here.
+            return
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode):
+                raise ValueError(
+                    f"registry database path {self.path!r} is a symlink; the "
+                    "registry holds worker bearer tokens and must be a regular "
+                    "file the service owns"
+                )
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(
+                    f"registry database path {self.path!r} is not a regular file"
+                )
+            if existing.st_uid != os.getuid() and os.getuid() != 0:
+                raise PermissionError(
+                    f"registry database {self.path!r} is owned by another user. "
+                    "It holds worker bearer tokens, so every process that opens "
+                    "it must run as that owner."
+                )
+            return
+
+        try:
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        except OSError:
             return
 
     def _restrict_database_mode(self) -> None:
@@ -750,13 +785,15 @@ class RegistryStore:
             nonce_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(enroll_nonces)")
             }
-            # The endpoint this nonce was actually spent on. A retransmission is
-            # only a retransmission of the request that created the nonce, so the
-            # comparison must be against this and not against whatever endpoint
-            # the worker is enrolled at now. NULL on rows written before this
-            # column, which are therefore never treated as retransmissions.
-            if "endpoint_url" not in nonce_columns:
-                conn.execute("ALTER TABLE enroll_nonces ADD COLUMN endpoint_url TEXT")
+            # A digest of the exact signed bytes this nonce was spent on. A
+            # retransmission is a retransmission of ONE request, so the match
+            # has to cover every signed field. Comparing the endpoint alone let
+            # a miner re-sign the same nonce and endpoint with a fresh
+            # timestamp and take an uncharged trip through every gate. NULL on
+            # rows written before this column, which are therefore never
+            # treated as retransmissions.
+            if "request_digest" not in nonce_columns:
+                conn.execute("ALTER TABLE enroll_nonces ADD COLUMN request_digest TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hotkey_enroll_attempts (
@@ -1697,6 +1734,7 @@ class RegistryStore:
         endpoint_url: str,
         *,
         nonce: str | None = None,
+        request_digest: str | None = None,
         coldkey: str | None = None,
         requested_profile_id: str | None = None,
         max_endpoints_per_coldkey: int | None = None,
@@ -1732,10 +1770,10 @@ class RegistryStore:
                 try:
                     conn.execute(
                         """
-                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso, endpoint_url)
+                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso, request_digest)
                         VALUES (?, ?, ?, ?)
                         """,
-                        (hotkey, nonce, ts, endpoint_url),
+                        (hotkey, nonce, ts, request_digest),
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ValueError("enroll nonce already used") from exc
@@ -1943,7 +1981,7 @@ class RegistryStore:
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
 
-    def is_completed_enrollment(self, hotkey: str, nonce: str, endpoint_url: str) -> bool:
+    def is_completed_enrollment(self, hotkey: str, nonce: str, request_digest: str) -> bool:
         """True when this exact signed request has already been completed.
 
         A retransmission is a signed request whose ``(hotkey, nonce)`` pair is
@@ -1958,12 +1996,12 @@ class RegistryStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT endpoint_url FROM enroll_nonces
+                SELECT request_digest FROM enroll_nonces
                 WHERE hotkey = ? AND nonce = ?
                 """,
                 (hotkey, nonce),
             ).fetchone()
-        return row is not None and row["endpoint_url"] == endpoint_url
+        return row is not None and row["request_digest"] == request_digest
 
     def worker_token(self, hotkey: str) -> str | None:
         """Return the bearer token minted for *hotkey* at enrollment.
@@ -2473,10 +2511,11 @@ class RegistryApp:
         claimed_coldkey: str | None = None
         requested_profile_id: str | None = None
         if policy is None:
+            signed_bytes = canonical_enroll_payload(
+                hotkey, endpoint_url, nonce, timestamp
+            )
             verify_enroll_signature(
-                hotkey,
-                canonical_enroll_payload(hotkey, endpoint_url, nonce, timestamp),
-                payload.get("signature_b64"),
+                hotkey, signed_bytes, payload.get("signature_b64")
             )
         else:
             # v2 request. Every field the registry acts on is inside the
@@ -2492,20 +2531,19 @@ class RegistryApp:
                 timestamp,
                 max_ttl_seconds=self.enroll_signature_ttl_seconds,
             )
+            signed_bytes = canonical_enroll_payload_v2(
+                hotkey=hotkey,
+                coldkey=claimed_coldkey,
+                network=network,
+                netuid=netuid,
+                endpoint_url=endpoint_url,
+                requested_profile_id=requested_profile_id,
+                nonce=nonce,
+                timestamp=timestamp,
+                expires_at=expires_at,
+            )
             verify_enroll_signature(
-                hotkey,
-                canonical_enroll_payload_v2(
-                    hotkey=hotkey,
-                    coldkey=claimed_coldkey,
-                    network=network,
-                    netuid=netuid,
-                    endpoint_url=endpoint_url,
-                    requested_profile_id=requested_profile_id,
-                    nonce=nonce,
-                    timestamp=timestamp,
-                    expires_at=expires_at,
-                ),
-                payload.get("signature_b64"),
+                hotkey, signed_bytes, payload.get("signature_b64")
             )
             # The signature proves the miner meant *this* subnet. The policy
             # verifier has already proven the artifact means this subnet. A
@@ -2542,7 +2580,8 @@ class RegistryApp:
         # it, inside the request's own expiry window. Refusing the replay and
         # sparing the budget lets the miner recover with a new nonce, which
         # costs one round trip and discloses nothing.
-        retransmission = self.store.is_completed_enrollment(hotkey, nonce, endpoint_url)
+        request_digest = hashlib.sha256(signed_bytes).hexdigest()
+        retransmission = self.store.is_completed_enrollment(hotkey, nonce, request_digest)
         if retransmission:
             logger.info("enroll retransmission hotkey=%s", hotkey)
 
@@ -2592,6 +2631,7 @@ class RegistryApp:
                 endpoint_url=endpoint_url,
                 requested_profile_id=requested_profile_id,
                 nonce=nonce,
+                request_digest=request_digest,
             )
 
         # Approved-coldkey gate: active whenever an allowlist is configured,
@@ -2639,7 +2679,9 @@ class RegistryApp:
                 )
 
         try:
-            self.store.enroll(hotkey, endpoint_url, nonce=nonce)
+            self.store.enroll(
+                hotkey, endpoint_url, nonce=nonce, request_digest=request_digest
+            )
         except LifecycleError as exc:
             # A terminal worker (revoked / retired / retiring) may not
             # re-enroll itself by changing its endpoint; recovery is an
@@ -2668,6 +2710,7 @@ class RegistryApp:
         endpoint_url: str,
         requested_profile_id: str | None,
         nonce: str,
+        request_digest: str,
     ) -> list[bytes]:
         """Apply the admission policy and write the pending record.
 
@@ -2725,6 +2768,7 @@ class RegistryApp:
                 hotkey,
                 endpoint_url,
                 nonce=nonce,
+                request_digest=request_digest,
                 coldkey=coldkey,
                 requested_profile_id=requested_profile_id,
                 max_endpoints_per_coldkey=policy.max_enrolled_endpoints_per_coldkey,
