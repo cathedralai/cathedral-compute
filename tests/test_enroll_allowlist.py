@@ -927,10 +927,28 @@ def test_a_nonce_is_only_a_retransmission_of_its_own_exact_request(
     original = _signed_payload(endpoint_url=first, nonce="50" * 16)
     assert _call(app, original)[0] == 200
 
-    # Byte-identical retransmission: uncharged, still refused.
+    # Byte-identical retransmission: uncharged, still refused, and it must not
+    # reach the admission gates at all. Sparing only the charge still lets a
+    # miner buy registration and allowlist work from as many addresses as it
+    # likes for the whole signature validity window, so the property is that
+    # the gates are never consulted.
     charged = _attempt_count(app.store, HOTKEY)
-    assert _call(app, original)[0] == 400
+    gate_calls: list[str] = []
+    real_is_registered = app.registration_provider.is_registered
+
+    def counting_is_registered(hotkey: str):  # type: ignore[no-untyped-def]
+        gate_calls.append(hotkey)
+        return real_is_registered(hotkey)
+
+    app.registration_provider.is_registered = counting_is_registered  # type: ignore[assignment]
+    try:
+        assert _call(app, original)[0] == 400
+    finally:
+        app.registration_provider.is_registered = real_is_registered  # type: ignore[assignment]
     assert _attempt_count(app.store, HOTKEY) == charged
+    assert gate_calls == [], (
+        "an exact replay must be answered before the registration gate runs"
+    )
 
     # Same nonce and endpoint, fresh timestamp. Never sent before, so charged.
     later = _signed_payload(
@@ -1029,23 +1047,85 @@ def test_a_fresh_database_is_never_briefly_world_readable(tmp_path: Path) -> Non
 def test_a_database_owned_by_another_user_fails_closed(tmp_path: Path) -> None:
     """Refusing beats running with tokens in a file we cannot secure.
 
-    An uncaught PermissionError traceback is not a decision; this is. Every
-    process that opens the registry must run as the database's owner.
+    Mocking chmod to raise does NOT test this: it exercises the chmod path and
+    stays green with the ownership check deleted. The owner has to actually
+    differ, so lstat is mocked to report a foreign uid and the test asserts
+    SQLite is never opened.
     """
     import os
+    import stat as stat_module
 
     db = tmp_path / "foreign.sqlite"
     db.write_bytes(b"")
-    real_chmod = os.chmod
+    real_lstat = os.lstat
+    foreign_uid = os.getuid() + 1
 
-    def refusing_chmod(path, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if str(path).startswith(str(db)):
-            raise PermissionError(1, "Operation not permitted")
-        return real_chmod(path, mode, *args, **kwargs)
+    class _ForeignStat:
+        st_mode = stat_module.S_IFREG | 0o644
+        st_uid = foreign_uid
 
-    with mock.patch.object(os, "chmod", refusing_chmod):
-        with pytest.raises(PermissionError, match="owned by another user"):
-            RegistryStore(str(db))
+    def lying_lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(db):
+            return _ForeignStat()
+        return real_lstat(path, *args, **kwargs)
+
+    opened: list[str] = []
+    real_connect = sqlite3.connect
+
+    def watching_connect(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        opened.append(str(path))
+        return real_connect(path, *args, **kwargs)
+
+    with mock.patch.object(os, "lstat", lying_lstat):
+        with mock.patch.object(sqlite3, "connect", watching_connect):
+            with pytest.raises(PermissionError) as raised:
+                RegistryStore(str(db))
+
+    assert "must run as its owner" in str(raised.value)
+    assert opened == [], "SQLite must never open a database owned by another user"
+
+
+def test_root_does_not_get_an_ownership_exemption(tmp_path: Path) -> None:
+    """A root service must not adopt a database an untrusted user pre-created.
+
+    Initialising it leaves that user as the owner, and chmod 0600 then
+    preserves their read and write access to every minted token.
+    """
+    import os
+    import stat as stat_module
+
+    db = tmp_path / "planted.sqlite"
+    db.write_bytes(b"")
+    real_lstat = os.lstat
+
+    class _AttackerOwned:
+        st_mode = stat_module.S_IFREG | 0o600
+        st_uid = os.getuid() + 1
+
+    def lying_lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(db):
+            return _AttackerOwned()
+        return real_lstat(path, *args, **kwargs)
+
+    with mock.patch.object(os, "lstat", lying_lstat):
+        with mock.patch.object(os, "getuid", lambda: 0):
+            with pytest.raises(PermissionError, match="must run as its owner"):
+                RegistryStore(str(db))
+
+
+def test_a_world_writable_directory_is_refused(tmp_path: Path) -> None:
+    """SQLite opens by path, so the directory is what binds the check.
+
+    If any user can write the directory, the file checked is not necessarily
+    the file opened, and no amount of checking the path closes that.
+    """
+    import os
+
+    exposed = tmp_path / "exposed"
+    exposed.mkdir()
+    os.chmod(exposed, 0o777)  # no sticky bit
+    with pytest.raises(PermissionError, match="writable by other users"):
+        RegistryStore(str(exposed / "registry.sqlite"))
 
 
 def test_a_symlinked_database_path_is_refused(tmp_path: Path) -> None:

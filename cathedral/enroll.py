@@ -629,14 +629,36 @@ class RegistryStore:
         # this is not a miner-reachable attack; it is refused because a link or
         # a foreign-owned file at this path is never intentional and the file
         # now holds credentials.
+        # SQLite opens by path, so a check that is not bound to the file it
+        # actually opens is advisory. The parent directory is what makes the
+        # binding real: if only trusted users can write there, nothing can swap
+        # the path between this check and the open.
+        parent = os.path.dirname(os.path.abspath(self.path)) or "."
+        try:
+            parent_stat = os.stat(parent)
+        except OSError as exc:
+            raise ValueError(
+                f"registry database directory {parent!r} is unusable"
+            ) from exc
+        writable_by_others = parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky = parent_stat.st_mode & stat.S_ISVTX
+        if writable_by_others and not sticky:
+            raise PermissionError(
+                f"registry database directory {parent!r} is writable by other "
+                "users, so the database path cannot be trusted. The registry "
+                "holds worker bearer tokens; put it in a directory only its "
+                "owner can write."
+            )
+
         try:
             existing = os.lstat(self.path)
         except FileNotFoundError:
             existing = None
-        except OSError:
-            # Anything else about the path surfaces from sqlite3.connect with a
-            # better message than we could produce here.
-            return
+        except OSError as exc:
+            raise ValueError(
+                f"registry database path {self.path!r} cannot be inspected"
+            ) from exc
+
         if existing is not None:
             if stat.S_ISLNK(existing.st_mode):
                 raise ValueError(
@@ -648,18 +670,36 @@ class RegistryStore:
                 raise ValueError(
                     f"registry database path {self.path!r} is not a regular file"
                 )
-            if existing.st_uid != os.getuid() and os.getuid() != 0:
+            # Root is checked too. A root service that initialises a database an
+            # untrusted user pre-created leaves that user as the owner, and
+            # chmod 0600 then preserves their read and write access to every
+            # minted token.
+            if existing.st_uid != os.getuid():
                 raise PermissionError(
-                    f"registry database {self.path!r} is owned by another user. "
-                    "It holds worker bearer tokens, so every process that opens "
-                    "it must run as that owner."
+                    f"registry database {self.path!r} is owned by uid "
+                    f"{existing.st_uid} but this process runs as uid "
+                    f"{os.getuid()}. It holds worker bearer tokens, so every "
+                    "process that opens it must run as its owner."
                 )
             return
 
+        # Create it ourselves, exclusively, so we know the inode is ours.
+        # Failing closed here is deliberate: the alternative is proceeding to
+        # open a path we could not secure.
         try:
-            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
-        except OSError:
+            descriptor = os.open(
+                self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+            )
+        except FileExistsError:
+            # Lost a race with another starting process. Re-check rather than
+            # assume; the loser of the race must still validate what is there.
+            self._precreate_database()
             return
+        except OSError as exc:
+            raise ValueError(
+                f"registry database {self.path!r} could not be created securely"
+            ) from exc
+        os.close(descriptor)
 
     def _restrict_database_mode(self) -> None:
         """Make the database owner-only.
@@ -2581,11 +2621,19 @@ class RegistryApp:
         # sparing the budget lets the miner recover with a new nonce, which
         # costs one round trip and discloses nothing.
         request_digest = hashlib.sha256(signed_bytes).hexdigest()
-        retransmission = self.store.is_completed_enrollment(hotkey, nonce, request_digest)
-        if retransmission:
+        if self.store.is_completed_enrollment(hotkey, nonce, request_digest):
+            # Answer here, before the registration and allowlist gates. Those
+            # gates each read and verify an operator-controlled artifact, and
+            # letting an exact replay reach them uncharged hands a miner free
+            # work from as many addresses as it likes for the whole signature
+            # validity window. The outcome is the same 400 the nonce insert
+            # would have produced; only the cost changes.
             logger.info("enroll retransmission hotkey=%s", hotkey)
+            return self._json(
+                start_response, 400, {"error": "enroll nonce already used"}
+            )
 
-        if not retransmission and not self.store.check_and_record_hotkey_attempt(
+        if not self.store.check_and_record_hotkey_attempt(
             hotkey,
             limit=self.hotkey_enroll_limit,
             window_seconds=self.hotkey_enroll_window_seconds,
