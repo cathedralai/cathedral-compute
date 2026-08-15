@@ -572,8 +572,17 @@ class RegistryStore:
         *,
         verification_ttl_seconds: int | None = None,
         clock: Callable[[], datetime] | None = None,
+        production_mode: bool = False,
     ) -> None:
         self.path = path
+        # Deployment policy, not a library invariant. The ancestor-chain trust
+        # check below applies only in production, the same way the operator
+        # token file is only fstat-and-mode checked in production
+        # (cli.py::_load_tokens). Enforcing it unconditionally puts a
+        # machine-wide filesystem policy inside a constructor that tests, five
+        # operator CLIs and the prober all call, and it rejects any database
+        # under a world-writable temp directory.
+        self.production_mode = bool(production_mode)
         if verification_ttl_seconds is None:
             verification_ttl_seconds = _positive_int_from_env(
                 VERIFICATION_TTL_ENV,
@@ -636,25 +645,26 @@ class RegistryStore:
         # just the immediate parent. Hand-rolling a subset of that got the
         # sticky-bit case wrong (see below) and ignored parent ownership
         # entirely, so an attacker-owned 0700 directory passed.
-        from cathedral.privileged_paths import UntrustedPath, inspect_creatable_file
-
         # Root and the running user are the only uids that may own the database
         # or anything above it. There is deliberately no sticky-bit exemption:
         # in a 01777 directory an untrusted account can PRE-CREATE
         # registry.sqlite-journal and keep the descriptor, and SQLite reuses
         # that inode, so a sidecar leaks minted tokens even though sticky stops
         # the attacker deleting a file they do not own.
-        verdict = inspect_creatable_file(
-            self.path, trusted_uids=frozenset({0, os.getuid()})
-        )
-        if not verdict.trusted:
-            raise PermissionError(
-                f"registry database path {self.path!r} is not trustworthy: "
-                + "; ".join(verdict.violations)
-                + ". It holds worker bearer tokens, so it and every directory "
-                "above it must be owned by root or this service and writable by "
-                "no one else."
+        if self.production_mode:
+            from cathedral.privileged_paths import inspect_creatable_file
+
+            verdict = inspect_creatable_file(
+                self.path, trusted_uids=frozenset({0, os.getuid()})
             )
+            if not verdict.trusted:
+                raise PermissionError(
+                    f"registry database path {self.path!r} is not trustworthy: "
+                    + "; ".join(verdict.violations)
+                    + ". It holds worker bearer tokens, so it and every directory "
+                    "above it must be owned by root or this service and writable "
+                    "by no one else."
+                )
 
         try:
             existing = os.lstat(self.path)
@@ -3207,7 +3217,7 @@ def main() -> None:
         )
 
     app = RegistryApp(
-        RegistryStore(args.db),
+        RegistryStore(args.db, production_mode=args.production_mode),
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,

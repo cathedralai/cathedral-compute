@@ -1091,7 +1091,10 @@ def _build_runtime(
             Path(candidate_snapshot_path).read_bytes(), "candidate snapshot"
         )
     ledger = Ledger(args.ledger_db)
-    registry = RegistryStore(getattr(args, "registry_db", ":memory:"))
+    registry = RegistryStore(
+        getattr(args, "registry_db", ":memory:"),
+        production_mode=config.production_mode,
+    )
 
     def token_provider(hotkey: str) -> str | None:
         return resolve_worker_token(tokens, registry, hotkey)

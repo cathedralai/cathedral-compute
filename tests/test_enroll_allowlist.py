@@ -1142,7 +1142,7 @@ def test_a_world_writable_directory_is_refused(tmp_path: Path) -> None:
     exposed.mkdir()
     os.chmod(exposed, 0o777)
     with pytest.raises(PermissionError) as raised:
-        RegistryStore(str(exposed / "registry.sqlite"))
+        RegistryStore(str(exposed / "registry.sqlite"), production_mode=True)
     assert "group- or world-writable" in str(raised.value), str(raised.value)
 
 
@@ -1161,7 +1161,7 @@ def test_a_sticky_world_writable_directory_is_also_refused(tmp_path: Path) -> No
     shared.mkdir()
     os.chmod(shared, 0o1777)  # sticky, world-writable: the /tmp shape
     with pytest.raises(PermissionError) as raised:
-        RegistryStore(str(shared / "registry.sqlite"))
+        RegistryStore(str(shared / "registry.sqlite"), production_mode=True)
     assert "group- or world-writable" in str(raised.value), str(raised.value)
 
 
@@ -1179,7 +1179,7 @@ def test_a_symlinked_database_path_is_refused(tmp_path: Path) -> None:
     link.symlink_to(real)
 
     with pytest.raises(PermissionError) as raised:
-        RegistryStore(str(link))
+        RegistryStore(str(link), production_mode=True)
     # Assert a phrase that cannot appear in the path. pytest names tmp_path
     # after the test, so a bare "symlink" pattern matches this test's own
     # directory name and passes even when the check is gone.
@@ -1219,3 +1219,32 @@ def test_a_lost_creation_race_fails_closed_instead_of_recursing(tmp_path: Path) 
 
     assert "repeated races" in str(raised.value), str(raised.value)
     assert 1 < len(attempts) <= 16, f"expected a bounded number of retries, got {len(attempts)}"
+
+
+def test_a_world_writable_ancestor_is_allowed_outside_production(tmp_path: Path) -> None:
+    """The chain policy is deployment policy, not a library invariant.
+
+    Enforcing it in every RegistryStore constructor put a machine-wide
+    filesystem rule inside a call that tests, five operator CLI commands and
+    the prober all make. On Linux pytest's tmp_path lives under /tmp, mode
+    1777, so the unconditional version refused roughly 113 call sites and CI
+    went red on both interpreters while the macOS run stayed green. Production
+    keeps the check; nothing else pays for it.
+    """
+    import os
+
+    shared = tmp_path / "worldwritable"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)
+    db = shared / "registry.sqlite"
+
+    store = RegistryStore(str(db))  # no production_mode: constructs fine
+    assert store.worker_token("5" + "Z" * 47) is None
+    # The credential-protecting part is unconditional: the file is still ours
+    # and still owner-only wherever it lives.
+    import stat as stat_module
+
+    assert stat_module.S_IMODE(os.stat(db).st_mode) == 0o600
+
+    with pytest.raises(PermissionError, match="not trustworthy"):
+        RegistryStore(str(db), production_mode=True)
