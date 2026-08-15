@@ -112,9 +112,14 @@ def _is_loopback_host(host: object) -> bool:
     if not isinstance(host, str) or not host:
         return False
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # IPv6 loopback is refused rather than accepted: the WSGI server used below
+    # is AF_INET only, so accepting ::1 would pass validation and then die at
+    # bind time with an address-family error, taking enrollment offline for a
+    # reason the operator was told nothing about.
+    return address.is_loopback and address.version == 4
 
 
 def _valid_worker_token(token: object) -> bool:
@@ -583,6 +588,7 @@ class RegistryStore:
             raise ValueError("clock must be callable")
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lifecycle_lock = threading.RLock()
+        self._precreate_database()
         self._init()
         self._restrict_database_mode()
 
@@ -601,6 +607,24 @@ class RegistryStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def _precreate_database(self) -> None:
+        """Create the database file owner-only before SQLite opens it.
+
+        SQLite creates a new database 0644 regardless of umask, so narrowing it
+        afterwards leaves a window on a fresh install where a local account can
+        open a handle that keeps reading every token written later. Creating it
+        ourselves first closes that window; on an existing database this is a
+        no-op.
+        """
+        if self.path == ":memory:" or self.path.startswith("file::memory:"):
+            return
+        try:
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
+        except OSError:
+            # Anything wrong with the path surfaces from sqlite3.connect with a
+            # better message than we could produce here.
+            return
 
     def _restrict_database_mode(self) -> None:
         """Make the database owner-only.
@@ -623,6 +647,16 @@ class RegistryStore:
                 os.chmod(self.path + suffix, 0o600)
             except FileNotFoundError:
                 continue
+            except PermissionError as exc:
+                # Refusing is deliberate. The alternative is running with worker
+                # bearer tokens in a file this process cannot secure, and no
+                # signal that anything is wrong.
+                raise PermissionError(
+                    f"cannot restrict {self.path + suffix} to owner-only: it is "
+                    "owned by another user. The registry holds worker bearer "
+                    "tokens, so every process that opens it must run as that "
+                    "owner."
+                ) from exc
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -713,6 +747,16 @@ class RegistryStore:
                 )
                 """
             )
+            nonce_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(enroll_nonces)")
+            }
+            # The endpoint this nonce was actually spent on. A retransmission is
+            # only a retransmission of the request that created the nonce, so the
+            # comparison must be against this and not against whatever endpoint
+            # the worker is enrolled at now. NULL on rows written before this
+            # column, which are therefore never treated as retransmissions.
+            if "endpoint_url" not in nonce_columns:
+                conn.execute("ALTER TABLE enroll_nonces ADD COLUMN endpoint_url TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hotkey_enroll_attempts (
@@ -1688,10 +1732,10 @@ class RegistryStore:
                 try:
                     conn.execute(
                         """
-                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso)
-                        VALUES (?, ?, ?)
+                        INSERT INTO enroll_nonces(hotkey, nonce, used_at_iso, endpoint_url)
+                        VALUES (?, ?, ?, ?)
                         """,
-                        (hotkey, nonce, ts),
+                        (hotkey, nonce, ts, endpoint_url),
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ValueError("enroll nonce already used") from exc
@@ -1914,10 +1958,8 @@ class RegistryStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT e.endpoint_url AS endpoint_url
-                FROM enroll_nonces AS n
-                JOIN enrollments AS e ON e.hotkey = n.hotkey
-                WHERE n.hotkey = ? AND n.nonce = ?
+                SELECT endpoint_url FROM enroll_nonces
+                WHERE hotkey = ? AND nonce = ?
                 """,
                 (hotkey, nonce),
             ).fetchone()

@@ -825,6 +825,9 @@ def _load_production_tokens(path: str) -> object:
 
 _LOGGER = logging.getLogger("cathedral.cli")
 
+# hotkey -> {(file digest, minted digest)} already reported.
+_WARNED_TOKEN_CONFLICTS: dict[str, set[tuple[str, str]]] = {}
+
 
 def resolve_worker_token(
     tokens: Mapping[str, str], registry: RegistryStore, hotkey: str
@@ -853,6 +856,19 @@ def resolve_worker_token(
     from_file = tokens.get(hotkey)
     minted = registry.worker_token(hotkey)
     if from_file is not None and minted is not None and from_file != minted:
+        # Warn once per distinct conflict. A legacy worker's first
+        # re-enrollment creates a mismatch that persists until an operator
+        # resolves it, and repeating the same line every epoch buries the
+        # alerts that still need reading. Keyed on the pair so a changed value
+        # on either side is reported again.
+        seen = _WARNED_TOKEN_CONFLICTS.setdefault(hotkey, set())
+        fingerprint = (
+            hashlib.sha256(from_file.encode()).hexdigest()[:16],
+            hashlib.sha256(minted.encode()).hexdigest()[:16],
+        )
+        if fingerprint in seen:
+            return from_file
+        seen.add(fingerprint)
         _LOGGER.warning(
             "worker %s has a token file entry that differs from the token minted "
             "at enrollment; sending the file value. If this worker was "

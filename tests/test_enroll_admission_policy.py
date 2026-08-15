@@ -1124,7 +1124,7 @@ def test_production_refuses_a_non_loopback_bind_at_launch(
     """
     import cathedral.enroll
 
-    for host in ("0.0.0.0", "::", "10.0.0.5"):
+    for host in ("0.0.0.0", "::", "::1", "10.0.0.5"):
         argv = [
             "cathedral-enroll",
             "--db", str(tmp_path / "registry.sqlite"),

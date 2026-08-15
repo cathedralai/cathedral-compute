@@ -824,8 +824,10 @@ def test_production_refuses_a_non_loopback_plaintext_bind(tmp_path: Path) -> Non
     from cathedral.enroll import _is_loopback_host
 
     assert _is_loopback_host("127.0.0.1") is True
-    assert _is_loopback_host("::1") is True
-    for host in ("0.0.0.0", "::", "8.8.8.8", "", None, "localhost"):
+    assert _is_loopback_host("127.0.0.5") is True
+    # ::1 is loopback but the server below is AF_INET only, so accepting it
+    # would pass validation and then fail at bind with enrollment offline.
+    for host in ("::1", "0.0.0.0", "::", "8.8.8.8", "", None, "localhost"):
         assert _is_loopback_host(host) is False, host
 
 
@@ -853,3 +855,113 @@ def test_the_registry_database_is_owner_only(tmp_path: Path) -> None:
         if sibling.exists():
             assert stat.S_IMODE(os.stat(sibling).st_mode) == 0o600, suffix
     assert store.worker_token("5" + "Z" * 47) is None
+
+
+def test_each_hotkey_gets_a_distinct_token(tmp_path: Path) -> None:
+    """Two miners must never share a credential.
+
+    Randomness of the generator and stability for one hotkey are both already
+    pinned, and neither catches persistence that stores one fixed valid token
+    for everyone. That mutation leaves every miner holding the bearer
+    credential every worker accepts.
+    """
+    second = Keypair.create_from_uri("//Bob", crypto_type=KeypairType.SR25519)
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(
+            tmp_path, {HOTKEY: COLDKEY, second.ss58_address: COLDKEY}
+        ),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+
+    status, first_body = _call(app, _signed_payload(nonce="40" * 16))
+    assert status == 200
+    status, second_body = _call(
+        app,
+        _signed_payload(
+            endpoint_url="https://8.8.4.4:8443",
+            keypair=second,
+            hotkey=second.ss58_address,
+            nonce="41" * 16,
+        ),
+    )
+    assert status == 200
+
+    assert first_body["worker_token"] != second_body["worker_token"]
+    assert app.store.worker_token(HOTKEY) == first_body["worker_token"]
+    assert app.store.worker_token(second.ss58_address) == second_body["worker_token"]
+
+
+def test_a_nonce_is_only_a_retransmission_for_its_own_endpoint(tmp_path: Path) -> None:
+    """The nonce is spent on one endpoint, and only that one.
+
+    Comparing against the worker's CURRENT enrollment instead lets a miner
+    enrol N1 at E1, move to E2 with N2, then sign N1 at E2. That request was
+    never sent before, so treating it as a retransmission hands out an
+    uncharged trip through the registration and allowlist gates.
+    """
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    first = "https://8.8.8.8:8090"
+    second = "https://8.8.4.4:9443"
+
+    assert _call(app, _signed_payload(endpoint_url=first, nonce="50" * 16))[0] == 200
+    assert _call(app, _signed_payload(endpoint_url=second, nonce="51" * 16))[0] == 200
+
+    charged = _attempt_count(app.store, HOTKEY)
+    # N1 signed against the NEW endpoint. Never sent before, so it is charged.
+    status, _ = _call(app, _signed_payload(endpoint_url=second, nonce="50" * 16))
+    assert status == 400
+    assert _attempt_count(app.store, HOTKEY) == charged + 1, (
+        "a nonce replayed against an endpoint it was never spent on is not a "
+        "retransmission and must be charged"
+    )
+
+    # A true retransmission of N1 at its own endpoint is still uncharged.
+    charged = _attempt_count(app.store, HOTKEY)
+    status, _ = _call(app, _signed_payload(endpoint_url=first, nonce="50" * 16))
+    assert status == 400
+    assert _attempt_count(app.store, HOTKEY) == charged
+
+
+def test_the_runtime_is_wired_to_the_minted_token(tmp_path: Path) -> None:
+    """The composition, not just the function.
+
+    resolve_worker_token being correct proves nothing if _build_runtime hands
+    the runtime `tokens.get` instead. That mutation leaves every test here
+    green while a freshly enrolled worker with no file entry gets missing_auth
+    for the whole epoch, which is the exact failure this change exists to end.
+    """
+    import argparse
+
+    from cathedral.cli import _build_runtime
+
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    registry_db = tmp_path / "registry.sqlite"
+    status, body = _call(app, _signed_payload(nonce="60" * 16))
+    assert status == 200
+    minted = body["worker_token"]
+
+    args = argparse.Namespace(
+        registry_db=str(registry_db),
+        ledger_db=str(tmp_path / "ledger.sqlite"),
+        tokens_file=None,  # no operator file at all: the new-miner case
+        measurements_file=None,
+        policy_registry=None,
+        production_mode=False,
+        development=True,
+    )
+    runtime, _ledger, tokens = _build_runtime(args)
+
+    assert tokens == {}, "no token file was configured"
+    assert runtime.token_provider(HOTKEY) == minted, (
+        "the runtime must read the token minted at enrollment"
+    )
+    assert runtime.token_provider("5" + "Z" * 47) is None
