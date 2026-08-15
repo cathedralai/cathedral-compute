@@ -630,24 +630,30 @@ class RegistryStore:
         # a foreign-owned file at this path is never intentional and the file
         # now holds credentials.
         # SQLite opens by path, so a check that is not bound to the file it
-        # actually opens is advisory. The parent directory is what makes the
-        # binding real: if only trusted users can write there, nothing can swap
-        # the path between this check and the open.
-        parent = os.path.dirname(os.path.abspath(self.path)) or "."
-        try:
-            parent_stat = os.stat(parent)
-        except OSError as exc:
-            raise ValueError(
-                f"registry database directory {parent!r} is unusable"
-            ) from exc
-        writable_by_others = parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        sticky = parent_stat.st_mode & stat.S_ISVTX
-        if writable_by_others and not sticky:
+        # actually opens is advisory. What makes it real is the whole ancestor
+        # chain being untamperable, which this repo already has a policy for:
+        # ownership, mode, ACLs and symlink components, every component, not
+        # just the immediate parent. Hand-rolling a subset of that got the
+        # sticky-bit case wrong (see below) and ignored parent ownership
+        # entirely, so an attacker-owned 0700 directory passed.
+        from cathedral.privileged_paths import UntrustedPath, inspect_creatable_file
+
+        # Root and the running user are the only uids that may own the database
+        # or anything above it. There is deliberately no sticky-bit exemption:
+        # in a 01777 directory an untrusted account can PRE-CREATE
+        # registry.sqlite-journal and keep the descriptor, and SQLite reuses
+        # that inode, so a sidecar leaks minted tokens even though sticky stops
+        # the attacker deleting a file they do not own.
+        verdict = inspect_creatable_file(
+            self.path, trusted_uids=frozenset({0, os.getuid()})
+        )
+        if not verdict.trusted:
             raise PermissionError(
-                f"registry database directory {parent!r} is writable by other "
-                "users, so the database path cannot be trusted. The registry "
-                "holds worker bearer tokens; put it in a directory only its "
-                "owner can write."
+                f"registry database path {self.path!r} is not trustworthy: "
+                + "; ".join(verdict.violations)
+                + ". It holds worker bearer tokens, so it and every directory "
+                "above it must be owned by root or this service and writable by "
+                "no one else."
             )
 
         try:
@@ -660,20 +666,15 @@ class RegistryStore:
             ) from exc
 
         if existing is not None:
-            if stat.S_ISLNK(existing.st_mode):
-                raise ValueError(
-                    f"registry database path {self.path!r} is a symlink; the "
-                    "registry holds worker bearer tokens and must be a regular "
-                    "file the service owns"
-                )
             if not stat.S_ISREG(existing.st_mode):
                 raise ValueError(
                     f"registry database path {self.path!r} is not a regular file"
                 )
-            # Root is checked too. A root service that initialises a database an
-            # untrusted user pre-created leaves that user as the owner, and
-            # chmod 0600 then preserves their read and write access to every
-            # minted token.
+            # Stricter than the chain policy on purpose. That policy trusts root
+            # and this user; here the file must be OURS. A root service that
+            # initialises a database an untrusted user pre-created leaves that
+            # user as the owner, and chmod 0600 then locks read and write to
+            # them rather than to root.
             if existing.st_uid != os.getuid():
                 raise PermissionError(
                     f"registry database {self.path!r} is owned by uid "
@@ -683,23 +684,40 @@ class RegistryStore:
                 )
             return
 
-        # Create it ourselves, exclusively, so we know the inode is ours.
-        # Failing closed here is deliberate: the alternative is proceeding to
-        # open a path we could not secure.
-        try:
-            descriptor = os.open(
-                self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-            )
-        except FileExistsError:
-            # Lost a race with another starting process. Re-check rather than
-            # assume; the loser of the race must still validate what is there.
-            self._precreate_database()
-            return
-        except OSError as exc:
-            raise ValueError(
-                f"registry database {self.path!r} could not be created securely"
-            ) from exc
-        os.close(descriptor)
+        # Create it ourselves, exclusively, so the inode is known to be ours.
+        # Bounded: an attacker who can win this race repeatedly must already
+        # have write access to a directory the chain check just refused, but a
+        # recursive retry would turn that into a RecursionError at startup
+        # rather than a clean refusal.
+        for _ in range(8):
+            try:
+                descriptor = os.open(
+                    self.path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    landed = os.lstat(self.path)
+                except FileNotFoundError:
+                    continue  # gone again; try to create it once more
+                if stat.S_ISREG(landed.st_mode) and landed.st_uid == os.getuid():
+                    return  # someone equivalent won the race; validated above
+                raise PermissionError(
+                    f"registry database {self.path!r} appeared during creation "
+                    "and is not a regular file owned by this process"
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"registry database {self.path!r} could not be created securely"
+                ) from exc
+            else:
+                os.close(descriptor)
+                return
+        raise PermissionError(
+            f"registry database {self.path!r} could not be created after "
+            "repeated races; refusing rather than retrying forever"
+        )
 
     def _restrict_database_mode(self) -> None:
         """Make the database owner-only.
@@ -2523,17 +2541,14 @@ class RegistryApp:
         # binding, profiles, and caps. It is loaded before anything is parsed
         # so an unavailable policy rejects uniformly rather than leaking which
         # request shapes the service would otherwise have accepted.
+        # The artifact itself is loaded further down, AFTER the replay check.
+        # Which signature form applies depends on whether a policy is
+        # CONFIGURED, not on its contents, so reading and verifying the signed
+        # artifact for a request that turns out to be an exact replay is pure
+        # cost an attacker can spend on our behalf from any number of
+        # addresses. The load still fails closed for every non-replay.
         policy = None
-        if self.admission_policy is not None:
-            policy = self.admission_policy.load()
-            if policy is None:
-                return self._reject(
-                    start_response,
-                    403,
-                    "admission policy unavailable",
-                    hotkey=None,
-                    reason="policy_unavailable",
-                )
+        policy_configured = self.admission_policy is not None
 
         hotkey = validate_hotkey(payload.get("hotkey"))
         # Production mode requires a public IP literal endpoint: see
@@ -2550,7 +2565,7 @@ class RegistryApp:
 
         claimed_coldkey: str | None = None
         requested_profile_id: str | None = None
-        if policy is None:
+        if not policy_configured:
             signed_bytes = canonical_enroll_payload(
                 hotkey, endpoint_url, nonce, timestamp
             )
@@ -2585,17 +2600,6 @@ class RegistryApp:
             verify_enroll_signature(
                 hotkey, signed_bytes, payload.get("signature_b64")
             )
-            # The signature proves the miner meant *this* subnet. The policy
-            # verifier has already proven the artifact means this subnet. A
-            # mismatch here is a request aimed somewhere else.
-            if network != policy.network or netuid != policy.netuid:
-                return self._reject(
-                    start_response,
-                    403,
-                    "request is bound to a different network or netuid",
-                    hotkey=hotkey,
-                    reason="network_mismatch",
-                )
 
         # Per-hotkey durable enrollment rate limit. Backed by SQLite so the
         # bound survives restarts and is consistent across app instances that
@@ -2632,6 +2636,28 @@ class RegistryApp:
             return self._json(
                 start_response, 400, {"error": "enroll nonce already used"}
             )
+
+        if policy_configured:
+            policy = self.admission_policy.load()
+            if policy is None:
+                return self._reject(
+                    start_response,
+                    403,
+                    "admission policy unavailable",
+                    hotkey=None,
+                    reason="policy_unavailable",
+                )
+            # The signature proves the miner meant *this* subnet. The policy
+            # verifier has already proven the artifact means this subnet. A
+            # mismatch here is a request aimed somewhere else.
+            if network != policy.network or netuid != policy.netuid:
+                return self._reject(
+                    start_response,
+                    403,
+                    "request is bound to a different network or netuid",
+                    hotkey=hotkey,
+                    reason="network_mismatch",
+                )
 
         if not self.store.check_and_record_hotkey_attempt(
             hotkey,

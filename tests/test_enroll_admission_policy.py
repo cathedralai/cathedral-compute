@@ -1181,3 +1181,39 @@ def test_production_still_launches_on_loopback(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
     with pytest.raises(RuntimeError, match="server reached"):
         cathedral.enroll.main()
+
+
+def test_an_exact_replay_does_not_reread_the_signed_policy(tmp_path: Path, monkeypatch):
+    """A replay must not make us read and verify the admission policy.
+
+    Loading the artifact is a file read, an Ed25519 verify and a canonical
+    re-serialisation. Doing that for a request we are about to refuse for nonce
+    reuse hands a miner unbounded work from any number of source addresses for
+    the whole signature lifetime. Which signature form applies depends on
+    whether a policy is CONFIGURED, not on its contents, so the load belongs
+    below the replay check.
+    """
+    app, _store, _keys = build_app(tmp_path)
+
+    loads = []
+    real_load = app.admission_policy.load
+
+    def counting_load(*args, **kwargs):
+        loads.append(1)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(app.admission_policy, "load", counting_load)
+
+    payload = v2_payload()
+    assert call(app, payload)[0] == 200
+    after_first = len(loads)
+    assert after_first >= 1, "the accepted enrollment must load the policy"
+
+    for _ in range(5):
+        status, body = call(app, payload)
+        assert status == 400
+        assert "nonce already used" in body["error"]
+
+    assert len(loads) == after_first, (
+        "an exact replay must not reread or reverify the signed admission policy"
+    )

@@ -1088,11 +1088,17 @@ def test_a_database_owned_by_another_user_fails_closed(tmp_path: Path) -> None:
 def test_root_does_not_get_an_ownership_exemption(tmp_path: Path) -> None:
     """A root service must not adopt a database an untrusted user pre-created.
 
-    Initialising it leaves that user as the owner, and chmod 0600 then
-    preserves their read and write access to every minted token.
+    Initialising it leaves that user as the owner, and chmod 0600 then locks
+    read and write to them rather than to root. The ancestor-chain policy is
+    stubbed to trusted here so the assertion isolates the leaf ownership check
+    rather than passing for the unrelated reason that tmp_path is not
+    root-owned.
     """
     import os
     import stat as stat_module
+
+    import cathedral.enroll as enroll_module
+    from cathedral.privileged_paths import PathVerdict
 
     db = tmp_path / "planted.sqlite"
     db.write_bytes(b"")
@@ -1107,8 +1113,19 @@ def test_root_does_not_get_an_ownership_exemption(tmp_path: Path) -> None:
             return _AttackerOwned()
         return real_lstat(path, *args, **kwargs)
 
-    with mock.patch.object(os, "lstat", lying_lstat):
-        with mock.patch.object(os, "getuid", lambda: 0):
+    def trusted_chain(target, **kwargs):  # type: ignore[no-untyped-def]
+        return PathVerdict(target=str(target), violations=())
+
+    with mock.patch.object(enroll_module, "os") as patched_os:
+        patched_os.lstat = lying_lstat
+        patched_os.getuid = lambda: 0
+        patched_os.path = os.path
+        patched_os.chmod = os.chmod
+        patched_os.open = os.open
+        patched_os.close = os.close
+        with mock.patch(
+            "cathedral.privileged_paths.inspect_creatable_file", trusted_chain
+        ):
             with pytest.raises(PermissionError, match="must run as its owner"):
                 RegistryStore(str(db))
 
@@ -1123,9 +1140,29 @@ def test_a_world_writable_directory_is_refused(tmp_path: Path) -> None:
 
     exposed = tmp_path / "exposed"
     exposed.mkdir()
-    os.chmod(exposed, 0o777)  # no sticky bit
-    with pytest.raises(PermissionError, match="writable by other users"):
+    os.chmod(exposed, 0o777)
+    with pytest.raises(PermissionError) as raised:
         RegistryStore(str(exposed / "registry.sqlite"))
+    assert "group- or world-writable" in str(raised.value), str(raised.value)
+
+
+def test_a_sticky_world_writable_directory_is_also_refused(tmp_path: Path) -> None:
+    """The sticky bit is not an exemption, and believing it was is the bug.
+
+    Sticky stops another user deleting or renaming an inode they do not own,
+    which is why a /tmp-shaped directory looks safe. It does not stop them
+    CREATING one. An untrusted account pre-creates registry.sqlite-journal and
+    keeps the descriptor; SQLite reuses that inode, so a sidecar leaks minted
+    tokens even though the main database is 0600 and unswappable.
+    """
+    import os
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)  # sticky, world-writable: the /tmp shape
+    with pytest.raises(PermissionError) as raised:
+        RegistryStore(str(shared / "registry.sqlite"))
+    assert "group- or world-writable" in str(raised.value), str(raised.value)
 
 
 def test_a_symlinked_database_path_is_refused(tmp_path: Path) -> None:
@@ -1141,9 +1178,44 @@ def test_a_symlinked_database_path_is_refused(tmp_path: Path) -> None:
     link = tmp_path / "link.sqlite"
     link.symlink_to(real)
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(PermissionError) as raised:
         RegistryStore(str(link))
-    # Match a phrase that cannot appear in the path. pytest names tmp_path
+    # Assert a phrase that cannot appear in the path. pytest names tmp_path
     # after the test, so a bare "symlink" pattern matches this test's own
-    # directory name and passes even when the symlink branch is gone.
+    # directory name and passes even when the check is gone.
     assert "is a symlink" in str(raised.value), str(raised.value)
+
+
+def test_a_lost_creation_race_fails_closed_instead_of_recursing(tmp_path: Path) -> None:
+    """The retry must terminate.
+
+    The first version recursed on FileExistsError. An attacker who can create
+    and unlink the leaf between the check and the open drives that into a
+    RecursionError at startup, which is a crash rather than a refusal. The
+    retry is bounded and ends in an explicit refusal.
+    """
+    import os
+
+    db = tmp_path / "raced.sqlite"
+    real_open = os.open
+    real_lstat = os.lstat
+    attempts: list[int] = []
+
+    def always_taken(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(db) and flags & os.O_CREAT:
+            attempts.append(1)
+            raise FileExistsError(17, "File exists")
+        return real_open(path, flags, *args, **kwargs)
+
+    def always_vanished(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(db):
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_lstat(path, *args, **kwargs)
+
+    with mock.patch.object(os, "open", always_taken):
+        with mock.patch.object(os, "lstat", always_vanished):
+            with pytest.raises(PermissionError) as raised:
+                RegistryStore(str(db))
+
+    assert "repeated races" in str(raised.value), str(raised.value)
+    assert 1 < len(attempts) <= 16, f"expected a bounded number of retries, got {len(attempts)}"
