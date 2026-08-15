@@ -21,6 +21,8 @@ Covers:
 from __future__ import annotations
 
 import base64
+import contextlib
+from unittest import mock
 import io
 import json
 import sqlite3
@@ -905,6 +907,25 @@ def test_a_retiring_worker_cannot_lift_its_retirement_by_re_enrolling(tmp_path: 
 # 8b. Production launch arguments
 # ---------------------------------------------------------------------------
 
+
+@contextlib.contextmanager
+def _trusted_registry_path():
+    """Neutralise the production ancestor-chain check for launch tests.
+
+    These tests exercise argument gating, not filesystem policy, and the chain
+    policy has its own tests. Without this they fail wherever the temp
+    directory is world-writable, which is every Linux CI runner, while passing
+    on macOS where tmp_path sits under root-owned /var/folders.
+    """
+    from cathedral.privileged_paths import PathVerdict
+
+    def trusted(target, **kwargs):
+        return PathVerdict(target=str(target), violations=())
+
+    with mock.patch("cathedral.privileged_paths.inspect_creatable_file", trusted):
+        yield
+
+
 def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monkeypatch):
     """The documented --admission-policy production launch must not demand
     --enroll-allowlist-digest: that artifact is never loaded on this path.
@@ -942,8 +963,9 @@ def test_production_policy_launch_needs_no_allowlist_digest(tmp_path: Path, monk
 
     monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
 
-    with pytest.raises(RuntimeError, match="server reached"):
-        cathedral.enroll.main()
+    with _trusted_registry_path():
+        with pytest.raises(RuntimeError, match="server reached"):
+            cathedral.enroll.main()
 
 
 def test_production_allowlist_launch_still_requires_the_artifact_digest(
@@ -1179,8 +1201,9 @@ def test_production_still_launches_on_loopback(tmp_path: Path, monkeypatch):
         raise RuntimeError("server reached")
 
     monkeypatch.setattr(cathedral.enroll, "make_server", _raise_reached)
-    with pytest.raises(RuntimeError, match="server reached"):
-        cathedral.enroll.main()
+    with _trusted_registry_path():
+        with pytest.raises(RuntimeError, match="server reached"):
+            cathedral.enroll.main()
 
 
 def test_an_exact_replay_does_not_reread_the_signed_policy(tmp_path: Path, monkeypatch):
