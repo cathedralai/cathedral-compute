@@ -21,6 +21,7 @@ import pytest
 from substrateinterface import Keypair, KeypairType
 
 import cathedral.enroll as enroll_module
+import cathedral.privileged_paths as privileged_paths
 from cathedral.cli import (
     build_parser,
     cmd_enroll_backup,
@@ -665,10 +666,35 @@ def _schema_signature(path: Path) -> tuple[object, ...]:
     return objects, columns, user_version
 
 
-def test_backup_cli_reports_integrity(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    source = tmp_path / "registry.sqlite"
+@pytest.fixture
+def trusted_cli_maintenance_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Isolate CLI behavior from Linux's intentionally untrusted /tmp ancestry."""
+    trusted_root = tmp_path.resolve()
+
+    def trust_test_path(
+        target: str | os.PathLike[str],
+        *,
+        trusted_uids: frozenset[int] | set[int],
+        **_kwargs: object,
+    ) -> privileged_paths.PathVerdict:
+        candidate = Path(target).resolve(strict=False)
+        assert candidate == trusted_root or trusted_root in candidate.parents
+        assert frozenset(trusted_uids) == frozenset({0, os.getuid()})
+        return privileged_paths.PathVerdict(target=str(candidate), violations=())
+
+    monkeypatch.setattr(privileged_paths, "inspect_path", trust_test_path)
+    monkeypatch.setattr(privileged_paths, "inspect_creatable_file", trust_test_path)
+    return tmp_path
+
+
+def test_backup_cli_reports_integrity(
+    trusted_cli_maintenance_tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    source = trusted_cli_maintenance_tmp_path / "registry.sqlite"
     RegistryStore(str(source))
-    destination = tmp_path / "backup.sqlite"
+    destination = trusted_cli_maintenance_tmp_path / "backup.sqlite"
     args = argparse.Namespace(
         registry_db=str(source), out=str(destination), sqlite_busy_timeout_ms=1000
     )
@@ -679,10 +705,10 @@ def test_backup_cli_reports_integrity(tmp_path: Path, capsys: pytest.CaptureFixt
 
 
 def test_backup_cli_copies_exact_legacy_schema_before_migration(
-    tmp_path: Path, capsys: pytest.CaptureFixture
+    trusted_cli_maintenance_tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    source = tmp_path / "legacy.sqlite"
-    destination = tmp_path / "legacy.backup.sqlite"
+    source = trusted_cli_maintenance_tmp_path / "legacy.sqlite"
+    destination = trusted_cli_maintenance_tmp_path / "legacy.backup.sqlite"
     _legacy_registry(source)
     legacy_schema = _schema_signature(source)
     args = argparse.Namespace(
@@ -700,11 +726,11 @@ def test_backup_cli_copies_exact_legacy_schema_before_migration(
 
 
 def test_journal_mode_cli_backs_up_before_switching(
-    tmp_path: Path, capsys: pytest.CaptureFixture
+    trusted_cli_maintenance_tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    source = tmp_path / "registry.sqlite"
+    source = trusted_cli_maintenance_tmp_path / "registry.sqlite"
     RegistryStore(str(source))
-    backup = tmp_path / "pre-wal.sqlite"
+    backup = trusted_cli_maintenance_tmp_path / "pre-wal.sqlite"
     args = argparse.Namespace(
         registry_db=str(source),
         backup_to=str(backup),
@@ -719,10 +745,10 @@ def test_journal_mode_cli_backs_up_before_switching(
 
 
 def test_journal_mode_cli_changes_no_legacy_schema(
-    tmp_path: Path, capsys: pytest.CaptureFixture
+    trusted_cli_maintenance_tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    source = tmp_path / "legacy.sqlite"
-    backup = tmp_path / "legacy.pre-wal.sqlite"
+    source = trusted_cli_maintenance_tmp_path / "legacy.sqlite"
+    backup = trusted_cli_maintenance_tmp_path / "legacy.pre-wal.sqlite"
     _legacy_registry(source)
     legacy_schema = _schema_signature(source)
     args = argparse.Namespace(
