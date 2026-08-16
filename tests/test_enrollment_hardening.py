@@ -46,7 +46,8 @@ from cathedral.enroll import (
     JsonHotkeyRegistrationProvider,
     RegistryApp,
     RegistryStore,
-    canonical_enroll_payload,
+    canonical_allowlist_enroll_payload,
+    canonical_legacy_enroll_payload,
     now_iso,
     validate_endpoint_url,
 )
@@ -90,17 +91,25 @@ def _signed_payload(
     hotkey: str = HOTKEY,
     nonce: str = "aa" * 16,
     timestamp: str | None = None,
-) -> dict[str, str]:
+    domain_bound: bool = False,
+) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
-    message = canonical_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    message = (
+        canonical_allowlist_enroll_payload(hotkey, endpoint_url, nonce, ts)
+        if domain_bound
+        else canonical_legacy_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    )
     sig = b64encode(keypair.sign(message)).decode("ascii")
-    return {
+    payload: dict[str, object] = {
         "hotkey": hotkey,
         "endpoint_url": endpoint_url,
         "nonce": nonce,
         "timestamp": ts,
         "signature_b64": sig,
     }
+    if domain_bound:
+        payload.update(network="finney", netuid=39)
+    return payload
 
 
 def _call(
@@ -480,6 +489,33 @@ def test_rate_limiting_trusted_proxy_and_hotkey_bounds(tmp_path: Path) -> None:
     )
     assert s == 200
 
+    # Equivalent IPv6 spellings are one client and must share one bucket.
+    app_ipv6 = RegistryApp(
+        RegistryStore(f"{base}/tp-ipv6.sqlite"),
+        IpRateLimiter(limit=1, window_seconds=60),
+        trusted_proxy=True,
+        hotkey_enroll_limit=100,
+    )
+    s, _ = _call(
+        app_ipv6,
+        "POST",
+        "/v1/enroll",
+        _signed_payload(nonce="b3" * 16),
+        remote_addr="10.0.0.1",
+        forwarded_for="2001:0db8:0000:0000:0000:0000:0000:0001",
+    )
+    assert s == 200
+    s, body = _call(
+        app_ipv6,
+        "POST",
+        "/v1/enroll",
+        _signed_payload(nonce="b4" * 16),
+        remote_addr="10.0.0.1",
+        forwarded_for="2001:db8::1",
+    )
+    assert s == 429
+    assert body["error"] == "rate limit exceeded"
+
     # --- per-hotkey durable bound across app instances ---
     db_hk = f"{base}/hotkey.sqlite"
     app1 = RegistryApp(
@@ -775,7 +811,16 @@ def test_production_mode_file_provider_allows_registered(tmp_path: Path) -> None
         registration_provider=provider,
         coldkey_allowlist=_AllowAllColdkeys(),
     )
-    status, body = _call(app, "POST", "/v1/enroll", _signed_payload(nonce="e0" * 16, endpoint_url="https://8.8.8.8:8090"))
+    status, body = _call(
+        app,
+        "POST",
+        "/v1/enroll",
+        _signed_payload(
+            nonce="e0" * 16,
+            endpoint_url="https://8.8.8.8:8090",
+            domain_bound=True,
+        ),
+    )
     assert status == 200
     assert body["status"] == "enrolled"
     # The token is minted at enrollment and handed back here (#60 interim).

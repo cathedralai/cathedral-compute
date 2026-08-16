@@ -29,7 +29,7 @@ guest. A plain server cannot produce a valid channel claim.
 git clone https://github.com/cathedralai/cathedral-compute.git
 cd cathedral-compute
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .
+pip install -e '.[enrollment-miner]'
 ```
 
 That installs the `cathedral` operator CLI. Inside the TDX VM, terminate TLS in
@@ -160,7 +160,7 @@ cd cathedral-compute
 python3.11 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e '.[enrollment-miner]'
 ```
 
 For any mainnet deployment, replace the moving branch with the immutable tag
@@ -219,9 +219,9 @@ weight, or earnings.
 ## 4. Where the worker credential comes from
 
 **Enrollment mints it. You do not create one.** A successful `POST /v1/enroll`
-returns `worker_token` in its response body, and the validator already holds
-the same value, so nothing is exchanged out of band and no operator transcribes
-a secret.
+returns `worker_token` to the local CLI, and the validator already holds the
+same value. `cathedral enroll submit` requires `--token-out` and writes the
+token there; stdout never includes the token.
 
 That changes the order of the remaining steps. Enrollment is step 7 and the
 protected worker in step 6 refuses to start without the credential, so on a
@@ -230,18 +230,14 @@ the order they were written, not the order you run them:
 
 ```
 2 check the machine -> 3 register -> 5 prove evidence locally
-  -> 7 enrol, save the returned worker_token -> 6 start the protected worker
+  -> 7 enrol, save with --token-out -> 6 start the protected worker
 ```
 
-Store what enrollment returned with mode `0600`:
+Prepare its owner-only directory before enrollment. The submit command creates
+the token file with mode `0600` and refuses to overwrite any existing path:
 
 ```bash
 install -d -m 700 "$HOME/.config/cathedral"
-umask 077
-# paste the worker_token value from the enrollment response
-cat > "$HOME/.config/cathedral/worker-token"
-chmod 600 "$HOME/.config/cathedral/worker-token"
-export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 ```
 
 The token is minted once and is preserved across re-enrollment, deliberately:
@@ -377,17 +373,59 @@ channel claim.
 Run the accepted command under a restricted supervisor such as systemd. Do not
 leave a long-lived worker attached to an ordinary SSH session.
 
-## 7. Complete private enrollment
+## 7. Submit enrollment and save the minted token
 
-Through the agreed private channel, provide only the accepted enrollment
-fields:
+Ask the operator which admission artifact is active. For a registry using the
+signed coldkey allowlist, sign and submit from the machine that holds your local
+wallet:
 
-```text
-network:  mainnet SN39 or testnet SN292
-hotkey:   <registered public SS58 address>
-endpoint: https://<accepted worker endpoint>
-token:    <unique worker bearer token>
+```bash
+cathedral enroll submit \
+  --registry-url https://<registry-origin> \
+  --endpoint-url https://<public-ip>:<port> \
+  --wallet-name <wallet-name> \
+  --hotkey-name <hotkey-name> \
+  --network finney \
+  --netuid 39 \
+  --token-out "$HOME/.config/cathedral/worker-token"
 ```
+
+Then load the saved token inside the measured worker environment before
+starting the protected worker:
+
+```bash
+export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
+```
+
+The command reads the hotkey locally. It never accepts the seed as a flag or
+environment variable. The request signature is bound to the Cathedral
+enrollment protocol, network, and netuid. Production endpoints require HTTPS,
+a canonical public IP literal, and an explicit port.
+
+The allowlist-v1 signature covers this exact document, serialized as compact
+JSON with sorted keys and no whitespace:
+
+<!-- enroll-preimage-example -->
+```json
+{
+  "domain": "cathedral-enroll-v1",
+  "endpoint_url": "https://34.61.154.15:8443",
+  "hotkey": "5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK",
+  "netuid": 39,
+  "network": "finney",
+  "nonce": "9f2c41b8e7a05d3641f8b2ce90a7d5138c6e4b02af9317d5e64c8b0a72d1f3e6",
+  "timestamp": "2026-07-26T21:00:00Z"
+}
+```
+
+The request body carries the same public fields and `signature_b64`. The
+domain field is part of the signed preimage, not a separate body field.
+
+The command requires `--token-out` before it loads your hotkey or contacts the
+registry. It reports success without printing the credential and creates the
+owner-only file named by `--token-out`. A failed request creates no token file,
+and an existing file stops the command instead of being replaced. Enrollment
+mints the token. Do not send it to the operator.
 
 If the token appears in a screenshot, shared shell history, public message or
 unprotected log, tell the operator. On a minted deployment you cannot rotate it
@@ -422,7 +460,8 @@ and netuid, the profile you are requesting, and an expiry, all inside the
 signature, and it answers `{"status": "pending"}` rather than
 `{"status": "enrolled"}` — because enrollment is permission to be tested,
 not admission. A v1 request cannot enroll against a policy-gated registry.
-Ask the operator which artifact is in force before building your client.
+The `cathedral enroll submit` command above emits the domain-bound allowlist-v1
+shape. Use the documented v2 request for a policy-gated registry.
 
 ## 8. Know what success means
 

@@ -20,8 +20,10 @@ Covers:
 
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
+import hashlib
 from unittest import mock
 import io
 import json
@@ -41,6 +43,7 @@ from cathedral.admission_policy import (
     sign_admission_policy,
 )
 from cathedral.enroll import (
+    REGISTRATION_SNAPSHOT_SCHEMA,
     JsonHotkeyRegistrationProvider,
     RegistryApp,
     RegistryStore,
@@ -119,7 +122,19 @@ def policy_bytes(
 
 def snapshot_file(tmp_path: Path, mapping: dict[str, str] | list[str]) -> str:
     path = tmp_path / "registered.json"
-    path.write_text(json.dumps({"hotkeys": mapping}))
+    document: dict[str, object] = {"hotkeys": mapping}
+    if isinstance(mapping, dict):
+        document.update(
+            {
+                "schema": REGISTRATION_SNAPSHOT_SCHEMA,
+                "network": NETWORK,
+                "netuid": NETUID,
+                "block": 9_000_000,
+                "block_is_finalized": True,
+                "generated_at": now_iso(),
+            }
+        )
+    path.write_text(json.dumps(document))
     return str(path)
 
 
@@ -658,16 +673,16 @@ def test_a_failed_worker_does_not_hold_the_total_cap(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    "variant",
+    ("variant", "expected_status", "expected_error"),
     [
-        "https://8.8.8.8:8443/",
-        "HTTPS://8.8.8.8:8443",
-        "https://8.8.8.8.:8443",
-        "https://8.8.8.8:8443",
+        ("https://8.8.8.8:8443/", 400, "endpoint_url must not include a path"),
+        ("HTTPS://8.8.8.8:8443", 403, "endpoint is already enrolled by another worker"),
+        ("https://8.8.8.8.:8443", 400, "endpoint_url host must be a canonical IP literal"),
+        ("https://8.8.8.8:8443", 403, "endpoint is already enrolled by another worker"),
     ],
 )
 def test_a_cosmetic_endpoint_variant_cannot_collide_with_a_victim(
-    tmp_path: Path, variant: str
+    tmp_path: Path, variant: str, expected_status: int, expected_error: str
 ):
     """Raw string comparison here would zero the victim, not stop the attacker.
 
@@ -692,8 +707,8 @@ def test_a_cosmetic_endpoint_variant_cannot_collide_with_a_victim(
             nonce="41" * 16,
         ),
     )
-    assert status == 403
-    assert body["error"] == "endpoint is already enrolled by another worker"
+    assert status == expected_status
+    assert body["error"] == expected_error
     assert row(store, STRANGER_HOTKEY) is None
 
 
@@ -707,8 +722,8 @@ def test_the_per_coldkey_cap_counts_machines_not_spellings(tmp_path: Path):
         app,
         v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT + "/", nonce="42" * 16),
     )
-    assert status == 403
-    assert body["error"] == "endpoint is already enrolled by another worker"
+    assert status == 400
+    assert body["error"] == "endpoint_url must not include a path"
 
 
 def test_two_hotkeys_cannot_claim_one_endpoint(tmp_path: Path):
@@ -994,6 +1009,40 @@ def test_production_allowlist_launch_still_requires_the_artifact_digest(
 # 9. Reconcile is reachable under a policy
 # ---------------------------------------------------------------------------
 
+
+def _policy_reconcile_args(
+    tmp_path: Path,
+    store: RegistryStore,
+    policy_path: Path,
+    *,
+    remove: bool,
+) -> argparse.Namespace:
+    keys = tmp_path / "policy-keys.json"
+    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
+    return argparse.Namespace(
+        registry_db=str(store.path),
+        allowlist=None,
+        admission_policy=str(policy_path),
+        admission_policy_keys=str(keys),
+        admission_policy_keys_digest=(
+            "sha256:" + hashlib.sha256(keys.read_bytes()).hexdigest()
+            if remove
+            else None
+        ),
+        admission_policy_digest=(
+            "sha256:" + hashlib.sha256(policy_path.read_bytes()).hexdigest()
+            if remove
+            else None
+        ),
+        network=NETWORK,
+        netuid=NETUID,
+        allowlist_max_age_seconds=86400,
+        registered_hotkeys_file=str(tmp_path / "registered.json"),
+        registration_max_age_seconds=3600,
+        remove=remove,
+    )
+
+
 def test_reconcile_runs_under_an_admission_policy(tmp_path: Path, capsys):
     """The documented way to free capacity must be runnable.
 
@@ -1001,29 +1050,12 @@ def test_reconcile_runs_under_an_admission_policy(tmp_path: Path, capsys):
     allowlist arguments were required, so a policy-configured operator could
     not run the one command that frees a slot.
     """
-    import argparse
-
     from cathedral.cli import cmd_enroll_reconcile
 
     app, store, policy_path = build_app(tmp_path, policy=policy_bytes(coldkeys=[COLDKEY]))
     assert call(app, v2_payload())[0] == 200
 
-    keys = tmp_path / "policy-keys.json"
-    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
-
-    args = argparse.Namespace(
-        registry_db=str(store.path),
-        allowlist=None,
-        admission_policy=str(policy_path),
-        admission_policy_keys=str(keys),
-        admission_policy_keys_digest=None,
-        network=NETWORK,
-        netuid=NETUID,
-        allowlist_max_age_seconds=86400,
-        registered_hotkeys_file=str(tmp_path / "registered.json"),
-        registration_max_age_seconds=3600,
-        remove=False,
-    )
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=False)
     assert cmd_enroll_reconcile(args) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["admission_mode"] == "selected"
@@ -1031,10 +1063,72 @@ def test_reconcile_runs_under_an_admission_policy(tmp_path: Path, capsys):
     assert report["flagged"] == []  # the approved coldkey is not flagged
 
 
+@pytest.mark.parametrize(
+    "missing",
+    ["admission_policy_keys_digest", "admission_policy_digest"],
+)
+def test_policy_reconcile_remove_requires_both_pins_without_mutation(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    from cathedral.cli import cmd_enroll_reconcile
+
+    _app, store, policy_path = build_app(tmp_path)
+    store.enroll(HOTKEY, ENDPOINT)
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=True)
+    setattr(args, missing, None)
+
+    with pytest.raises(ValueError, match=f"--remove requires --{missing.replace('_', '-')}"):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("attribute", "message"),
+    [
+        ("admission_policy_keys_digest", "key digest does not match"),
+        ("admission_policy_digest", "policy digest does not match"),
+    ],
+)
+def test_policy_reconcile_remove_rejects_mismatched_pins(
+    tmp_path: Path,
+    attribute: str,
+    message: str,
+) -> None:
+    from cathedral.cli import cmd_enroll_reconcile
+
+    _app, store, policy_path = build_app(tmp_path)
+    store.enroll(HOTKEY, ENDPOINT)
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=True)
+    setattr(args, attribute, "sha256:" + "0" * 64)
+
+    with pytest.raises(ValueError, match=message):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
+
+
+def test_policy_reconcile_remove_with_exact_pins_retires_only_rejected_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    from cathedral.cli import cmd_enroll_reconcile
+
+    _app, store, policy_path = build_app(
+        tmp_path,
+        registered={HOTKEY: COLDKEY, HOTKEY_TWO: OTHER_COLDKEY},
+    )
+    store.enroll(HOTKEY, ENDPOINT)
+    store.enroll(HOTKEY_TWO, ENDPOINT_TWO)
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=True)
+
+    assert cmd_enroll_reconcile(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == [HOTKEY_TWO]
+    assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(HOTKEY_TWO).state is WorkerLifecycleState.RETIRED
+
+
 def test_open_mode_reconcile_reclaims_only_deregistered_workers(tmp_path: Path, capsys):
     """Applying coldkey approval in open mode would retire the whole board."""
-    import argparse
-
     from cathedral.cli import cmd_enroll_reconcile
 
     app, store, policy_path = build_app(
@@ -1046,23 +1140,9 @@ def test_open_mode_reconcile_reclaims_only_deregistered_workers(tmp_path: Path, 
     assert call(app, v2_payload(keypair=MINER_TWO, endpoint_url=ENDPOINT_TWO, nonce="a0" * 16))[0] == 200
 
     # One of the two leaves the subnet.
-    (tmp_path / "registered.json").write_text(json.dumps({"hotkeys": {HOTKEY: COLDKEY}}))
+    snapshot_file(tmp_path, {HOTKEY: COLDKEY})
 
-    keys = tmp_path / "policy-keys.json"
-    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
-    args = argparse.Namespace(
-        registry_db=str(store.path),
-        allowlist=None,
-        admission_policy=str(policy_path),
-        admission_policy_keys=str(keys),
-        admission_policy_keys_digest=None,
-        network=NETWORK,
-        netuid=NETUID,
-        allowlist_max_age_seconds=86400,
-        registered_hotkeys_file=str(tmp_path / "registered.json"),
-        registration_max_age_seconds=3600,
-        remove=False,
-    )
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=False)
     assert cmd_enroll_reconcile(args) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["admission_mode"] == "all_registered"
@@ -1074,8 +1154,6 @@ def test_open_mode_reconcile_aborts_on_empty_snapshot(tmp_path: Path):
     """Finding: a torn or failed rotation write of the registration
     snapshot must abort reconcile loudly in open mode too, not flag and
     (with --remove) retire every enrolled hotkey as not_registered."""
-    import argparse
-
     from cathedral.cli import cmd_enroll_reconcile
 
     app, store, policy_path = build_app(
@@ -1089,21 +1167,7 @@ def test_open_mode_reconcile_aborts_on_empty_snapshot(tmp_path: Path):
     # Torn rotation write: zero bytes, fresh mtime.
     (tmp_path / "registered.json").write_bytes(b"")
 
-    keys = tmp_path / "policy-keys.json"
-    keys.write_text(json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}))
-    args = argparse.Namespace(
-        registry_db=str(store.path),
-        allowlist=None,
-        admission_policy=str(policy_path),
-        admission_policy_keys=str(keys),
-        admission_policy_keys_digest=None,
-        network=NETWORK,
-        netuid=NETUID,
-        allowlist_max_age_seconds=86400,
-        registered_hotkeys_file=str(tmp_path / "registered.json"),
-        registration_max_age_seconds=3600,
-        remove=True,
-    )
+    args = _policy_reconcile_args(tmp_path, store, policy_path, remove=True)
     with pytest.raises(ValueError, match="registration snapshot"):
         cmd_enroll_reconcile(args)
     assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.PENDING
@@ -1111,8 +1175,6 @@ def test_open_mode_reconcile_aborts_on_empty_snapshot(tmp_path: Path):
 
 
 def test_reconcile_refuses_both_or_neither_artifact(tmp_path: Path):
-    import argparse
-
     from cathedral.cli import cmd_enroll_reconcile
 
     _app, store, policy_path = build_app(tmp_path)

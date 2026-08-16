@@ -29,9 +29,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import ssl
 import stat
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -57,7 +61,21 @@ from cathedral.customer_receipt import (
     parse_customer_receipt_trusted_keys_json,
     verify_customer_receipt,
 )
-from cathedral.enroll import JsonHotkeyRegistrationProvider, RegistryStore
+from cathedral.enroll import (
+    DEFAULT_ENROLL_NETUID,
+    DEFAULT_ENROLL_NETWORK,
+    MAX_BODY,
+    JsonHotkeyRegistrationProvider,
+    RegistryStore,
+    backup_sqlite_database,
+    canonical_enroll_payload,
+    now_iso,
+    set_sqlite_journal_mode,
+    validate_endpoint_url,
+    validate_hotkey,
+    validate_netuid,
+    validate_network,
+)
 from cathedral.evidence import (
     MAX_CONTROLLED_ENVELOPE_BYTES,
     MAX_INDEX_ARTIFACT_BYTES,
@@ -3458,45 +3476,83 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     # operator wrapper), so a missing optional attribute must mean "not
     # supplied" rather than AttributeError.
     policy_path = getattr(args, "admission_policy", None)
-    if bool(getattr(args, "allowlist", None)) == bool(policy_path):
+    allowlist_path = getattr(args, "allowlist", None)
+    if bool(allowlist_path) == bool(policy_path):
         raise ValueError("pass exactly one of --allowlist or --admission-policy")
+    remove = bool(getattr(args, "remove", False))
+
+    def digest_pin(attribute: str) -> str | None:
+        flag = "--" + attribute.replace("_", "-")
+        value = getattr(args, attribute, None)
+        if value is None:
+            if remove:
+                raise ValueError(f"--remove requires {flag}")
+            return None
+        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{flag} must be sha256 followed by 64 lowercase hex characters")
+        return value
+
+    network = validate_network(
+        getattr(args, "network", DEFAULT_ENROLL_NETWORK)
+    )
+    netuid = validate_netuid(getattr(args, "netuid", DEFAULT_ENROLL_NETUID))
     approved: frozenset[str] | None
     artifact: dict[str, object]
-    if getattr(args, "allowlist", None):
+    if allowlist_path:
+        keys_digest = digest_pin("allowlist_keys_digest")
+        artifact_digest = digest_pin("allowlist_digest")
         allowlist = verify_allowlist(
-            _read_bounded_registry_file(args.allowlist, "coldkey allowlist"),
+            _read_bounded_registry_file(allowlist_path, "coldkey allowlist"),
             load_allowlist_keys(
                 args.allowlist_keys,
-                pinned_digest=args.allowlist_keys_digest,
+                pinned_digest=keys_digest,
             ),
             max_age_seconds=args.allowlist_max_age_seconds,
         )
+        if artifact_digest is not None and not hmac.compare_digest(
+            allowlist.digest, artifact_digest
+        ):
+            raise ValueError("allowlist digest does not match --allowlist-digest")
         approved = allowlist.coldkeys
         artifact = {
             "allowlist_release": allowlist.release,
             "allowlist_digest": allowlist.digest,
         }
     else:
+        keys_digest = digest_pin("admission_policy_keys_digest")
+        artifact_digest = digest_pin("admission_policy_digest")
         policy = verify_admission_policy(
             _read_bounded_registry_file(policy_path, "admission policy"),
             load_policy_keys(
                 args.admission_policy_keys,
-                pinned_digest=getattr(args, "admission_policy_keys_digest", None),
+                pinned_digest=keys_digest,
             ),
-            network=getattr(args, "network", "finney"),
-            netuid=getattr(args, "netuid", 39),
+            network=network,
+            netuid=netuid,
             max_age_seconds=args.allowlist_max_age_seconds,
         )
+        if artifact_digest is not None and not hmac.compare_digest(
+            policy.digest, artifact_digest
+        ):
+            raise ValueError(
+                "admission policy digest does not match --admission-policy-digest"
+            )
         approved = policy.coldkeys if policy.mode == MODE_SELECTED else None
         artifact = {
             "admission_config_version": policy.config_version,
             "admission_digest": policy.digest,
             "admission_mode": policy.mode,
         }
+    store = RegistryStore(args.registry_db)
     registration = JsonHotkeyRegistrationProvider(
         args.registered_hotkeys_file,
         max_age_seconds=args.registration_max_age_seconds,
-    ).load_snapshot()
+        strict=True,
+        network=network,
+        netuid=netuid,
+        expected_uid=os.geteuid(),
+        high_water_store=store,
+    ).load_snapshot(advance_high_water=True)
     # A broken snapshot must abort loudly: treating every enrollment as
     # unresolvable would flag (and with --remove retire) the whole board.
     if registration is None:
@@ -3507,7 +3563,6 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
             "registration snapshot carries no coldkey mapping; rotate the "
             "extended {'hotkeys': {hotkey: coldkey}} format first"
         )
-    store = RegistryStore(args.registry_db)
     checked = 0
     flagged: list[dict[str, object]] = []
     for enrollment in store.enrollments():
@@ -3533,7 +3588,7 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
             }
         )
     removed: list[str] = []
-    if args.remove:
+    if remove:
         for entry in flagged:
             store.remove_enrollment(str(entry["hotkey"]))
             removed.append(str(entry["hotkey"]))
@@ -3549,6 +3604,247 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_enroll_backup(args: argparse.Namespace) -> int:
+    """Take a transaction-safe online copy of the registry database."""
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    result = backup_sqlite_database(
+        args.registry_db,
+        args.out,
+        busy_timeout_ms=args.sqlite_busy_timeout_ms,
+        production_mode=True,
+    )
+    print(
+        json.dumps(
+            {
+                "source": args.registry_db,
+                "destination": args.out,
+                "pages": result.pages,
+                "journal_mode": result.source_journal_mode,
+                "integrity_check": "ok",
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_enroll_journal_mode(args: argparse.Namespace) -> int:
+    """Back up the registry, then explicitly switch its journal mode."""
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    result = backup_sqlite_database(
+        args.registry_db,
+        args.backup_to,
+        busy_timeout_ms=args.sqlite_busy_timeout_ms,
+        production_mode=True,
+    )
+    before, after = set_sqlite_journal_mode(
+        args.registry_db,
+        args.mode,
+        busy_timeout_ms=args.sqlite_busy_timeout_ms,
+        production_mode=True,
+    )
+    print(
+        json.dumps(
+            {
+                "registry_db": args.registry_db,
+                "backup": args.backup_to,
+                "backup_pages": result.pages,
+                "journal_mode_before": before,
+                "journal_mode_after": after,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _wallet_hotkey_keypair(
+    wallet_name: str, hotkey_name: str, wallet_path: str | None
+):
+    """Load a local hotkey without accepting its seed through CLI or env."""
+    from bittensor_wallet import Wallet
+
+    kwargs = {"name": wallet_name, "hotkey": hotkey_name}
+    if wallet_path:
+        kwargs["path"] = wallet_path
+    return Wallet(**kwargs).hotkey
+
+
+ENROLL_SUBMIT_USER_AGENT = "cathedral-enroll-submit/1"
+
+
+def _post_json(url: str, body: bytes, timeout_seconds: float) -> tuple[int, object]:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "User-Agent": ENROLL_SUBMIT_USER_AGENT,
+        },
+    )
+
+    def decode(raw: bytes) -> object:
+        if len(raw) > MAX_BODY:
+            raise ValueError("enrollment registry response exceeds the size limit")
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("enrollment registry returned non-JSON") from exc
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return int(response.status), decode(response.read(MAX_BODY + 1))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY + 1)
+        try:
+            return int(exc.code), decode(raw)
+        except ValueError:
+            return int(exc.code), {"error": "non-JSON or oversized error response"}
+    except urllib.error.URLError as exc:
+        raise ValueError(f"enrollment registry unreachable: {exc.reason}") from exc
+
+
+def _write_enrollment_token(path: str, token: str) -> Path:
+    """Create one owner-only token file without following or replacing a path."""
+    target = Path(path).expanduser()
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = os.open(target, flags, 0o600)
+    created = os.fstat(descriptor)
+    try:
+        if not stat.S_ISREG(created.st_mode):
+            raise ValueError("--token-out must create a regular file")
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            descriptor = None
+            handle.write(token + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        final = os.lstat(target)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or (final.st_dev, final.st_ino) != (created.st_dev, created.st_ino)
+            or stat.S_IMODE(final.st_mode) != 0o600
+            or (hasattr(os, "getuid") and final.st_uid != os.getuid())
+        ):
+            raise PermissionError("--token-out changed while the credential was written")
+        parent = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        return target
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            current = os.lstat(target)
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                os.unlink(target)
+        raise
+
+
+def _redact_enrollment_response(response: object) -> object:
+    if not isinstance(response, dict):
+        return response
+    redacted = dict(response)
+    redacted.pop("worker_token", None)
+    return redacted
+
+
+def cmd_enroll_submit(args: argparse.Namespace) -> int:
+    """Sign and submit one domain-bound allowlist enrollment locally."""
+    token_out = getattr(args, "token_out", None)
+    if not isinstance(token_out, str) or not token_out.strip():
+        raise ValueError("--token-out is required and must not be empty")
+    if args.timeout_seconds <= 0:
+        raise ValueError("--timeout-seconds must be positive")
+    endpoint_url = validate_endpoint_url(
+        args.endpoint_url, require_ip_literal=True
+    )
+    network = validate_network(args.network)
+    netuid = validate_netuid(args.netuid)
+    registry_url = args.registry_url.rstrip("/")
+    parsed_registry = urllib.parse.urlparse(registry_url)
+    if (
+        parsed_registry.scheme != "https"
+        or not parsed_registry.netloc
+        or parsed_registry.username
+        or parsed_registry.password
+        or parsed_registry.path
+        or parsed_registry.params
+        or parsed_registry.query
+        or parsed_registry.fragment
+    ):
+        raise ValueError("--registry-url must be an HTTPS origin with no credentials or path")
+
+    keypair = (
+        args.keypair_factory(args.wallet_name, args.hotkey_name, args.wallet_path)
+        if getattr(args, "keypair_factory", None) is not None
+        else _wallet_hotkey_keypair(
+            args.wallet_name, args.hotkey_name, args.wallet_path
+        )
+    )
+    hotkey = validate_hotkey(keypair.ss58_address)
+    nonce = secrets.token_hex(32)
+    timestamp = now_iso()
+    message = canonical_enroll_payload(
+        hotkey,
+        endpoint_url,
+        nonce,
+        timestamp,
+        network=network,
+        netuid=netuid,
+    )
+    body = json.dumps(
+        {
+            "hotkey": hotkey,
+            "endpoint_url": endpoint_url,
+            "network": network,
+            "netuid": netuid,
+            "nonce": nonce,
+            "timestamp": timestamp,
+            "signature_b64": base64.b64encode(keypair.sign(message)).decode("ascii"),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    status, response = args.transport(
+        f"{registry_url}/v1/enroll", body, args.timeout_seconds
+    )
+    saved_to: Path | None = None
+    if status == 200:
+        token = response.get("worker_token") if isinstance(response, dict) else None
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 4096
+            or any(not 0x21 <= ord(character) <= 0x7E for character in token)
+        ):
+            raise ValueError("successful enrollment response has no valid worker token")
+        saved_to = _write_enrollment_token(token_out, token)
+    output: dict[str, object] = {
+        "http_status": status,
+        "response": _redact_enrollment_response(response),
+        "credential_saved": saved_to is not None,
+    }
+    if saved_to is not None:
+        output["credential_path"] = str(saved_to)
+    print(json.dumps(output, sort_keys=True))
+    return 0 if status == 200 else 1
 
 
 # --------------------------------------------------------------------------
@@ -3759,8 +4055,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_reconcile = enroll_sub.add_parser(
         "reconcile",
         help=(
-            "list (and with --remove retire) enrollments whose coldkey is "
-            "absent from the signed allowlist"
+            "report enrollments rejected by one signed approval artifact; "
+            "--remove also retires them and requires exact trust pins"
         ),
     )
     p_enroll_reconcile.add_argument("--registry-db", required=True)
@@ -3785,7 +4081,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_reconcile.add_argument(
         "--admission-policy-keys-digest",
         metavar="sha256:HEX",
-        help="pin the admission policy key file to this sha256 digest",
+        help=(
+            "pin the admission policy key file to this sha256 digest; required "
+            "with --remove when --admission-policy is selected"
+        ),
+    )
+    p_enroll_reconcile.add_argument(
+        "--admission-policy-digest",
+        metavar="sha256:HEX",
+        help=(
+            "pin the exact signed admission policy; required with --remove "
+            "when --admission-policy is selected"
+        ),
     )
     p_enroll_reconcile.add_argument(
         "--network", default="finney", help="network the policy must be bound to"
@@ -3797,10 +4104,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--allowlist-keys-digest",
         metavar="sha256:HEX",
         help=(
-            "pin the key file to this sha256 digest. Required: reconcile is "
-            "the only enforcement for pre-existing rows and --remove is "
-            "destructive, so an unpinned key file would let a substituted key "
-            "both hide rogue rows and retire honest ones."
+            "pin the allowlist key file to this sha256 digest; required with "
+            "--remove when --allowlist is selected"
+        ),
+    )
+    p_enroll_reconcile.add_argument(
+        "--allowlist-digest",
+        metavar="sha256:HEX",
+        help=(
+            "pin the exact signed allowlist; required with --remove when "
+            "--allowlist is selected"
         ),
     )
     p_enroll_reconcile.add_argument(
@@ -3812,7 +4125,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_reconcile.add_argument(
         "--registered-hotkeys-file",
         required=True,
-        help="extended registration snapshot carrying hotkey-to-coldkey mappings",
+        help=(
+            "finalized cathedral_registration_snapshot_v2 carrying the exact "
+            "network, netuid, and hotkey-to-coldkey mappings"
+        ),
     )
     p_enroll_reconcile.add_argument(
         "--registration-max-age-seconds", type=int, default=3600, metavar="N"
@@ -3820,9 +4136,67 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_reconcile.add_argument(
         "--remove",
         action="store_true",
-        help="retire flagged enrollments and clear their attestation verdicts",
+        help=(
+            "retire flagged enrollments and clear their attestation verdicts; "
+            "requires the selected key-file and artifact digest pins"
+        ),
     )
     p_enroll_reconcile.set_defaults(func=cmd_enroll_reconcile)
+
+    p_enroll_backup = enroll_sub.add_parser(
+        "backup", help="take a transaction-safe online registry backup"
+    )
+    p_enroll_backup.add_argument("--registry-db", required=True)
+    p_enroll_backup.add_argument(
+        "--out", required=True, help="destination path; must not already exist"
+    )
+    p_enroll_backup.add_argument(
+        "--sqlite-busy-timeout-ms", type=int, default=None, metavar="N"
+    )
+    p_enroll_backup.set_defaults(func=cmd_enroll_backup)
+
+    p_enroll_journal = enroll_sub.add_parser(
+        "journal-mode", help="back up the registry and switch its journal mode"
+    )
+    p_enroll_journal.add_argument("--registry-db", required=True)
+    p_enroll_journal.add_argument(
+        "--mode", required=True, choices=("wal", "delete")
+    )
+    p_enroll_journal.add_argument(
+        "--backup-to",
+        required=True,
+        help="mandatory online backup destination before the mode switch",
+    )
+    p_enroll_journal.add_argument(
+        "--sqlite-busy-timeout-ms", type=int, default=None, metavar="N"
+    )
+    p_enroll_journal.set_defaults(func=cmd_enroll_journal_mode)
+
+    p_enroll_submit = enroll_sub.add_parser(
+        "submit", help="sign and submit this miner's allowlist enrollment"
+    )
+    p_enroll_submit.add_argument("--registry-url", required=True, metavar="https://HOST")
+    p_enroll_submit.add_argument(
+        "--endpoint-url", required=True, metavar="https://IP:PORT"
+    )
+    p_enroll_submit.add_argument("--wallet-name", required=True)
+    p_enroll_submit.add_argument("--hotkey-name", required=True)
+    p_enroll_submit.add_argument("--wallet-path", default=None)
+    p_enroll_submit.add_argument("--network", default=DEFAULT_ENROLL_NETWORK)
+    p_enroll_submit.add_argument("--netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+    p_enroll_submit.add_argument("--timeout-seconds", type=float, default=30.0)
+    p_enroll_submit.add_argument(
+        "--token-out",
+        required=True,
+        metavar="PATH",
+        help=(
+            "required create-only owner-only worker-token file; refuses an "
+            "existing path. The token is never printed"
+        ),
+    )
+    p_enroll_submit.set_defaults(
+        func=cmd_enroll_submit, transport=_post_json, keypair_factory=None
+    )
 
     p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
