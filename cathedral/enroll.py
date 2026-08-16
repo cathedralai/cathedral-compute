@@ -14,6 +14,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import importlib
 import ipaddress
 import json
 import logging
@@ -22,14 +23,15 @@ import re
 import secrets
 import sqlite3
 import stat
+import tempfile
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
-from urllib.parse import urlparse
-from wsgiref.simple_server import make_server
+from urllib.parse import quote, urlparse
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from cathedral.assurance import (
     ATTESTATION_ADMISSION_POLICY,
@@ -62,11 +64,27 @@ from cathedral.lifecycle import (
     require_transition_reason,
     retry_delay_seconds,
 )
+from cathedral.policy_registry import canonical_json
 
-try:
-    from substrateinterface import Keypair
-except Exception:  # pragma: no cover - exercised only when dependency import fails
-    Keypair = None  # type: ignore[assignment]
+SIGNATURE_VERIFIER_MODULES = ("substrateinterface", "bittensor_wallet")
+
+
+def load_keypair_class(
+    modules: tuple[str, ...] = SIGNATURE_VERIFIER_MODULES,
+) -> tuple[str | None, Any]:
+    """Return the first importable sr25519 Keypair implementation."""
+    for name in modules:
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            continue
+        candidate = getattr(module, "Keypair", None)
+        if candidate is not None and callable(candidate):
+            return name, candidate
+    return None, None
+
+
+KEYPAIR_SOURCE, Keypair = load_keypair_class()
 
 
 logger = logging.getLogger("cathedral.enroll")
@@ -88,11 +106,74 @@ DEFAULT_HOTKEY_ENROLL_LIMIT = 20
 DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS = 3600
 _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
 
+# The legacy allowlist request remains a v1 wire format, but its signature is
+# bound to this protocol and subnet. Bare v1 remains available only when no
+# production admission artifact is configured.
+ENROLL_DOMAIN_TAG = "cathedral-enroll-v1"
+DEFAULT_ENROLL_NETWORK = "finney"
+DEFAULT_ENROLL_NETUID = 39
+
+# RegistryStore is shared by enrollment and the epoch loop. Keep the existing
+# sqlite3 default at five seconds unless one caller explicitly chooses a lower
+# bound. The public enrollment service uses four seconds so lock contention
+# returns before the reverse proxy times out.
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+ENROLL_BUSY_RETRY_AFTER_SECONDS = 15
+DEFAULT_IP_LIMITER_MAX_KEYS = 4096
+HOTKEY_ATTEMPT_SWEEP_INTERVAL_SECONDS = 900
+
+_PREFLIGHT_ADDRESS = "5Cvzb5veKov4TMvd5JVgecHYSphjGU3Dh4N2MGPPCoUJ7cZV"
+_PREFLIGHT_MESSAGE = b"cathedral-enroll-verifier-preflight-v1"
+_PREFLIGHT_SIGNATURE_B64 = (
+    "ThgZ+GzZKIBrOALGgrh3pVkAi84HnQrjp7b6mq1aIWpGWW0DtEUFymbyQJhYpZRD"
+    "+OaS6UDE9VBPHcqSeRcDjw=="
+)
+
+REGISTRATION_SNAPSHOT_SCHEMA = "cathedral_registration_snapshot_v2"
+MAX_SNAPSHOT_BLOCK = 2**53
+MAX_SNAPSHOT_FILE_BYTES = 1024 * 1024
+MAX_SNAPSHOT_HOTKEYS = 4096
+
 # The bearer token the validator presents to a worker. Kept well inside
 # runtime.MAX_BEARER_TOKEN_LENGTH (4096) and restricted to the printable
 # ASCII the runtime's own validator accepts, so a minted token can never be
 # the thing that makes a miner unreachable.
 WORKER_TOKEN_BYTES = 32
+
+
+class SignatureVerifierUnavailable(RuntimeError):
+    """No usable sr25519 verifier is importable in this interpreter."""
+
+
+def preflight_signature_verifier(keypair_class: Any = None) -> str:
+    """Prove the verifier accepts a valid vector and rejects a corrupt one."""
+    candidate = Keypair if keypair_class is None else keypair_class
+    if candidate is None:
+        raise SignatureVerifierUnavailable(
+            "no sr25519 verifier is importable; install one of "
+            + ", ".join(SIGNATURE_VERIFIER_MODULES)
+        )
+    signature = base64.b64decode(_PREFLIGHT_SIGNATURE_B64, validate=True)
+    corrupted = bytearray(signature)
+    corrupted[0] ^= 0x01
+    try:
+        accepted = candidate(ss58_address=_PREFLIGHT_ADDRESS).verify(
+            _PREFLIGHT_MESSAGE, signature
+        )
+        rejected = candidate(ss58_address=_PREFLIGHT_ADDRESS).verify(
+            _PREFLIGHT_MESSAGE, bytes(corrupted)
+        )
+    except Exception as exc:
+        raise SignatureVerifierUnavailable(
+            "sr25519 verifier failed its startup known-answer check"
+        ) from exc
+    if accepted is not True or rejected is not False:
+        raise SignatureVerifierUnavailable(
+            "sr25519 verifier failed its startup known-answer check"
+        )
+    if keypair_class is None:
+        return KEYPAIR_SOURCE or "unknown"
+    return getattr(candidate, "__module__", "unknown")
 
 
 def generate_worker_token() -> str:
@@ -102,6 +183,269 @@ def generate_worker_token() -> str:
     of the printable-ASCII range ``_validate_bearer_token`` requires.
     """
     return secrets.token_urlsafe(WORKER_TOKEN_BYTES)
+
+
+@dataclass(frozen=True)
+class SQLiteBackupResult:
+    """Facts proven while copying a SQLite database without migrating it."""
+
+    pages: int
+    source_journal_mode: str
+
+
+def _validated_busy_timeout_ms(value: int | None) -> int:
+    if value is None:
+        return DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("busy_timeout_ms must be positive")
+    return value
+
+
+def _inspect_existing_sqlite_file(
+    path: str,
+    *,
+    label: str,
+    production_mode: bool,
+) -> os.stat_result:
+    """Bind raw maintenance to a regular file owned by this process."""
+    if path == ":memory:" or path.startswith("file::memory:"):
+        raise ValueError(f"an in-memory {label} cannot be maintained by path")
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"{label} path {path!r} cannot be inspected") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"{label} path {path!r} is not a regular non-symlink file")
+    if info.st_uid != os.getuid():
+        raise PermissionError(
+            f"{label} {path!r} is owned by uid {info.st_uid}, not this process"
+        )
+    if production_mode:
+        from cathedral.privileged_paths import inspect_path
+
+        verdict = inspect_path(path, trusted_uids=frozenset({0, os.getuid()}))
+        if not verdict.trusted:
+            raise PermissionError(
+                f"{label} path {path!r} is not trustworthy: "
+                + "; ".join(verdict.violations)
+            )
+    return info
+
+
+def _open_sqlite_read_only(path: str, busy_timeout_ms: int) -> sqlite3.Connection:
+    absolute = os.path.abspath(path)
+    uri = "file:" + quote(absolute, safe="/") + "?mode=ro"
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=busy_timeout_ms / 1000.0,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def _remove_exact_created_file(path: str, created: os.stat_result) -> bool:
+    """Remove *path* only while it still names the inode this process created."""
+    absolute = os.path.abspath(path)
+    parent_path = os.path.dirname(absolute)
+    name = os.path.basename(absolute)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent = os.open(parent_path, directory_flags)
+    try:
+        try:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+            return False
+        os.unlink(name, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    return True
+
+
+def backup_sqlite_database(
+    source_path: str,
+    destination: str,
+    *,
+    busy_timeout_ms: int | None = None,
+    production_mode: bool = False,
+) -> SQLiteBackupResult:
+    """Copy committed SQLite pages without constructing or migrating a store.
+
+    This is the maintenance primitive used before a new release opens a legacy
+    registry. The source is opened read-only and the destination is created
+    owner-only and create-only. Both databases must pass integrity checks.
+    """
+    timeout = _validated_busy_timeout_ms(busy_timeout_ms)
+    source_before = _inspect_existing_sqlite_file(
+        source_path,
+        label="registry database",
+        production_mode=production_mode,
+    )
+    if production_mode:
+        from cathedral.privileged_paths import inspect_creatable_file
+
+        verdict = inspect_creatable_file(
+            destination, trusted_uids=frozenset({0, os.getuid()})
+        )
+        if not verdict.trusted:
+            raise PermissionError(
+                f"backup path {destination!r} is not trustworthy: "
+                + "; ".join(verdict.violations)
+            )
+    destination_absolute = os.path.abspath(destination)
+    parent_path = os.path.dirname(destination_absolute)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".cathedral-backup-",
+        dir=parent_path,
+    )
+    os.fchmod(descriptor, 0o600)
+    temporary_created = os.fstat(descriptor)
+    os.close(descriptor)
+    destination_published = False
+    try:
+        source = _open_sqlite_read_only(source_path, timeout)
+        try:
+            source_integrity = str(
+                source.execute("PRAGMA integrity_check").fetchone()[0]
+            )
+            if source_integrity.lower() != "ok":
+                raise ValueError("source registry failed its integrity check")
+            journal_mode = str(
+                source.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
+            target = sqlite3.connect(temporary_path, timeout=timeout / 1000.0)
+            try:
+                target.execute(f"PRAGMA busy_timeout = {timeout}")
+                source.backup(target)
+                pages = int(target.execute("PRAGMA page_count").fetchone()[0])
+                target_integrity = str(
+                    target.execute("PRAGMA integrity_check").fetchone()[0]
+                )
+                if target_integrity.lower() != "ok":
+                    raise ValueError("backup failed its integrity check")
+            finally:
+                target.close()
+        finally:
+            source.close()
+
+        source_after = os.lstat(source_path)
+        if (source_after.st_dev, source_after.st_ino) != (
+            source_before.st_dev,
+            source_before.st_ino,
+        ):
+            raise PermissionError("registry source changed while it was being backed up")
+        temporary_final = os.lstat(temporary_path)
+        if (
+            not stat.S_ISREG(temporary_final.st_mode)
+            or (temporary_final.st_dev, temporary_final.st_ino)
+            != (temporary_created.st_dev, temporary_created.st_ino)
+        ):
+            raise PermissionError("backup staging file changed while it was being written")
+        descriptor = os.open(
+            temporary_path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (
+                temporary_created.st_dev,
+                temporary_created.st_ino,
+            ):
+                raise PermissionError("backup staging file changed before publication")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        # Hard-link publication is create-only and atomic: the requested path
+        # never names a partial database. A concurrent destination wins with
+        # FileExistsError and is never removed by cleanup.
+        os.link(temporary_path, destination_absolute, follow_symlinks=False)
+        destination_published = True
+        destination_final = os.lstat(destination_absolute)
+        if (
+            not stat.S_ISREG(destination_final.st_mode)
+            or (destination_final.st_dev, destination_final.st_ino)
+            != (temporary_created.st_dev, temporary_created.st_ino)
+            or stat.S_IMODE(destination_final.st_mode) != 0o600
+        ):
+            raise PermissionError("published backup does not match verified staging file")
+        parent = os.open(
+            parent_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        if not _remove_exact_created_file(temporary_path, temporary_created):
+            raise PermissionError("verified backup staging file could not be removed")
+        return SQLiteBackupResult(pages=pages, source_journal_mode=journal_mode)
+    except BaseException:
+        cleanup_errors: list[BaseException] = []
+        if destination_published:
+            try:
+                _remove_exact_created_file(destination_absolute, temporary_created)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            _remove_exact_created_file(temporary_path, temporary_created)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RuntimeError("failed to remove an incomplete backup publication") from (
+                cleanup_errors[0]
+            )
+        raise
+
+
+def set_sqlite_journal_mode(
+    path: str,
+    mode: str,
+    *,
+    busy_timeout_ms: int | None = None,
+    production_mode: bool = False,
+) -> tuple[str, str]:
+    """Change only SQLite's journal mode, without running schema migration."""
+    timeout = _validated_busy_timeout_ms(busy_timeout_ms)
+    _inspect_existing_sqlite_file(
+        path,
+        label="registry database",
+        production_mode=production_mode,
+    )
+    normalized = mode.strip().lower()
+    if normalized not in {"delete", "wal", "truncate", "persist", "memory", "off"}:
+        raise ValueError("unsupported sqlite journal mode")
+    connection = sqlite3.connect(path, timeout=timeout / 1000.0)
+    try:
+        connection.execute(f"PRAGMA busy_timeout = {timeout}")
+        before = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        after = str(
+            connection.execute(f"PRAGMA journal_mode = {normalized}").fetchone()[0]
+        ).lower()
+    finally:
+        connection.close()
+    if after != normalized:
+        raise ValueError(f"sqlite refused the journal mode change (still {after})")
+    return before, after
+
+
+def _is_sqlite_contention(exc: sqlite3.OperationalError) -> bool:
+    """Return whether an operational error is SQLite lock contention."""
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _is_loopback_host(host: object) -> bool:
@@ -143,6 +487,21 @@ class RegistrationProvider(Protocol):
     """
 
     def is_registered(self, hotkey: str) -> bool | None:
+        ...
+
+
+class RegistrationSnapshotHighWaterStore(Protocol):
+    """Durable block and canonical-content state for strict snapshots."""
+
+    def check_registration_snapshot_block(
+        self,
+        network: str,
+        netuid: int,
+        block: int,
+        snapshot_digest: str,
+        *,
+        advance: bool,
+    ) -> bool:
         ...
 
 
@@ -189,31 +548,72 @@ class JsonHotkeyRegistrationProvider:
     Typical update cycle: rotate the file from a cron job that re-fetches the
     metagraph; the max-age bound ensures a stuck cron is caught within one
     interval instead of silently admitting stale/deregistered hotkeys.
+
+    Production mode enables strict verification. Only a version 2 snapshot
+    for the configured network and netuid is accepted. It must declare a
+    finalized, non-regressing block and carry a hotkey-to-coldkey mapping. The
+    block and canonical-snapshot digest high-water mark lives in the registry
+    database, so a restart cannot replay an older snapshot or substitute a
+    different mapping at the same block. The file itself must be a regular,
+    non-symlink file owned by the expected uid and must not be group or world
+    writable.
     """
 
-    def __init__(self, path: str, *, max_age_seconds: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_age_seconds: int,
+        strict: bool = False,
+        network: str | None = None,
+        netuid: int | None = None,
+        expected_uid: int | None = None,
+        high_water_store: RegistrationSnapshotHighWaterStore | None = None,
+        advance_high_water_on_use: bool = False,
+    ) -> None:
         if max_age_seconds <= 0:
             raise ValueError("max_age_seconds must be a positive integer")
+        if strict and (network is None or netuid is None):
+            raise ValueError("strict snapshot verification requires network and netuid")
+        if strict and high_water_store is None:
+            raise ValueError("strict snapshot verification requires a durable high-water store")
+        if advance_high_water_on_use and not strict:
+            raise ValueError("only strict snapshots have a block high-water mark")
         self.path = path
         self.max_age_seconds = max_age_seconds
+        self.strict = strict
+        self.network = network
+        self.netuid = netuid
+        self.expected_uid = 0 if (strict and expected_uid is None) else expected_uid
+        self.high_water_store = high_water_store
+        self.advance_high_water_on_use = bool(advance_high_water_on_use)
 
-    def load_snapshot(self) -> tuple[set[str], dict[str, str] | None] | None:
+    def load_snapshot(
+        self,
+        *,
+        advance_high_water: bool = False,
+    ) -> tuple[set[str], dict[str, str] | None] | None:
         """Read and parse the snapshot, applying the freshness bound.
 
         Returns ``(hotkeys, coldkey_by_hotkey)`` where the mapping is ``None``
         for the hotkeys-only formats, or ``None`` overall when the file is
         missing, unreadable, stale, empty, or malformed (fail closed).
+
+        Pure verification leaves the durable block state unchanged. An
+        operational consumer passes ``advance_high_water=True`` only when it
+        is about to rely on this snapshot for admission or reconciliation.
         """
         try:
-            stat_result = os.stat(self.path)
-            age = time.time() - stat_result.st_mtime
-            if age > self.max_age_seconds:
-                return None  # stale snapshot; fail closed
-            with open(self.path, "r", encoding="utf-8") as fh:
-                content = fh.read()
+            content = self._read_checked()
         except OSError:
-            return None  # missing or unreadable file; fail closed
-        parsed = self._parse(content)
+            return None
+        if content is None:
+            return None
+        parsed = (
+            self._parse_strict(content, advance_high_water=advance_high_water)
+            if self.strict
+            else self._parse(content)
+        )
         if parsed is not None and not parsed[0]:
             # Zero hotkeys can only be a torn or failed rotation write on a
             # live subnet (the validator itself is always registered); fail
@@ -222,8 +622,124 @@ class JsonHotkeyRegistrationProvider:
             return None
         return parsed
 
+    def _read_checked(self) -> str | None:
+        if not self.strict:
+            stat_result = os.stat(self.path)
+            if time.time() - stat_result.st_mtime > self.max_age_seconds:
+                return None
+            with open(self.path, "r", encoding="utf-8") as handle:
+                return handle.read()
+
+        before = os.lstat(self.path)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            logger.warning("registration snapshot is not a regular file")
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(self.path, flags)
+        try:
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                logger.warning("registration snapshot changed underneath the read")
+                return None
+            if not stat.S_ISREG(after.st_mode):
+                return None
+            if self.expected_uid is not None and after.st_uid != self.expected_uid:
+                logger.warning("registration snapshot is not owned by the expected user")
+                return None
+            if after.st_mode & 0o022:
+                logger.warning("registration snapshot is group or world writable")
+                return None
+            if time.time() - after.st_mtime > self.max_age_seconds:
+                return None
+            raw = os.read(descriptor, MAX_SNAPSHOT_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw) > MAX_SNAPSHOT_FILE_BYTES:
+            logger.warning("registration snapshot exceeds the maximum size")
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def _parse_strict(
+        self,
+        content: str,
+        *,
+        advance_high_water: bool,
+    ) -> tuple[set[str], dict[str, str]] | None:
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(document, dict):
+            return None
+        if document.get("schema") != REGISTRATION_SNAPSHOT_SCHEMA:
+            logger.warning("registration snapshot schema is unsupported")
+            return None
+        if document.get("network") != self.network or document.get("netuid") != self.netuid:
+            logger.warning("registration snapshot declares a different network or netuid")
+            return None
+        generated_raw = document.get("generated_at")
+        if not isinstance(generated_raw, str):
+            return None
+        try:
+            generated = _parse_iso_utc(generated_raw)
+        except ValueError:
+            return None
+        now = datetime.now(UTC)
+        if generated > now + timedelta(minutes=5):
+            logger.warning("registration snapshot generated_at is in the future")
+            return None
+        if (now - generated).total_seconds() > self.max_age_seconds:
+            return None
+        if document.get("block_is_finalized") is not True:
+            logger.warning("registration snapshot does not declare a finalized block")
+            return None
+        block = document.get("block")
+        if (
+            isinstance(block, bool)
+            or not isinstance(block, int)
+            or not 0 < block <= MAX_SNAPSHOT_BLOCK
+        ):
+            logger.warning("registration snapshot block is not a bounded positive integer")
+            return None
+        mapping = document.get("hotkeys")
+        if (
+            not isinstance(mapping, dict)
+            or not mapping
+            or len(mapping) > MAX_SNAPSHOT_HOTKEYS
+        ):
+            return None
+        for hotkey, coldkey in mapping.items():
+            if (
+                not isinstance(hotkey, str)
+                or HOTKEY_RE.fullmatch(hotkey) is None
+                or not isinstance(coldkey, str)
+                or HOTKEY_RE.fullmatch(coldkey) is None
+            ):
+                logger.warning("registration snapshot contains a malformed key")
+                return None
+        snapshot_digest = "sha256:" + hashlib.sha256(canonical_json(document)).hexdigest()
+        high_water = self.high_water_store
+        assert high_water is not None
+        assert self.network is not None
+        assert self.netuid is not None
+        if not high_water.check_registration_snapshot_block(
+            self.network,
+            self.netuid,
+            block,
+            snapshot_digest,
+            advance=advance_high_water,
+        ):
+            logger.warning("registration snapshot block moved backwards")
+            return None
+        return set(mapping), dict(mapping)
+
     def is_registered(self, hotkey: str) -> bool | None:
-        snapshot = self.load_snapshot()
+        snapshot = self.load_snapshot(
+            advance_high_water=self.advance_high_water_on_use
+        )
         if snapshot is None:
             return None
         hotkeys, _coldkeys = snapshot
@@ -236,7 +752,9 @@ class JsonHotkeyRegistrationProvider:
         it is a hotkeys-only format that carries no ownership data, or when
         the hotkey has no entry in the mapping.
         """
-        snapshot = self.load_snapshot()
+        snapshot = self.load_snapshot(
+            advance_high_water=self.advance_high_water_on_use
+        )
         if snapshot is None:
             return None
         _hotkeys, coldkeys = snapshot
@@ -339,20 +857,26 @@ def validate_enroll_timestamp(
     return timestamp
 
 
+MAX_ENDPOINT_URL_LENGTH = 300
+
+
 def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = False) -> str:
     """Validate an enrollment endpoint URL.
 
-    :param require_ip_literal: when True (production mode), the host must be
-        a public IP literal. This closes the DNS check/use (TOCTOU) gap for
-        launch without a pinned custom connector: a hostname resolved at
-        enrollment time could resolve to a different, non-global address by
-        the time the prober connects (DNS rebinding). An IP literal has no
-        such gap because there is nothing left to resolve. Non-production
-        callers may still enroll a hostname endpoint; see ``prober.py`` for
-        the matching probe-time gate.
+    The endpoint is an origin, not a resource URL. Paths, parameters, queries,
+    and fragments are rejected because the prober appends its own paths.
+
+    In production, require HTTPS, an explicit port, and a canonical public IP
+    literal. This removes DNS rebinding and alternate-spelling ambiguity.
     """
     if not isinstance(endpoint_url, str):
         raise ValueError("endpoint_url must be a string")
+    if not endpoint_url or len(endpoint_url) > MAX_ENDPOINT_URL_LENGTH:
+        raise ValueError("endpoint_url is empty or too long")
+    if endpoint_url.strip() != endpoint_url or any(
+        not 0x21 <= ord(character) <= 0x7E for character in endpoint_url
+    ):
+        raise ValueError("endpoint_url must be visible ASCII with no whitespace")
     parsed = urlparse(endpoint_url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("endpoint_url must use http or https")
@@ -360,12 +884,25 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
         raise ValueError("endpoint_url must include a host and no credentials")
     if parsed.fragment:
         raise ValueError("endpoint_url must not include a fragment")
+    if parsed.query:
+        raise ValueError("endpoint_url must not include a query string")
+    if parsed.path:
+        raise ValueError("endpoint_url must not include a path")
+    if parsed.params:
+        raise ValueError("endpoint_url must not include URL parameters")
     host = parsed.hostname
     if host is None:
         raise ValueError("endpoint_url must include a host")
-    normalized_host = host.rstrip(".").lower()
+    literal_host = host.lower()
+    normalized_host = literal_host.rstrip(".")
     if "%" in normalized_host or normalized_host in REJECTED_HOSTS:
         raise ValueError("endpoint_url host is not allowed")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("endpoint_url port must be an integer from 1 to 65535") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("endpoint_url port must be an integer from 1 to 65535")
     try:
         ip = ipaddress.ip_address(normalized_host)
     except ValueError:
@@ -377,6 +914,16 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
     else:
         if not is_globally_routable(ip):
             raise ValueError("endpoint_url host must be a public address")
+        if require_ip_literal:
+            if str(ip) != literal_host:
+                raise ValueError("endpoint_url host must be a canonical IP literal")
+            if getattr(ip, "ipv4_mapped", None) is not None or getattr(ip, "sixtofour", None):
+                raise ValueError("endpoint_url host must not be an IPv4-in-IPv6 alias")
+    if require_ip_literal:
+        if parsed.scheme != "https":
+            raise ValueError("endpoint_url must use https in production mode")
+        if port is None:
+            raise ValueError("endpoint_url must carry an explicit port in production mode")
     return endpoint_url
 
 
@@ -414,13 +961,10 @@ def canonical_endpoint_key(endpoint_url: str) -> str:
     return f"{scheme}://{authority}"
 
 
-def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timestamp: str) -> bytes:
-    """Canonical bytes miners sign before calling /v1/enroll.
-
-    Legacy v1 request. Accepted only while no admission policy is
-    configured; see ``canonical_enroll_payload_v2``.
-    """
-
+def canonical_legacy_enroll_payload(
+    hotkey: str, endpoint_url: str, nonce: str, timestamp: str
+) -> bytes:
+    """Original bare v1 bytes, accepted only with no admission artifact."""
     payload = {
         "endpoint_url": endpoint_url,
         "hotkey": hotkey,
@@ -428,6 +972,51 @@ def canonical_enroll_payload(hotkey: str, endpoint_url: str, nonce: str, timesta
         "timestamp": timestamp,
     }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def canonical_enroll_payload(
+    hotkey: str,
+    endpoint_url: str,
+    nonce: str,
+    timestamp: str,
+    *,
+    network: str = DEFAULT_ENROLL_NETWORK,
+    netuid: int = DEFAULT_ENROLL_NETUID,
+    domain: str = ENROLL_DOMAIN_TAG,
+) -> bytes:
+    """Canonical domain-bound v1 bytes for coldkey-allowlist enrollment."""
+    payload = {
+        "domain": domain,
+        "endpoint_url": endpoint_url,
+        "hotkey": hotkey,
+        "netuid": netuid,
+        "network": network,
+        "nonce": nonce,
+        "timestamp": timestamp,
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def canonical_allowlist_enroll_payload(
+    hotkey: str,
+    endpoint_url: str,
+    nonce: str,
+    timestamp: str,
+    *,
+    network: str = DEFAULT_ENROLL_NETWORK,
+    netuid: int = DEFAULT_ENROLL_NETUID,
+    domain: str = ENROLL_DOMAIN_TAG,
+) -> bytes:
+    """Explicit alias for the canonical deployed allowlist-v1 preimage."""
+    return canonical_enroll_payload(
+        hotkey,
+        endpoint_url,
+        nonce,
+        timestamp,
+        network=network,
+        netuid=netuid,
+        domain=domain,
+    )
 
 
 def canonical_enroll_payload_v2(
@@ -573,8 +1162,11 @@ class RegistryStore:
         verification_ttl_seconds: int | None = None,
         clock: Callable[[], datetime] | None = None,
         production_mode: bool = False,
+        busy_timeout_ms: int | None = None,
     ) -> None:
         self.path = path
+        self.busy_timeout_ms = _validated_busy_timeout_ms(busy_timeout_ms)
+        self._last_attempt_sweep = 0.0
         # Deployment policy, not a library invariant. The ancestor-chain trust
         # check below applies only in production, the same way the operator
         # token file is only fstat-and-mode checked in production
@@ -614,10 +1206,33 @@ class RegistryStore:
         return when
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000.0)
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def journal_mode(self) -> str:
+        with self._connect() as conn:
+            return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+    def backup_to(self, destination: str) -> int:
+        """Create an owner-only, transaction-safe online database backup."""
+        return backup_sqlite_database(
+            self.path,
+            destination,
+            busy_timeout_ms=self.busy_timeout_ms,
+            production_mode=self.production_mode,
+        ).pages
+
+    def set_journal_mode(self, mode: str) -> tuple[str, str]:
+        """Switch journal mode and return the mode before and after."""
+        return set_sqlite_journal_mode(
+            self.path,
+            mode,
+            busy_timeout_ms=self.busy_timeout_ms,
+            production_mode=self.production_mode,
+        )
 
     def _precreate_database(self) -> None:
         """Create the database file owner-only before SQLite opens it.
@@ -878,6 +1493,31 @@ class RegistryStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS registration_snapshot_high_water (
+                    network TEXT NOT NULL,
+                    netuid INTEGER NOT NULL,
+                    block INTEGER NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    PRIMARY KEY(network, netuid)
+                )
+                """
+            )
+            snapshot_high_water_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(registration_snapshot_high_water)"
+                )
+            }
+            if "snapshot_digest" not in snapshot_high_water_columns:
+                # Previous releases stored only the height. The first accepted
+                # operational snapshot at that height atomically backfills the
+                # digest before the row is relied upon again.
+                conn.execute(
+                    "ALTER TABLE registration_snapshot_high_water "
+                    "ADD COLUMN snapshot_digest TEXT"
+                )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS worker_lifecycle_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     hotkey TEXT NOT NULL REFERENCES enrollments(hotkey),
@@ -956,6 +1596,102 @@ class RegistryStore:
                 """
             )
             self._backfill_lifecycle(conn)
+
+    def registration_snapshot_high_water(
+        self,
+        network: str,
+        netuid: int,
+    ) -> int | None:
+        """Return the highest strict registration block accepted for an audience."""
+        checked_network = validate_network(network)
+        checked_netuid = validate_netuid(netuid)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT block
+                FROM registration_snapshot_high_water
+                WHERE network = ? AND netuid = ?
+                """,
+                (checked_network, checked_netuid),
+            ).fetchone()
+        return None if row is None else int(row["block"])
+
+    def check_registration_snapshot_block(
+        self,
+        network: str,
+        netuid: int,
+        block: int,
+        snapshot_digest: str,
+        *,
+        advance: bool,
+    ) -> bool:
+        """Check, and optionally advance, one block-and-content high-water mark."""
+        checked_network = validate_network(network)
+        checked_netuid = validate_netuid(netuid)
+        if (
+            isinstance(block, bool)
+            or not isinstance(block, int)
+            or not 0 < block <= MAX_SNAPSHOT_BLOCK
+        ):
+            raise ValueError("snapshot block must be a bounded positive integer")
+        if (
+            not isinstance(snapshot_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_digest) is None
+        ):
+            raise ValueError("snapshot digest must be canonical sha256")
+        with self._connect() as conn:
+            if advance:
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT block, snapshot_digest
+                FROM registration_snapshot_high_water
+                WHERE network = ? AND netuid = ?
+                """,
+                (checked_network, checked_netuid),
+            ).fetchone()
+            current = None if row is None else int(row["block"])
+            current_digest = None if row is None else row["snapshot_digest"]
+            if current_digest is not None and (
+                not isinstance(current_digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", current_digest) is None
+            ):
+                return False
+            if current is not None and block < current:
+                return False
+            if current is not None and current_digest is None and block == current:
+                # A pre-digest row cannot prove which mapping occupied this
+                # height. Fail closed until a later finalized block advances
+                # both fields atomically instead of blessing one same-height
+                # mapping after migration.
+                return False
+            if (
+                current is not None
+                and block == current
+                and current_digest is not None
+                and not secrets.compare_digest(current_digest, snapshot_digest)
+            ):
+                return False
+            if advance and current is None:
+                conn.execute(
+                    """
+                    INSERT INTO registration_snapshot_high_water(
+                        network, netuid, block, snapshot_digest
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (checked_network, checked_netuid, block, snapshot_digest),
+                )
+            elif advance and block > current:
+                conn.execute(
+                    """
+                    UPDATE registration_snapshot_high_water
+                    SET block = ?, snapshot_digest = ?
+                    WHERE network = ? AND netuid = ?
+                    """,
+                    (block, snapshot_digest, checked_network, checked_netuid),
+                )
+        return True
 
     def _advance_lifecycle_clock(
         self, conn: sqlite3.Connection, when: datetime
@@ -2027,6 +2763,11 @@ class RegistryStore:
             datetime.now(UTC) - timedelta(seconds=window_seconds)
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM hotkey_enroll_attempts WHERE hotkey = ? AND attempted_at_iso < ?",
+                (hotkey, cutoff),
+            )
             count = conn.execute(
                 """
                 SELECT COUNT(*) FROM hotkey_enroll_attempts
@@ -2040,7 +2781,26 @@ class RegistryStore:
                 "INSERT INTO hotkey_enroll_attempts(hotkey, attempted_at_iso) VALUES (?, ?)",
                 (hotkey, ts),
             )
+        self._sweep_expired_attempts(window_seconds)
         return True
+
+    def _sweep_expired_attempts(self, window_seconds: int) -> None:
+        """Periodically prune expired attempt rows for inactive hotkeys."""
+        now = time.monotonic()
+        if now - self._last_attempt_sweep < HOTKEY_ATTEMPT_SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_attempt_sweep = now
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=window_seconds)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM hotkey_enroll_attempts WHERE attempted_at_iso < ?",
+                    (cutoff,),
+                )
+        except sqlite3.OperationalError:
+            logger.warning("hotkey attempt sweep skipped: registry busy")
 
     def enrollments(self) -> list[Enrollment]:
         with self._connect() as conn:
@@ -2437,21 +3197,53 @@ class RegistryStore:
 
 
 class IpRateLimiter:
-    def __init__(self, *, limit: int = 10, window_seconds: int = 60) -> None:
+    """Thread-safe per-address limiter with a bounded key space."""
+
+    def __init__(
+        self,
+        *,
+        limit: int = 10,
+        window_seconds: int = 60,
+        max_keys: int = DEFAULT_IP_LIMITER_MAX_KEYS,
+    ) -> None:
+        if limit <= 0 or window_seconds <= 0 or max_keys <= 0:
+            raise ValueError("limit, window_seconds, and max_keys must be positive")
         self.limit = limit
         self.window_seconds = window_seconds
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self.max_keys = max_keys
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
+        self._lock = threading.Lock()
 
     def allow(self, ip: str) -> bool:
         now = time.monotonic()
-        hits = self._hits[ip]
         cutoff = now - self.window_seconds
-        while hits and hits[0] < cutoff:
-            hits.popleft()
-        if len(hits) >= self.limit:
-            return False
-        hits.append(now)
-        return True
+        with self._lock:
+            self._evict(cutoff)
+            hits = self._hits.get(ip)
+            if hits is None:
+                hits = deque()
+                self._hits[ip] = hits
+            else:
+                self._hits.move_to_end(ip)
+            while hits and hits[0] < cutoff:
+                hits.popleft()
+            if len(hits) >= self.limit:
+                return False
+            hits.append(now)
+            return True
+
+    def tracked_keys(self) -> int:
+        with self._lock:
+            return len(self._hits)
+
+    def _evict(self, cutoff: float) -> None:
+        expired = [
+            key for key, hits in self._hits.items() if not hits or hits[-1] < cutoff
+        ]
+        for key in expired:
+            del self._hits[key]
+        while len(self._hits) >= self.max_keys:
+            self._hits.popitem(last=False)
 
 
 class RegistryApp:
@@ -2468,7 +3260,12 @@ class RegistryApp:
         trusted_proxy: bool = False,
         hotkey_enroll_limit: int = DEFAULT_HOTKEY_ENROLL_LIMIT,
         hotkey_enroll_window_seconds: int = DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS,
+        network: str = DEFAULT_ENROLL_NETWORK,
+        netuid: int = DEFAULT_ENROLL_NETUID,
     ) -> None:
+        preflight_signature_verifier()
+        self.network = validate_network(network)
+        self.netuid = validate_netuid(netuid)
         self.store = store
         self.limiter = limiter if limiter is not None else IpRateLimiter()
         if enroll_signature_ttl_seconds is None:
@@ -2519,23 +3316,40 @@ class RegistryApp:
             if method == "GET" and path == "/v1/attested":
                 return self._json(start_response, 200, self.store.board())
             return self._json(start_response, 404, {"error": "not found"})
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_contention(exc):
+                raise
+            logger.warning("enroll deferred: registry busy")
+            return self._json(
+                start_response,
+                503,
+                {"error": "registry busy, retry shortly"},
+                headers=[("Retry-After", str(ENROLL_BUSY_RETRY_AFTER_SECONDS))],
+            )
         except ValueError as exc:
             return self._json(start_response, 400, {"error": str(exc)})
         except json.JSONDecodeError:
             return self._json(start_response, 400, {"error": "invalid json"})
 
+    def _client_ip(self, environ: dict[str, Any]) -> str:
+        """Use one proxy-overwritten IP literal, otherwise the socket peer."""
+        remote = environ.get("REMOTE_ADDR", "")
+        if not isinstance(remote, str):
+            remote = ""
+        if not self.trusted_proxy:
+            return remote
+        forwarded = environ.get("HTTP_X_FORWARDED_FOR")
+        if not isinstance(forwarded, str) or "," in forwarded or "%" in forwarded:
+            return remote
+        candidate = forwarded.strip()
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            return remote
+        return str(address)
+
     def _enroll(self, environ: dict[str, Any], start_response: Any) -> list[bytes]:
-        # Never trust X-Forwarded-For unless the app is explicitly configured to
-        # run behind a trusted reverse proxy.  A spoofed header lets any client
-        # pick an arbitrary source IP and bypass the per-address rate limit.
-        if self.trusted_proxy:
-            ip = (
-                environ.get("HTTP_X_FORWARDED_FOR", environ.get("REMOTE_ADDR", ""))
-                .split(",")[0]
-                .strip()
-            )
-        else:
-            ip = environ.get("REMOTE_ADDR", "")
+        ip = self._client_ip(environ)
         if not self.limiter.allow(ip or "unknown"):
             return self._reject(
                 start_response,
@@ -2595,12 +3409,43 @@ class RegistryApp:
         claimed_coldkey: str | None = None
         requested_profile_id: str | None = None
         if not policy_configured:
-            signed_bytes = canonical_enroll_payload(
-                hotkey, endpoint_url, nonce, timestamp
-            )
-            verify_enroll_signature(
-                hotkey, signed_bytes, payload.get("signature_b64")
-            )
+            if self.coldkey_allowlist is not None:
+                network = validate_network(payload.get("network"))
+                netuid = validate_netuid(payload.get("netuid"))
+                if (network, netuid) != (self.network, self.netuid):
+                    return self._reject(
+                        start_response,
+                        403,
+                        "enrollment is for a different network or netuid",
+                        hotkey=hotkey,
+                        reason="wrong_audience",
+                    )
+                signed_bytes = canonical_allowlist_enroll_payload(
+                    hotkey,
+                    endpoint_url,
+                    nonce,
+                    timestamp,
+                    network=network,
+                    netuid=netuid,
+                )
+            else:
+                signed_bytes = canonical_legacy_enroll_payload(
+                    hotkey, endpoint_url, nonce, timestamp
+                )
+            try:
+                verify_enroll_signature(
+                    hotkey, signed_bytes, payload.get("signature_b64")
+                )
+            except ValueError:
+                if self.coldkey_allowlist is None:
+                    raise
+                return self._reject(
+                    start_response,
+                    403,
+                    "enrollment signature did not verify",
+                    hotkey=hotkey,
+                    reason="signature_invalid",
+                )
         else:
             # v2 request. Every field the registry acts on is inside the
             # signature. There is no downgrade path: once a policy is
@@ -2971,20 +3816,55 @@ class RegistryApp:
         return payload
 
     @staticmethod
-    def _json(start_response: Any, status: int, payload: dict[str, Any]) -> list[bytes]:
+    def _json(
+        start_response: Any,
+        status: int,
+        payload: dict[str, Any],
+        *,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> list[bytes]:
         reason = {
             200: "OK",
             400: "Bad Request",
             403: "Forbidden",
             404: "Not Found",
             429: "Too Many Requests",
+            503: "Service Unavailable",
         }.get(status, "OK")
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
         start_response(
             f"{status} {reason}",
-            [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(body))),
+                *(headers or []),
+            ],
         )
         return [body]
+
+
+class _QuietRequestHandler(WSGIRequestHandler):
+    """Bound connection lifetime and avoid reverse DNS on the listener."""
+
+    timeout = 10
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        message = format % args if args else format
+        sanitized = "".join(
+            character if 0x20 <= ord(character) <= 0x7E else "?"
+            for character in message[:512]
+        )
+        logger.info("http %s", sanitized)
+
+    def address_string(self) -> str:
+        return self.client_address[0]
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except TimeoutError:
+            self.close_connection = True
 
 
 def main() -> None:
@@ -3009,9 +3889,9 @@ def main() -> None:
         "--registered-hotkeys-file",
         metavar="PATH",
         help=(
-            "path to a JSON array, JSON {'hotkeys': [...]} object, or "
-            "newline-delimited file of registered hotkeys; used as the "
-            "RegistrationProvider. Mandatory when --production-mode is set."
+            "registration snapshot. Production requires the finalized, "
+            "audience-bound cathedral_registration_snapshot_v2 document; "
+            "legacy list formats are development-only"
         ),
     )
     parser.add_argument(
@@ -3121,14 +4001,24 @@ def main() -> None:
     )
     parser.add_argument(
         "--network",
-        default="finney",
-        help="network the admission policy must be bound to (default: finney)",
+        default=DEFAULT_ENROLL_NETWORK,
+        help="network the enrollment artifact and request must be bound to",
     )
     parser.add_argument(
         "--netuid",
         type=int,
-        default=39,
-        help="netuid the admission policy must be bound to (default: 39)",
+        default=DEFAULT_ENROLL_NETUID,
+        help="netuid the enrollment artifact and request must be bound to",
+    )
+    parser.add_argument(
+        "--sqlite-busy-timeout-ms",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "bounded wait for the registry lock before answering 503 "
+            f"(default: {DEFAULT_SQLITE_BUSY_TIMEOUT_MS})"
+        ),
     )
     args = parser.parse_args()
 
@@ -3138,6 +4028,13 @@ def main() -> None:
         parser.error("--enroll-allowlist-max-age-seconds must be a positive integer")
     if args.admission_policy_max_age_seconds <= 0:
         parser.error("--admission-policy-max-age-seconds must be a positive integer")
+    if args.sqlite_busy_timeout_ms is not None and args.sqlite_busy_timeout_ms <= 0:
+        parser.error("--sqlite-busy-timeout-ms must be a positive integer")
+    try:
+        args.network = validate_network(args.network)
+        args.netuid = validate_netuid(args.netuid)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.production_mode and not args.registered_hotkeys_file:
         parser.error("--production-mode requires --registered-hotkeys-file")
@@ -3190,11 +4087,28 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    try:
+        verifier_source = preflight_signature_verifier()
+    except SignatureVerifierUnavailable as exc:
+        parser.exit(2, f"refusing to serve: {exc}\n")
+    logger.info("sr25519 verifier ready source=%s", verifier_source)
+
+    store = RegistryStore(
+        args.db,
+        production_mode=args.production_mode,
+        busy_timeout_ms=args.sqlite_busy_timeout_ms,
+    )
+
     provider: RegistrationProvider | None = None
     if args.registered_hotkeys_file:
         provider = JsonHotkeyRegistrationProvider(
             args.registered_hotkeys_file,
             max_age_seconds=args.registration_max_age_seconds,
+            strict=args.production_mode,
+            network=args.network,
+            netuid=args.netuid,
+            high_water_store=store if args.production_mode else None,
+            advance_high_water_on_use=args.production_mode,
         )
 
     allowlist: SignedColdkeyAllowlistProvider | None = None
@@ -3227,14 +4141,18 @@ def main() -> None:
         )
 
     app = RegistryApp(
-        RegistryStore(args.db, production_mode=args.production_mode),
+        store,
         trusted_proxy=args.trusted_proxy,
         production_mode=args.production_mode,
         registration_provider=provider,
         coldkey_allowlist=allowlist,
         admission_policy=admission,
+        network=args.network,
+        netuid=args.netuid,
     )
-    with make_server(args.host, args.port, app) as server:
+    with make_server(
+        args.host, args.port, app, handler_class=_QuietRequestHandler
+    ) as server:
         logger.info("serving registry on http://%s:%d", args.host, args.port)
         server.serve_forever()
 

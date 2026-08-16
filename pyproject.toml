@@ -12,8 +12,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Additional validator-chain and test tooling.
-dev = ["pytest>=8.0", "substrate-interface>=1.7.0"]
+# The public enrollment service verifies sr25519 signatures but never opens a
+# wallet. The miner-side submit command opens a local Bittensor wallet. Keep
+# the roles explicit so immutable production environments install only the
+# key implementation they execute.
+enrollment-service = ["substrate-interface>=1.7.0,<2"]
+enrollment-miner = ["bittensor-wallet>=4.0.1,<5"]
+# Install this role in its own producer environment. Bittensor 10 uses cyscale,
+# while substrate-interface uses py-scale-codec under the same module name.
+enrollment-operator = ["bittensor>=10.3.1,<11"]
+# Additional validator-chain and test tooling. The producer role stays out of
+# this environment to avoid combining those incompatible codec stacks.
+dev = [
+  "pytest>=8.0",
+  "substrate-interface>=1.7.0,<2",
+  "bittensor-wallet>=4.0.1,<5",
+]
 
 [project.scripts]
 cathedral = "cathedral.cli:main"

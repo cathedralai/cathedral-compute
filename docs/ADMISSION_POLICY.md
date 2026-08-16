@@ -272,6 +272,13 @@ The legacy path is untouched by this change and still works exactly as
 artifact no longer covers, and retires them with `--remove`. It accepts either
 approval artifact, because it is the only way to free enrollment capacity.
 
+Report-only use permits omitted pins for development. Destructive use requires
+both `--admission-policy-keys-digest` and `--admission-policy-digest`, sourced
+from the approved release record. The first fixes the signer set. The second
+fixes the exact current policy and blocks replay of an older still-valid signed
+policy. The equivalent allowlist path requires `--allowlist-keys-digest` and
+`--allowlist-digest`.
+
 Its meaning depends on the mode. Under `selected` it flags rows whose coldkey
 is not approved. Under `all_registered` there is no approved-coldkey set, so
 coldkey approval is not a criterion — applying one anyway would flag every row

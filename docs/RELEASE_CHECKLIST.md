@@ -83,32 +83,59 @@ tampering. Compute it against the deployed installation.
 
 ## Standing gate: reconcile the allowlist (#56)
 
-Coldkey approval is enforced **only at enrollment time**. `is_allowed` is
-consulted in the enrollment request handler (`cathedral/enroll.py:2425`) and
-nowhere else, so a worker that enrolled while its coldkey was approved keeps its
+Coldkey approval is enforced **only at enrollment time**. A worker that
+enrolled while its coldkey was approved keeps its
 registry row, keeps being probed, and keeps earning after that coldkey is
 removed from the allowlist. Nothing revokes it on its own.
 
 The remedy exists and is effective, but it is manual:
+
+Build the exact reviewed enrollment release with its production verifier
+dependency, then run the startup known-answer check before installing the
+immutable environment:
+
+```bash
+python -m pip install '.[enrollment-service]'
+python -c 'from cathedral.enroll import preflight_signature_verifier; print(preflight_signature_verifier())'
+```
+
+On the separate snapshot-producer host, install the chain-client role:
+
+```bash
+python -m venv .snapshot-producer
+. .snapshot-producer/bin/activate
+python -m pip install '.[enrollment-operator]'
+python -c 'from importlib.metadata import version; import bittensor; print(version("bittensor"))'
+```
 
 ```bash
 cathedral enroll reconcile \
   --registry-db /data/registry.sqlite \
   --allowlist /etc/cathedral/enroll-allowlist-sn39.r2.json \
   --allowlist-keys /etc/cathedral/enroll-allowlist-keys.json \
-  --registered-hotkeys-file /path/to/registration-snapshot.json
+  --registered-hotkeys-file /path/to/registration-snapshot.json \
+  --allowlist-keys-digest sha256:<trusted-key-file-digest> \
+  --allowlist-digest sha256:<exact-approved-artifact-digest>
   # add --remove to retire the flagged rows, omit it to see them first
 ```
 
 Run it without `--remove` first and read the flagged set; that output is the
 answer to "who is currently earning who should not be".
+Before adding `--remove`, verify both digests against the release record. Never
+derive the destructive-run pins from the files at the paths being reconciled.
 
 Make this a release gate and a recurring one:
 
-- [ ] run reconcile before cutting the release, record the flagged set
+- [ ] run reconcile before cutting the release, record the flagged set and the
+      durable registration-snapshot block high-water mark
 - [ ] run it again after any allowlist revocation, since revoking alone changes nothing
-- [ ] note the allowlist expiry, release 2 lapses **2026-08-29**, and a lapsed
-      allowlist means no new enrollments at all
+- [ ] record the deployed allowlist release, digest, validity end, and staleness
+      deadline. A lapsed artifact means no new enrollments
+- [ ] generate the registration snapshot from a finalized head with
+      `scripts/cathedral_enroll_allowlist.py snapshot`, then verify its network,
+      netuid, block, required hotkeys, uid, mode, and age
+- [ ] take `cathedral enroll backup` before changing the deployed service or
+      SQLite journal mode. Never copy a live registry file with `cp`
 
 This is currently low-risk because the approved set is small and admits no
 external miners, which is exactly why it is easy to forget once it does.

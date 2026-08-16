@@ -16,20 +16,68 @@ the durable owner identity: hotkeys rotate and one operator may run several.
 
 ## Extended registration snapshot
 
-`JsonHotkeyRegistrationProvider` accepts the existing hotkeys-only formats
-(JSON array, `{"hotkeys": [...]}`, newline-delimited) plus the extended form:
+Outside production, `JsonHotkeyRegistrationProvider` accepts the existing
+hotkeys-only formats (JSON array, `{"hotkeys": [...]}`, newline-delimited)
+plus the extended form. Production accepts only the strict version 2 form:
 
 ```json
-{"hotkeys": {"<hotkey ss58>": "<coldkey ss58>", "...": "..."}}
+{
+  "schema": "cathedral_registration_snapshot_v2",
+  "network": "finney",
+  "netuid": 39,
+  "block": 9000000,
+  "block_is_finalized": true,
+  "generated_at": "2026-08-16T00:00:00Z",
+  "hotkeys": {"<hotkey ss58>": "<coldkey ss58>"}
+}
 ```
 
-Hotkeys-only snapshots keep working for the registration gate, but they carry
-no ownership data, so coldkey resolution fails closed until the rotation cron
-emits the extended format. The same mtime-based `max_age_seconds` staleness
-bound applies to every format. A snapshot that parses to zero hotkeys is
-never treated as valid, in any format: on a live subnet the validator itself
-is always registered, so an empty snapshot can only be a torn or failed
-rotation write, and is refused the same as a stale or malformed one.
+The production reader checks the schema, network, netuid, declared generation
+time, finalized-block claim, block regression, mapping size, ownership, file
+type, inode, uid, mode, mtime, and byte size. Any mismatch fails closed.
+Hotkeys-only formats remain development-compatible, but cannot resolve a
+coldkey.
+
+Generate and atomically rotate the strict snapshot from the finalized head in
+a dedicated producer environment. Do not add the operator extra to the public
+service environment:
+
+```bash
+python -m venv .snapshot-producer
+. .snapshot-producer/bin/activate
+python -m pip install '.[enrollment-operator]'
+python scripts/cathedral_enroll_allowlist.py snapshot \
+  --network finney \
+  --netuid 39 \
+  --output /etc/cathedral/registered-hotkeys-sn39.json \
+  --require-hotkey <expected-hotkey>
+```
+
+The operator extra installs the Bittensor SDK used to read the finalized
+metagraph. It is separate from `enrollment-service`, so the public enrollment
+listener does not install chain-client dependencies or combine incompatible
+codec stacks. The command refuses an empty or mismatched metagraph and never
+substitutes the best unfinalized head.
+
+Build the immutable enrollment-service environment from the exact reviewed
+source revision with the service extra. A base install does not promise an
+sr25519 implementation:
+
+```bash
+python -m pip install '.[enrollment-service]'
+python -c 'from cathedral.enroll import preflight_signature_verifier; print(preflight_signature_verifier())'
+```
+
+The service refuses to open its listener unless this known-answer preflight
+accepts a valid sr25519 signature and rejects a corrupted one.
+
+## Enrollment signature
+
+An allowlist-v1 request includes `network` and `netuid`. Its sr25519 signature
+covers canonical JSON with these fields plus
+`"domain":"cathedral-enroll-v1"`. A signature for another network, subnet, or
+protocol does not verify. A bare legacy-v1 signature is accepted only by a
+development registry with no admission artifact configured.
 
 ## Allowlist artifact format
 
@@ -111,12 +159,11 @@ document; `cathedral enroll reconcile` prints it as `allowlist_digest`.
 
 ## Rotation
 
-Rotate the allowlist by writing a new signed document in place with a higher
-`release` and a fresh `generated_at`. The registry re-reads and re-verifies
-the file on every enrollment request, so no restart is needed unless the
-artifact digest is pinned. A stuck rotation is caught by the staleness
-ceiling within one `--enroll-allowlist-max-age-seconds` interval, after which
-all enrollment fails closed.
+Use `scripts/cathedral_enroll_allowlist.py sign` to write a new signed document
+with a higher `release` and a fresh `generated_at`. The tool refuses to
+overwrite an existing destination. Install the reviewed artifact by atomic
+replacement. The registry re-reads and re-verifies it on each enrollment. A
+production artifact-digest pin requires a controlled restart with the new pin.
 
 ## Fail-closed matrix
 
@@ -150,13 +197,35 @@ gate; only new POSTs are affected.
 
 ## Gate ordering
 
-Inside `POST /v1/enroll`: per-IP rate limit, payload validation, and sr25519
-signature verification run first (the signature authenticates the caller
-before anything else is decided). The cheap local gates follow: subnet
-registration, coldkey resolution, allowlist membership. Only a request that
-passes all of them records the durable per-hotkey attempt and reaches the
-store, so a rejected request never burns attempt budget or creates any
-durable row.
+Inside `POST /v1/enroll`: the bounded per-IP limiter, payload validation, and
+sr25519 verification run first. An exact replay is rejected without consuming
+the durable budget. Every other authenticated attempt is atomically counted
+before registration and allowlist verification, because those artifact checks
+also consume service work. Rejection never creates an enrollment row.
+
+## Registry maintenance
+
+Do not copy a live SQLite registry with `cp`. Use the online backup command:
+
+```bash
+cathedral enroll backup \
+  --registry-db /data/cathedral-enroll.sqlite \
+  --out /data/backups/cathedral-enroll.before-wal.sqlite
+```
+
+The backup is built and integrity-checked in an owner-only staging file, then
+published create-only as one complete inode. A failed backup never publishes a
+partial destination, and an existing destination is never replaced.
+
+To switch between rollback-journal and WAL mode, require a fresh online backup
+in the same operator action:
+
+```bash
+cathedral enroll journal-mode \
+  --registry-db /data/cathedral-enroll.sqlite \
+  --mode wal \
+  --backup-to /data/backups/cathedral-enroll.pre-wal.sqlite
+```
 
 ## Testnet scope
 
@@ -179,18 +248,32 @@ cathedral enroll reconcile \
   --allowlist enroll-allowlist.json \
   --allowlist-keys enroll-allowlist-keys.json \
   --allowlist-keys-digest sha256:<hex> \
+  --allowlist-digest sha256:<hex> \
   --registered-hotkeys-file registered-hotkeys.json
 ```
 
 This lists every enrollment whose coldkey is unresolvable or absent from the
-allowlist, without changing anything. Add `--remove` to retire the flagged
-rows and clear their attestation verdicts. Removal is terminal lifecycle
+allowlist. A successful run records the snapshot block as the durable
+high-water mark, including without `--remove`, so a later process cannot replay
+an older snapshot. The high-water state binds both the block and the canonical
+snapshot digest, so a different mapping at the same block is also rejected.
+It does not change enrollment or lifecycle rows. Add `--remove` to retire the
+flagged rows and clear their attestation verdicts.
+
+Report-only use permits omitted pins for development. `--remove` requires both
+the selected key-file digest and the exact selected artifact digest. Take those
+pins from the approved release record, not from the files being checked. The key
+pin prevents a substituted signer. The artifact pin prevents replay of an older
+still-valid signed allowlist. The command validates both before reading the
+registration snapshot or changing lifecycle state.
+Removal is terminal lifecycle
 retirement rather than physical row deletion: the worker lifecycle ledger is
 append-only and its rows reference the enrollment, so the audit trail
 survives while the worker leaves the refresh set, the epoch target list, and
 the public verified count.
 
-The command aborts, touching nothing, when the allowlist fails verification
+The command aborts without advancing the high-water mark or changing lifecycle
+state when the allowlist fails verification
 or when the registration snapshot is stale, empty, malformed, or
 hotkeys-only: those states must never be interpreted as "nobody is
 approved". An empty snapshot in particular is always treated as a torn or

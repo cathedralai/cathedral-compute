@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
@@ -35,7 +36,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from substrateinterface import Keypair, KeypairType
 
-from cathedral.cli import cmd_enroll_reconcile
+from cathedral.cli import build_parser, cmd_enroll_reconcile
 from cathedral.coldkey_allowlist import (
     ColdkeyAllowlistError,
     SignedColdkeyAllowlistProvider,
@@ -44,10 +45,14 @@ from cathedral.coldkey_allowlist import (
     verify_allowlist,
 )
 from cathedral.enroll import (
+    DEFAULT_ENROLL_NETUID,
+    DEFAULT_ENROLL_NETWORK,
+    REGISTRATION_SNAPSHOT_SCHEMA,
     JsonHotkeyRegistrationProvider,
     RegistryApp,
     RegistryStore,
-    canonical_enroll_payload,
+    canonical_allowlist_enroll_payload,
+    canonical_legacy_enroll_payload,
     now_iso,
 )
 from cathedral.lifecycle import WorkerLifecycleState
@@ -81,17 +86,25 @@ def _signed_payload(
     hotkey: str = HOTKEY,
     nonce: str = "aa" * 16,
     timestamp: str | None = None,
-) -> dict[str, str]:
+    domain_bound: bool = True,
+) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
-    message = canonical_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    message = (
+        canonical_allowlist_enroll_payload(hotkey, endpoint_url, nonce, ts)
+        if domain_bound
+        else canonical_legacy_enroll_payload(hotkey, endpoint_url, nonce, ts)
+    )
     sig = b64encode(keypair.sign(message)).decode("ascii")
-    return {
+    payload: dict[str, object] = {
         "hotkey": hotkey,
         "endpoint_url": endpoint_url,
         "nonce": nonce,
         "timestamp": ts,
         "signature_b64": sig,
     }
+    if domain_bound:
+        payload.update(network="finney", netuid=39)
+    return payload
 
 
 def _call(
@@ -146,7 +159,19 @@ def _write_allowlist(path: Path, document: dict) -> None:
 
 def _snapshot_file(tmp_path: Path, mapping: dict[str, str] | list[str]) -> Path:
     hk_file = tmp_path / "registered-hotkeys.json"
-    hk_file.write_text(json.dumps({"hotkeys": mapping}))
+    document: dict[str, object] = {"hotkeys": mapping}
+    if isinstance(mapping, dict):
+        document.update(
+            {
+                "schema": REGISTRATION_SNAPSHOT_SCHEMA,
+                "network": DEFAULT_ENROLL_NETWORK,
+                "netuid": DEFAULT_ENROLL_NETUID,
+                "block": 9_000_000,
+                "block_is_finalized": True,
+                "generated_at": now_iso(),
+            }
+        )
+    hk_file.write_text(json.dumps(document))
     return hk_file
 
 
@@ -218,6 +243,21 @@ def test_non_allowlisted_coldkey_rejected_with_logged_reason(
     assert "reason=coldkey_not_allowlisted" in caplog.text
     assert f"hotkey={HOTKEY}" in caplog.text
     assert f"coldkey={COLDKEY}" in caplog.text
+
+
+def test_allowlist_signature_failure_is_an_authentication_rejection(
+    tmp_path: Path,
+) -> None:
+    app = _app(
+        tmp_path,
+        registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
+        coldkey_allowlist=_allowlist_provider(tmp_path, [COLDKEY]),
+    )
+    payload = _signed_payload(nonce="12" * 16)
+    payload["endpoint_url"] = "https://8.8.4.4:9443"
+    status, body = _call(app, payload)
+    assert status == 403
+    assert body["error"] == "enrollment signature did not verify"
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +412,9 @@ def test_production_mode_without_allowlist_rejects_all(tmp_path: Path) -> None:
         registration_provider=_provider(tmp_path, {HOTKEY: COLDKEY}),
         coldkey_allowlist=None,
     )
-    status, body = _call(app, _signed_payload(nonce="40" * 16))
+    status, body = _call(
+        app, _signed_payload(nonce="40" * 16, domain_bound=False)
+    )
     assert status == 403
     assert "allowlist not configured" in body["error"]
     assert app.store.enrollments() == []
@@ -381,7 +423,10 @@ def test_production_mode_without_allowlist_rejects_all(tmp_path: Path) -> None:
 def test_non_production_without_allowlist_keeps_current_behavior(tmp_path: Path) -> None:
     app = _app(tmp_path, production_mode=False)
     status, body = _call(
-        app, _signed_payload("https://miner.example.com:8090", nonce="41" * 16)
+        app,
+        _signed_payload(
+            "https://miner.example.com:8090", nonce="41" * 16, domain_bound=False
+        ),
     )
     assert status == 200
     assert body["status"] == "enrolled"
@@ -472,11 +517,24 @@ def test_rejected_enrollment_still_consumes_attempt_budget(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 def _reconcile_args(tmp_path: Path, *, remove: bool) -> argparse.Namespace:
+    allowlist_path = tmp_path / "allowlist.json"
+    keys_path = tmp_path / "keys.json"
     return argparse.Namespace(
         registry_db=str(tmp_path / "reconcile.sqlite"),
-        allowlist=str(tmp_path / "allowlist.json"),
-        allowlist_keys=str(tmp_path / "keys.json"),
-        allowlist_keys_digest=None,
+        allowlist=str(allowlist_path),
+        allowlist_keys=str(keys_path),
+        allowlist_keys_digest=(
+            "sha256:" + hashlib.sha256(keys_path.read_bytes()).hexdigest()
+            if remove
+            else None
+        ),
+        allowlist_digest=(
+            "sha256:" + hashlib.sha256(allowlist_path.read_bytes()).hexdigest()
+            if remove
+            else None
+        ),
+        network=DEFAULT_ENROLL_NETWORK,
+        netuid=DEFAULT_ENROLL_NETUID,
         allowlist_max_age_seconds=86400,
         registered_hotkeys_file=str(tmp_path / "registered-hotkeys.json"),
         registration_max_age_seconds=3600,
@@ -514,6 +572,25 @@ def test_reconcile_lists_non_allowlisted_without_changes(
     assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
 
 
+def test_reconcile_help_declares_destructive_pin_contract(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["enroll", "reconcile", "--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    for flag in (
+        "--allowlist-keys-digest",
+        "--allowlist-digest",
+        "--admission-policy-keys-digest",
+        "--admission-policy-digest",
+    ):
+        assert flag in help_text
+    assert "requires the selected key-file and artifact digest pins" in " ".join(
+        help_text.split()
+    )
+
+
 def test_reconcile_remove_retires_only_non_allowlisted(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -532,6 +609,55 @@ def test_reconcile_remove_retires_only_non_allowlisted(
         )
 
 
+@pytest.mark.parametrize("missing", ["allowlist_keys_digest", "allowlist_digest"])
+def test_reconcile_remove_requires_both_allowlist_pins_without_mutation(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    args = _reconcile_args(tmp_path, remove=True)
+    setattr(args, missing, None)
+
+    with pytest.raises(ValueError, match=f"--remove requires --{missing.replace('_', '-')}"):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("attribute", "message"),
+    [
+        ("allowlist_keys_digest", "key digest does not match"),
+        ("allowlist_digest", "allowlist digest does not match"),
+    ],
+)
+def test_reconcile_remove_rejects_mismatched_allowlist_pins(
+    tmp_path: Path, attribute: str, message: str
+) -> None:
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    args = _reconcile_args(tmp_path, remove=True)
+    setattr(args, attribute, "sha256:" + "0" * 64)
+
+    with pytest.raises(ValueError, match=message):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
+
+
+@pytest.mark.parametrize("attribute", ["allowlist_keys_digest", "allowlist_digest"])
+def test_reconcile_rejects_malformed_digest_pin_grammar(
+    tmp_path: Path, attribute: str
+) -> None:
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    args = _reconcile_args(tmp_path, remove=True)
+    setattr(args, attribute, "sha256:ABC")
+
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        cmd_enroll_reconcile(args)
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
+
+
 def test_reconcile_flags_unresolvable_rows(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -547,8 +673,52 @@ def test_reconcile_flags_unresolvable_rows(
 def test_reconcile_aborts_on_hotkeys_only_snapshot(tmp_path: Path) -> None:
     _reconcile_fixture(tmp_path)
     _snapshot_file(tmp_path, [HOTKEY])
-    with pytest.raises(ValueError, match="no coldkey mapping"):
+    with pytest.raises(ValueError, match="registration snapshot"):
         cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=True))
+
+
+def test_reconcile_aborts_on_wrong_snapshot_audience_without_removing(
+    tmp_path: Path,
+) -> None:
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    snapshot_path = tmp_path / "registered-hotkeys.json"
+    document = json.loads(snapshot_path.read_text())
+    document["network"] = "test"
+    snapshot_path.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="registration snapshot"):
+        cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=True))
+
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
+
+
+def test_reconcile_dry_run_persists_block_high_water_and_rejects_rollback(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    store, approved, rogue = _reconcile_fixture(tmp_path)
+    snapshot_path = tmp_path / "registered-hotkeys.json"
+    document = json.loads(snapshot_path.read_text())
+    document["block"] = 9_000_001
+    snapshot_path.write_text(json.dumps(document))
+
+    assert cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=False)) == 0
+    capsys.readouterr()
+    assert (
+        store.registration_snapshot_high_water(
+            DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID
+        )
+        == 9_000_001
+    )
+
+    document["block"] = 9_000_000
+    document["generated_at"] = now_iso()
+    snapshot_path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="registration snapshot"):
+        cmd_enroll_reconcile(_reconcile_args(tmp_path, remove=False))
+
+    assert store.lifecycle_snapshot(rogue).state is WorkerLifecycleState.PENDING
+    assert store.lifecycle_snapshot(approved).state is WorkerLifecycleState.PENDING
 
 
 def test_reconcile_aborts_on_stale_snapshot(tmp_path: Path) -> None:
