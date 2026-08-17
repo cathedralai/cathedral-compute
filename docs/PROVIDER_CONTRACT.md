@@ -91,26 +91,25 @@ no wall-clock time, no random identifiers, so a second run is byte-identical.
 Never hand-edit a vector. Change the contract, rerun the generator, and let the
 digest assertions record the change.
 
-### This repository supersedes the plan on wire format
+### This repository is canonical for the wire format
 
-The fast-start sandbox plan carries an earlier draft of this contract. Where the
-two disagree, this repository is canonical, because it is the artifact the tests
-execute. The differences are deliberate, not drift:
+Earlier design drafts of this contract are in circulation. Where any of them
+disagrees with this repository, this repository wins, because it is the artifact
+the tests execute. The differences below are deliberate, not drift:
 
-- Field names. The plan uses `nonce` and `workload_digest`. The wire format uses
-  `provider_nonce` and `workload_manifest_digest`.
+- Field names are `provider_nonce` and `workload_manifest_digest`. Drafts using
+  `nonce` and `workload_digest` are superseded.
 - `budget_micros` is refused inside `workload_manifest` and `policy_document`.
-  The plan's assignment example sends it to the provider in the clear. A
-  provider does not need the customer's budget to execute one bounded job, and
-  the permit binds the assignment without it.
-- Attempt transitions. The plan's table lets `DISPATCH_PENDING` reach `FAILED`
-  directly while every sibling state routes through a cleanup-pending state, and
-  it gives `SUCCESS_CLEANUP_PENDING` no abort edge, which leaves its own
-  fifteen-minute rule unrepresentable. This contract routes every failure
-  through a cleanup-pending state and adds the abort edges, so an unproven
-  cleanup deadline ends `FAILED` with a refund and can never produce a success.
+  A provider does not need the customer's budget to execute one bounded job, and
+  the permit binds the assignment without it. Any draft that puts a budget on
+  the provider-facing document is superseded.
+- Every failure routes through a cleanup-pending state, and the post-result
+  states carry abort edges. A draft that lets a state reach `FAILED` directly,
+  or that gives `SUCCESS_CLEANUP_PENDING` no abort edge, cannot represent its
+  own cleanup deadline rule. Here an unproven cleanup deadline ends `FAILED`
+  with a refund and can never produce a success.
 
-Anyone implementing the Polaris broker should build against this repository.
+Implementers should build against this repository.
 
 The composed attempt transcript contains the private ledger binding,
 reservation, settlement, customer ID, and logical job ID. It is an internal
