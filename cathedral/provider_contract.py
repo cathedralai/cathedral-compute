@@ -18,11 +18,19 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, Self
 
+from cathedral.workload import (
+    WORKLOAD_MANIFEST_SCHEMA,
+    ImageReference,
+    WorkloadAdmissionError,
+    WorkloadManifest,
+)
+
 
 PROVIDER_IDENTITY_SCHEMA = "cathedral_provider_identity_v1"
 CAPABILITY_SLOT_SCHEMA = "cathedral_provider_capability_slot_v1"
 CAPABILITY_INVENTORY_SCHEMA = "cathedral_provider_capability_inventory_v1"
 ATTEMPT_ASSIGNMENT_SCHEMA = "cathedral_attempt_assignment_v1"
+ATTEMPT_RESULT_SCHEMA = "cathedral_attempt_result_v1"
 ASSIGNMENT_PERMIT_SCHEMA = "cathedral_assignment_permit_v1"
 ASSIGNMENT_LEDGER_BINDING_SCHEMA = "cathedral_assignment_ledger_binding_v1"
 PROVIDER_DISPATCH_ENVELOPE_SCHEMA = "cathedral_provider_dispatch_envelope_v1"
@@ -56,6 +64,8 @@ class ProviderRejectionCode(str, Enum):
     PERMIT_NOT_YET_VALID = "permit_not_yet_valid"
     PERMIT_REPLAY = "permit_replay"
     PERMIT_SEQUENCE = "permit_sequence"
+    RESULT_NONCE_MISMATCH = "result_nonce_mismatch"
+    RESULT_MEASUREMENT_MISMATCH = "result_measurement_mismatch"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     WORKER_SETTLEMENT_CONFLICT = "worker_settlement_conflict"
 
@@ -937,6 +947,118 @@ class ProviderDispatchEnvelope:
         return cls.from_document(parse_canonical_json(data))
 
 
+_WORKLOAD_MANIFEST_DOCUMENT_KEYS = frozenset(
+    {
+        "schema",
+        "arguments_digest",
+        "artifact_digests",
+        "config_digest",
+        "default_service_credentials",
+        "host_integration",
+        "host_network",
+        "image_digest",
+        "image_reference",
+        "policy_digest",
+        "policy_id",
+        "privileged",
+        "registry",
+        "repository",
+        "resource_profile",
+        "runtime_profile",
+        "signature_digest",
+        "signer_identity",
+        "trust_root_id",
+    }
+)
+
+
+def parse_workload_manifest_document(document: object) -> WorkloadManifest:
+    """Parse a canonical document into the real `WorkloadManifest` it must represent.
+
+    `ProviderDispatchEnvelope` only checks that `workload_manifest` is
+    canonical JSON matching the assignment digest and free of forbidden
+    private fields.  An empty object with a matching digest satisfies that
+    check today, because nothing requires the payload to actually be a
+    `cathedral.workload.WorkloadManifest`.
+
+    This function closes that gap: it parses the document against the exact
+    schema `cathedral.workload.WorkloadManifest` defines and returns the real
+    typed object, so a caller gets the same policy-checked manifest that
+    passed admission rather than an unvalidated blob that merely hashes to
+    the right value.  It does not run admission policy or signature
+    verification; those already happened before this document was ever
+    placed on the wire.
+    """
+
+    if not isinstance(document, Mapping) or any(not isinstance(key, str) for key in document):
+        raise ProviderContractError("workload manifest must be an object with string keys")
+    _reject_provider_private_fields(document)
+    if frozenset(document) != _WORKLOAD_MANIFEST_DOCUMENT_KEYS:
+        raise ProviderContractError(
+            "workload manifest has missing or unknown fields for its real schema"
+        )
+    if document.get("schema") != WORKLOAD_MANIFEST_SCHEMA:
+        raise ProviderContractError("workload manifest schema is unsupported")
+
+    artifact_digests = document["artifact_digests"]
+    if not isinstance(artifact_digests, (list, tuple)) or any(
+        not isinstance(item, str) for item in artifact_digests
+    ):
+        raise ProviderContractError("workload manifest artifact digests are invalid")
+
+    try:
+        manifest = WorkloadManifest(
+            image=ImageReference.parse(document["image_reference"], production=False),
+            signer_identity=document["signer_identity"],  # type: ignore[arg-type]
+            trust_root_id=document["trust_root_id"],  # type: ignore[arg-type]
+            signature_digest=document["signature_digest"],  # type: ignore[arg-type]
+            policy_id=document["policy_id"],  # type: ignore[arg-type]
+            policy_digest=document["policy_digest"],  # type: ignore[arg-type]
+            arguments_digest=document["arguments_digest"],  # type: ignore[arg-type]
+            config_digest=document["config_digest"],  # type: ignore[arg-type]
+            resource_profile=document["resource_profile"],  # type: ignore[arg-type]
+            runtime_profile=document["runtime_profile"],  # type: ignore[arg-type]
+            artifact_digests=tuple(artifact_digests),
+            default_service_credentials=document["default_service_credentials"],  # type: ignore[arg-type]
+            host_integration=document["host_integration"],  # type: ignore[arg-type]
+            host_network=document["host_network"],  # type: ignore[arg-type]
+            privileged=document["privileged"],  # type: ignore[arg-type]
+        )
+    except WorkloadAdmissionError as exc:
+        raise ProviderContractError(f"workload manifest is invalid: {exc}") from exc
+
+    if canonical_json_bytes(manifest.document()) != canonical_json_bytes(document):
+        raise ProviderContractError(
+            "workload manifest does not round-trip to the same canonical document"
+        )
+    return manifest
+
+
+def load_dispatch_workload_manifest(envelope: ProviderDispatchEnvelope) -> WorkloadManifest:
+    """Load and verify the real `WorkloadManifest` embedded in a dispatch envelope.
+
+    This is the sanctioned way for a dispatcher to guarantee the manifest it
+    is about to hand a provider is the exact policy-checked object that
+    passed admission: it parses `envelope.workload_manifest` against the real
+    workload schema and confirms the parsed manifest's own digest still
+    matches `envelope.assignment.workload_manifest_digest`.
+
+    A manifest that satisfies `cathedral.workload.WorkloadManifest` but also
+    carries a forbidden private field is still rejected; this does not weaken
+    the envelope's private-field rule.
+    """
+
+    if not isinstance(envelope, ProviderDispatchEnvelope):
+        raise ProviderContractError("dispatch envelope is invalid")
+    manifest = parse_workload_manifest_document(envelope.workload_manifest)
+    if manifest.digest != envelope.assignment.workload_manifest_digest:
+        raise ProviderContractError(
+            "loaded workload manifest digest does not match the assignment",
+            ProviderRejectionCode.DIGEST_MISMATCH,
+        )
+    return manifest
+
+
 def validate_assignment_slot(
     assignment: AttemptAssignment,
     slot: CapabilitySlot,
@@ -1262,6 +1384,125 @@ def require_attempt_transition(current: AttemptState, target: AttemptState) -> N
         raise ProviderContractError("attempt state is invalid")
     if target not in ALLOWED_ATTEMPT_TRANSITIONS[current]:
         raise ProviderContractError(f"illegal attempt transition {current.value} -> {target.value}")
+
+
+@dataclass(frozen=True)
+class AttemptResult:
+    """The provider's returned result and the attestation quote that vouches for it.
+
+    This is the record a RESULT_RECEIVED transition must reference instead of
+    a bare opaque digest.  It binds a quote to the exact fresh assignment it
+    answers: the nonce, the reported measurement, and the result payload.
+
+    The quote is treated as opaque bytes plus the fields it claims.  This
+    record does not verify Intel DCAP evidence, parse a real quote structure,
+    or independently confirm the reported measurement is genuine.  It only
+    checks that the claimed fields bind to the right assignment.  Independent
+    evidence verification remains a separate, future concern.
+    """
+
+    attempt_id: str
+    assignment_digest: str
+    quote_digest: str
+    attested_nonce: str
+    measurement_digest: str
+    result_payload_digest: str
+    produced_at: datetime
+    received_at: datetime
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.attempt_id, "attempt_id")
+        _digest(self.assignment_digest, "assignment_digest")
+        _digest(self.quote_digest, "quote_digest")
+        _bounded_text(self.attested_nonce, "attested_nonce", _NONCE_RE)
+        _digest(self.measurement_digest, "measurement_digest")
+        _digest(self.result_payload_digest, "result_payload_digest")
+        _canonical_utc(self.produced_at, "produced_at")
+        _canonical_utc(self.received_at, "received_at")
+        if self.received_at < self.produced_at:
+            raise ProviderContractError("attempt result was received before it was produced")
+
+    def to_document(self) -> Mapping[str, object]:
+        return {
+            "schema": ATTEMPT_RESULT_SCHEMA,
+            "attempt_id": self.attempt_id,
+            "assignment_digest": self.assignment_digest,
+            "quote_digest": self.quote_digest,
+            "attested_nonce": self.attested_nonce,
+            "measurement_digest": self.measurement_digest,
+            "result_payload_digest": self.result_payload_digest,
+            "produced_at": _canonical_utc(self.produced_at, "produced_at"),
+            "received_at": _canonical_utc(self.received_at, "received_at"),
+        }
+
+    @property
+    def digest(self) -> str:
+        return canonical_sha256(self)
+
+    @classmethod
+    def from_document(cls, document: object) -> Self:
+        value = _require_keys(
+            document,
+            schema=ATTEMPT_RESULT_SCHEMA,
+            keys=frozenset(
+                {
+                    "schema",
+                    "attempt_id",
+                    "assignment_digest",
+                    "quote_digest",
+                    "attested_nonce",
+                    "measurement_digest",
+                    "result_payload_digest",
+                    "produced_at",
+                    "received_at",
+                }
+            ),
+            label="attempt result",
+        )
+        return cls(
+            attempt_id=_bounded_text(value["attempt_id"], "attempt_id"),
+            assignment_digest=_digest(value["assignment_digest"], "assignment_digest"),
+            quote_digest=_digest(value["quote_digest"], "quote_digest"),
+            attested_nonce=_bounded_text(value["attested_nonce"], "attested_nonce", _NONCE_RE),
+            measurement_digest=_digest(value["measurement_digest"], "measurement_digest"),
+            result_payload_digest=_digest(
+                value["result_payload_digest"], "result_payload_digest"
+            ),
+            produced_at=_parse_utc(value["produced_at"], "produced_at"),
+            received_at=_parse_utc(value["received_at"], "received_at"),
+        )
+
+
+def validate_result_assignment(
+    assignment: AttemptAssignment,
+    result: AttemptResult,
+) -> None:
+    """Bind a provider's returned result and its quote to the exact assignment it answers.
+
+    A stale quote, one produced for an earlier or different attempt, attests
+    a different nonce than the assignment it is now presented against.  This
+    rejects it.  It also rejects a quote whose reported measurement is not
+    the assignment's pinned image digest.
+
+    This checks record bindings only.  It does not verify the quote's
+    signature, parse real DCAP evidence, or independently confirm the
+    measurement is genuine.
+    """
+
+    if not isinstance(assignment, AttemptAssignment) or not isinstance(result, AttemptResult):
+        raise ProviderContractError("attempt result inputs are invalid")
+    if result.attempt_id != assignment.attempt_id or result.assignment_digest != assignment.digest:
+        raise ProviderContractError("result does not match its attempt assignment")
+    if result.attested_nonce != assignment.provider_nonce:
+        raise ProviderContractError(
+            "quote attests a different nonce than this assignment issued",
+            ProviderRejectionCode.RESULT_NONCE_MISMATCH,
+        )
+    if result.measurement_digest != assignment.image_digest:
+        raise ProviderContractError(
+            "quote measurement does not match the assignment image digest",
+            ProviderRejectionCode.RESULT_MEASUREMENT_MISMATCH,
+        )
 
 
 @dataclass(frozen=True)

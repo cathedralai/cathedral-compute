@@ -17,6 +17,7 @@ from cathedral.provider_contract import (
     AssignmentLedgerBinding,
     AssignmentPermit,
     AttemptAssignment,
+    AttemptResult,
     AttemptState,
     AttemptTransitionEvent,
     CapabilityInventory,
@@ -44,7 +45,9 @@ from cathedral.provider_contract import (
     canonical_json_bytes,
     canonical_sha256,
     hash_idempotency_key,
+    load_dispatch_workload_manifest,
     parse_canonical_json,
+    parse_workload_manifest_document,
     require_attempt_transition,
     resolve_submission_idempotency,
     resolve_held_settlement,
@@ -56,12 +59,14 @@ from cathedral.provider_contract import (
     validate_assignment_slot,
     validate_cleanup_assignment,
     validate_interruption_assignment,
+    validate_result_assignment,
     validate_settlement,
     validate_settlement_supersession,
     validate_permit_renewal,
     validate_transition_assignment,
     validate_terminal_transition,
 )
+from cathedral.workload import ImageReference, WorkloadManifest
 
 
 NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
@@ -114,6 +119,44 @@ def _assignment(**changes: object) -> AttemptAssignment:
     }
     values.update(changes)
     return AttemptAssignment(**values)  # type: ignore[arg-type]
+
+
+def _result(
+    assignment: AttemptAssignment | None = None,
+    **changes: object,
+) -> AttemptResult:
+    bound_assignment = assignment or _assignment()
+    values: dict[str, object] = {
+        "attempt_id": bound_assignment.attempt_id,
+        "assignment_digest": bound_assignment.digest,
+        "quote_digest": DIGEST_D,
+        "attested_nonce": bound_assignment.provider_nonce,
+        "measurement_digest": bound_assignment.image_digest,
+        "result_payload_digest": DIGEST_E,
+        "produced_at": NOW,
+        "received_at": NOW + timedelta(seconds=1),
+    }
+    values.update(changes)
+    return AttemptResult(**values)  # type: ignore[arg-type]
+
+
+def _workload_manifest(**changes: object) -> WorkloadManifest:
+    values: dict[str, object] = {
+        "image": ImageReference.parse(
+            f"registry.example.com/cathedral/worker@{DIGEST_C}", production=False
+        ),
+        "signer_identity": "sigstore://cathedral/worker-release",
+        "trust_root_id": "cathedral-workload-root-v1",
+        "signature_digest": DIGEST_D,
+        "policy_id": "customer-cpu-v1",
+        "policy_digest": DIGEST_B,
+        "arguments_digest": DIGEST_A,
+        "config_digest": DIGEST_E,
+        "resource_profile": "cpu-small",
+        "runtime_profile": "confidential-cpu-v1",
+    }
+    values.update(changes)
+    return WorkloadManifest(**values)  # type: ignore[arg-type]
 
 
 def _permit(
@@ -498,6 +541,109 @@ def test_provider_dispatch_envelope_binds_exact_documents_and_rejects_private_fi
     assert private.value.code is ProviderRejectionCode.PRIVATE_FIELD_FORBIDDEN
 
 
+def test_result_binds_fresh_nonce_and_rejects_stale_swapped_and_mismatched() -> None:
+    assignment = _assignment()
+    result = _result(assignment)
+
+    validate_result_assignment(assignment, result)  # does not raise
+
+    stale_quote = replace(result, attested_nonce="9" * 64)
+    with pytest.raises(ProviderContractError) as stale:
+        validate_result_assignment(assignment, stale_quote)
+    assert stale.value.code is ProviderRejectionCode.RESULT_NONCE_MISMATCH
+
+    other_assignment = _assignment(attempt_id="attempt-other", provider_nonce="8" * 64)
+    with pytest.raises(ProviderContractError, match="does not match its attempt assignment"):
+        validate_result_assignment(other_assignment, result)
+
+    mismatched_measurement = replace(result, measurement_digest=DIGEST_B)
+    with pytest.raises(ProviderContractError) as mismatched:
+        validate_result_assignment(assignment, mismatched_measurement)
+    assert mismatched.value.code is ProviderRejectionCode.RESULT_MEASUREMENT_MISMATCH
+
+
+def test_result_cannot_be_received_before_it_was_produced() -> None:
+    assignment = _assignment()
+    with pytest.raises(ProviderContractError, match="received before it was produced"):
+        _result(assignment, produced_at=NOW + timedelta(seconds=1), received_at=NOW)
+
+
+def test_manifest_loader_parses_real_schema_not_merely_a_digest_match() -> None:
+    manifest = _workload_manifest()
+    document = manifest.document()
+    policy_document = {"schema": "cathedral_execution_policy_v1", "egress": "none"}
+    assignment = _assignment(
+        workload_manifest_digest=manifest.digest,
+        policy_digest=canonical_sha256(policy_document),
+    )
+    envelope = ProviderDispatchEnvelope(
+        assignment=assignment,
+        workload_manifest=document,
+        policy_document=policy_document,
+        permit=_permit(
+            assignment,
+            authorization_digest=DIGEST_D,
+        ),
+    )
+
+    loaded = load_dispatch_workload_manifest(envelope)
+
+    assert loaded == manifest
+    assert isinstance(loaded, WorkloadManifest)
+
+    # Before this loader existed, an empty object whose digest happened to
+    # match the assignment satisfied ProviderDispatchEnvelope's own shape
+    # checks. The loader must still refuse it: it is not a real manifest.
+    empty_digest = canonical_sha256({})
+    empty_assignment = _assignment(
+        workload_manifest_digest=empty_digest,
+        policy_digest=canonical_sha256(policy_document),
+    )
+    empty_envelope = ProviderDispatchEnvelope(
+        assignment=empty_assignment,
+        workload_manifest={},
+        policy_document=policy_document,
+        permit=_permit(empty_assignment, authorization_digest=DIGEST_D),
+    )
+    with pytest.raises(ProviderContractError, match="missing or unknown fields"):
+        load_dispatch_workload_manifest(empty_envelope)
+
+
+def test_manifest_loader_rejects_private_field_even_when_schema_otherwise_matches() -> None:
+    manifest = _workload_manifest()
+    smuggled = {**manifest.document(), "budget_micros": 5}
+
+    # ProviderDispatchEnvelope's own constructor already refuses this before
+    # the loader ever runs. Calling the loader's parser directly proves it
+    # independently enforces the same rule rather than relying only on the
+    # envelope to have caught it first.
+    with pytest.raises(ProviderContractError) as private:
+        parse_workload_manifest_document(smuggled)
+    assert private.value.code is ProviderRejectionCode.PRIVATE_FIELD_FORBIDDEN
+
+    policy_document = {"schema": "cathedral_execution_policy_v1", "egress": "none"}
+    assignment = _assignment(
+        workload_manifest_digest=canonical_sha256(smuggled),
+        policy_digest=canonical_sha256(policy_document),
+    )
+    with pytest.raises(ProviderContractError) as envelope_private:
+        ProviderDispatchEnvelope(
+            assignment=assignment,
+            workload_manifest=smuggled,
+            policy_document=policy_document,
+            permit=_permit(assignment, authorization_digest=DIGEST_D),
+        )
+    assert envelope_private.value.code is ProviderRejectionCode.PRIVATE_FIELD_FORBIDDEN
+
+
+def test_manifest_loader_rejects_inconsistent_redundant_image_fields() -> None:
+    manifest = _workload_manifest()
+    tampered = {**manifest.document(), "registry": "attacker.example.com"}
+
+    with pytest.raises(ProviderContractError, match="round-trip"):
+        parse_workload_manifest_document(tampered)
+
+
 def test_unassigned_dispatch_is_worker_level_and_has_no_provider_attempt_fields() -> None:
     outcome = UnassignedDispatchOutcome(
         outcome_id="unassigned-001",
@@ -527,6 +673,7 @@ def test_all_wire_records_round_trip_and_fail_closed_on_shape_or_schema() -> Non
         (_assignment(), AttemptAssignment),
         (_permit(), AssignmentPermit),
         (_binding(), AssignmentLedgerBinding),
+        (_result(), AttemptResult),
         (
             InterruptionOutcome(
                 attempt_id="attempt-001",
@@ -1277,3 +1424,54 @@ def test_checked_in_permit_renewal_vector_accepts_next_and_rejects_replay() -> N
     # Renewal is forward only: the superseded permit cannot come back.
     with pytest.raises(ProviderContractError):
         validate_permit_renewal(renewed, current, observed_at)
+
+
+def test_checked_in_attempt_result_golden_vector_is_stable() -> None:
+    vector = _load_vector("attempt-result-v1.json")
+    assignment = AttemptAssignment.from_document(vector["assignment"])
+    result = AttemptResult.from_document(vector["result"])
+
+    assert result.to_document() == vector["result"]
+    assert result.digest == vector["expected_digest"]
+    assert canonical_sha256(vector["result"]) == vector["expected_digest"]
+
+    # The vector's own result actually binds to its own assignment.
+    validate_result_assignment(assignment, result)
+
+
+def test_checked_in_stale_quote_vector_drives_the_real_rejection() -> None:
+    """The vector must reproduce the nonce-replay rejection, not merely parse.
+
+    This is the exact scenario the AttemptResult record exists to close: the
+    result record's attempt_id and assignment_digest are correctly relabeled
+    for the retry, exactly what a dispatcher's bookkeeping would naturally
+    carry forward, but the quote behind it was produced earlier and still
+    attests the first assignment's nonce. A check that stopped at attempt_id
+    and assignment_digest would accept this. Only inspecting the attested
+    nonce rejects it, which is the entire point of this record.
+    """
+    vector = _load_vector("stale-quote-v1.json")
+    first_assignment = AttemptAssignment.from_document(vector["first_assignment"])
+    second_assignment = AttemptAssignment.from_document(vector["second_assignment"])
+    stale_result = AttemptResult.from_document(vector["stale_quote_result"])
+
+    # The two assignments share a workload and image but not an attempt or nonce.
+    assert first_assignment.workload_manifest_digest == second_assignment.workload_manifest_digest
+    assert first_assignment.image_digest == second_assignment.image_digest
+    assert first_assignment.attempt_id != second_assignment.attempt_id
+    assert first_assignment.provider_nonce != second_assignment.provider_nonce
+
+    # The result record is correctly addressed to the retry...
+    assert stale_result.attempt_id == second_assignment.attempt_id
+    assert stale_result.assignment_digest == second_assignment.digest
+    # ...but the quote behind it still attests the first assignment's nonce.
+    assert stale_result.attested_nonce == first_assignment.provider_nonce
+
+    with pytest.raises(ProviderContractError) as stale:
+        validate_result_assignment(second_assignment, stale_result)
+    assert stale.value.code is ProviderRejectionCode.RESULT_NONCE_MISMATCH
+    assert stale.value.code.value == vector["expected_rejection_code"]
+
+    # It is not valid against the first assignment either: it never claimed to be.
+    with pytest.raises(ProviderContractError, match="does not match its attempt assignment"):
+        validate_result_assignment(first_assignment, stale_result)

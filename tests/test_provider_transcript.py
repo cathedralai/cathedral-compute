@@ -14,6 +14,7 @@ from cathedral.provider_contract import (
     AssignmentLedgerBinding,
     AssignmentPermit,
     AttemptAssignment,
+    AttemptResult,
     AttemptState,
     AttemptTransitionEvent,
     CleanupOutcome,
@@ -25,11 +26,13 @@ from cathedral.provider_contract import (
     ProviderContractError,
     ProviderIdentity,
     ProviderIdentityKind,
+    ProviderRejectionCode,
     SettlementAction,
     TerminalBasis,
     UnassignedDispatchOutcome,
     UnassignedDispatchReason,
     WorkerSettlementDecision,
+    validate_result_assignment,
 )
 from cathedral.provider_transcript import ProviderAttemptTranscript, WorkerExecutionTranscript
 
@@ -161,6 +164,25 @@ def _event(
     )
 
 
+def _result(
+    assignment: AttemptAssignment,
+    *,
+    produced_at: datetime,
+    received_at: datetime,
+    label: str = "result",
+) -> AttemptResult:
+    return AttemptResult(
+        attempt_id=assignment.attempt_id,
+        assignment_digest=assignment.digest,
+        quote_digest=_digest(f"{label}:quote"),
+        attested_nonce=assignment.provider_nonce,
+        measurement_digest=assignment.image_digest,
+        result_payload_digest=_digest(f"{label}:payload"),
+        produced_at=produced_at,
+        received_at=received_at,
+    )
+
+
 def _success_transcript(
     *,
     permit_expires_at: datetime = NOW + timedelta(seconds=30),
@@ -169,6 +191,12 @@ def _success_transcript(
     time_offset: int = 0,
 ) -> ProviderAttemptTranscript:
     assignment = _assignment(attempt_id=attempt_id, nonce=nonce)
+    result = _result(
+        assignment,
+        produced_at=NOW + timedelta(seconds=time_offset + 5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=time_offset + 6),
+        label=f"success:{attempt_id}",
+    )
     transitions = (
         (AttemptState.DISPATCH_PENDING, AttemptState.SLOT_CLAIMED),
         (AttemptState.SLOT_CLAIMED, AttemptState.ASSIGNMENT_SENT),
@@ -186,6 +214,7 @@ def _success_transcript(
             current=current,
             target=target,
             second=time_offset + index,
+            detail_digest=(result.digest if target is AttemptState.RESULT_RECEIVED else None),
         )
         for index, (current, target) in enumerate(transitions, start=1)
     )
@@ -219,6 +248,7 @@ def _success_transcript(
         ),
         events=events + (terminal,),
         cleanup=cleanup,
+        result=result,
     )
 
 
@@ -679,27 +709,27 @@ def test_transcript_canonical_round_trip_is_exact(build_transcript) -> None:
     [
         (
             "transcript-success-v1.json",
-            "sha256:b776ee5b4a6e53d2a51135b1f334cd95a6a98be0edbaa981c396fa4435e34e1c",
+            "sha256:17086f7639283e9bf8ffa2c435ded8fa93ba72a433536e8bbd275f7c1400f05a",
             AttemptState.SUCCEEDED,
         ),
         (
             "transcript-interrupted-v1.json",
-            "sha256:69810b58be2b6784f1e4b17cddb2da7359d77f589bbf72d999af2bd416dddc7e",
+            "sha256:78f4adb4279d572603f4d825c5b2d36740e2ce290e7588cf27b566f7227a3e62",
             AttemptState.INTERRUPTED,
         ),
         (
             "transcript-failed-v1.json",
-            "sha256:d54847bf71f91e165d2d438b17567481cbb014449f80e86cd8d8d39e15006f98",
+            "sha256:66f962fc29f962ac694998905890510f2c8957dbe7415bd22715f5f6fec5ff03",
             AttemptState.FAILED,
         ),
         (
             "transcript-cancelled-v1.json",
-            "sha256:919dbe9e52b0ffff7b030dab111befd7da293db91ed6b1c9befb9884b4221dad",
+            "sha256:e8013536de2fb7e6766be403e41fd1909ce4e3d0194b4e37be842715ab44eda8",
             AttemptState.CANCELLED,
         ),
         (
             "transcript-evidence-rejected-v1.json",
-            "sha256:598fbe56c6f2086b45000c8098612c1de6fde36a60535bc30a80ff90b2420844",
+            "sha256:cbb2487f573b6c27891f4768ec589e413c10c81d2193fd4b51ad518f17e069d1",
             AttemptState.FAILED,
         ),
     ],
@@ -735,7 +765,7 @@ def test_checked_in_worker_transcript_golden_vector_is_stable() -> None:
     assert transcript.canonical_bytes == wire_bytes
     assert (
         transcript.digest
-        == "sha256:a57552b025c4e3129185b1a5bca496e92c4f71987688faa65713f1faf64d2f7f"
+        == "sha256:eebfeb50e5df40cec3c5625e77adbdc811be96ba226aab40d99615d911e4760c"
     )
     assert transcript.final_settlement.winning_attempt_id == transcript.attempts[-1].assignment.attempt_id
 
@@ -1011,3 +1041,103 @@ def test_interrupt_cleanup_entry_must_bind_interruption() -> None:
 
     with pytest.raises(ProviderContractError, match="does not bind its interruption"):
         replace(transcript, events=tuple(events)).validate()
+
+
+def _result_received_index(transcript: ProviderAttemptTranscript) -> int:
+    return next(
+        index
+        for index, event in enumerate(transcript.events)
+        if event.target is AttemptState.RESULT_RECEIVED
+    )
+
+
+def test_result_received_transition_requires_a_matching_result_record() -> None:
+    transcript = _success_transcript()
+
+    with pytest.raises(
+        ProviderContractError, match="requires a matching result record"
+    ):
+        replace(transcript, result=None).validate()
+
+
+def test_result_received_transition_must_bind_its_result_record() -> None:
+    transcript = _success_transcript()
+    events = list(transcript.events)
+    events[_result_received_index(transcript)] = replace(
+        events[_result_received_index(transcript)],
+        detail_digest=MISMATCH_DIGEST,
+    )
+
+    with pytest.raises(ProviderContractError, match="does not bind its result record"):
+        replace(transcript, events=tuple(events)).validate()
+
+
+def test_result_without_a_result_received_event_is_rejected() -> None:
+    """An attempt that aborted before RUNNING never produced a result at all."""
+
+    transcript = _unsuccessful_transcript(
+        AttemptState.FAILED, attempt_id="attempt-failed-stray-result", nonce="a" * 64
+    )
+    stray_result = _result(
+        transcript.assignment,
+        produced_at=NOW + timedelta(seconds=1),
+        received_at=NOW + timedelta(seconds=2),
+        label="stray",
+    )
+
+    with pytest.raises(
+        ProviderContractError,
+        match="only an attempt that received a result may carry a result record",
+    ):
+        replace(transcript, result=stray_result).validate()
+
+
+def test_result_reused_from_another_attempt_is_rejected() -> None:
+    """A stale quote is rejected even when its detail_digest is bound correctly.
+
+    The RESULT_RECEIVED transition here does reference the borrowed result
+    record byte-for-byte, so the binding check alone would accept it. It is
+    validate_result_assignment's job to notice the result actually belongs
+    to a different attempt and assignment.
+    """
+
+    donor = _success_transcript(attempt_id="attempt-result-donor", nonce="b" * 64)
+    victim = _success_transcript(
+        attempt_id="attempt-result-victim", nonce="c" * 64, time_offset=20
+    )
+
+    events = list(victim.events)
+    events[_result_received_index(victim)] = replace(
+        events[_result_received_index(victim)],
+        detail_digest=donor.result.digest,
+    )
+
+    with pytest.raises(ProviderContractError, match="does not match its attempt assignment"):
+        replace(victim, events=tuple(events), result=donor.result).validate()
+
+
+def test_result_received_transition_cannot_precede_its_result() -> None:
+    """The control plane cannot log a transition before the result triggering it arrived."""
+
+    transcript = _success_transcript()
+    events = list(transcript.events)
+    result_index = _result_received_index(transcript)
+    events[result_index] = replace(
+        events[result_index],
+        occurred_at=transcript.result.received_at - timedelta(microseconds=1),
+    )
+
+    with pytest.raises(
+        ProviderContractError, match="occurred before its result was received"
+    ):
+        replace(transcript, events=tuple(events)).validate()
+
+
+def test_result_binds_the_assignment_it_answers() -> None:
+    transcript = _success_transcript()
+
+    assert transcript.result is not None
+    assert transcript.result.attempt_id == transcript.assignment.attempt_id
+    assert transcript.result.assignment_digest == transcript.assignment.digest
+    assert transcript.result.attested_nonce == transcript.assignment.provider_nonce
+    assert transcript.result.measurement_digest == transcript.assignment.image_digest

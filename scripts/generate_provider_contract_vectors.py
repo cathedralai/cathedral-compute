@@ -27,6 +27,7 @@ from cathedral.provider_contract import (
     AssignmentLedgerBinding,
     AssignmentPermit,
     AttemptAssignment,
+    AttemptResult,
     AttemptState,
     AttemptTransitionEvent,
     CleanupOutcome,
@@ -99,6 +100,94 @@ def build_assignment_vector() -> None:
 
 
 # ---------------------------------------------------------------------------
+# attempt-result-v1.json
+# ---------------------------------------------------------------------------
+
+
+def build_attempt_result_vector() -> None:
+    assignment = AttemptAssignment(
+        attempt_id="attempt-result-golden-001",
+        provider=_provider(),
+        slot_id="slot-useast1-a-001",
+        provider_nonce="e" * 64,
+        workload_manifest_digest=_vector_digest("result-golden:workload-manifest"),
+        policy_digest=_vector_digest("result-golden:policy-document"),
+        image_digest=_vector_digest("result-golden:image"),
+    )
+    result = AttemptResult(
+        attempt_id=assignment.attempt_id,
+        assignment_digest=assignment.digest,
+        quote_digest=_vector_digest("result-golden:quote"),
+        attested_nonce=assignment.provider_nonce,
+        measurement_digest=assignment.image_digest,
+        result_payload_digest=_vector_digest("result-golden:result-payload"),
+        produced_at=NOW + timedelta(seconds=5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=6),
+    )
+    document = {
+        "assignment": assignment.to_document(),
+        "result": result.to_document(),
+        "expected_digest": result.digest,
+    }
+    _write_json("attempt-result-v1.json", document)
+
+
+# ---------------------------------------------------------------------------
+# stale-quote-v1.json
+# ---------------------------------------------------------------------------
+
+
+def build_stale_quote_vector() -> None:
+    """A quote produced for one assignment, relabeled and presented for a retry.
+
+    This is the replay this record exists to reject.  The result record's own
+    attempt_id and assignment_digest are exactly the retry's, the fields a
+    dispatcher's bookkeeping would naturally carry forward, but the quote
+    bytes behind it were produced earlier: the nonce the quote actually
+    attests is still the first assignment's, not the fresh one the retry
+    issued.  A record that only checked attempt_id and assignment_digest
+    would accept this; checking the attested nonce is what rejects it.
+    """
+
+    label = "stale-quote-golden"
+    first_assignment = AttemptAssignment(
+        attempt_id="attempt-stale-quote-001",
+        provider=_provider(),
+        slot_id="slot-useast1-a-001",
+        provider_nonce="f" * 64,
+        workload_manifest_digest=_vector_digest(f"{label}:workload-manifest"),
+        policy_digest=_vector_digest(f"{label}:policy-document"),
+        image_digest=_vector_digest(f"{label}:image"),
+    )
+    second_assignment = AttemptAssignment(
+        attempt_id="attempt-stale-quote-002",
+        provider=_provider(),
+        slot_id="slot-useast1-a-001",
+        provider_nonce="0" * 64,
+        workload_manifest_digest=first_assignment.workload_manifest_digest,
+        policy_digest=first_assignment.policy_digest,
+        image_digest=first_assignment.image_digest,
+    )
+    stale_quote_result = AttemptResult(
+        attempt_id=second_assignment.attempt_id,
+        assignment_digest=second_assignment.digest,
+        quote_digest=_vector_digest(f"{label}:quote"),
+        attested_nonce=first_assignment.provider_nonce,
+        measurement_digest=second_assignment.image_digest,
+        result_payload_digest=_vector_digest(f"{label}:result-payload"),
+        produced_at=NOW + timedelta(seconds=5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=6),
+    )
+    document = {
+        "first_assignment": first_assignment.to_document(),
+        "second_assignment": second_assignment.to_document(),
+        "stale_quote_result": stale_quote_result.to_document(),
+        "expected_rejection_code": "result_nonce_mismatch",
+    }
+    _write_json("stale-quote-v1.json", document)
+
+
+# ---------------------------------------------------------------------------
 # Shared attempt-transcript construction
 # ---------------------------------------------------------------------------
 
@@ -164,12 +253,32 @@ def _event(
     )
 
 
+def _result(
+    assignment: AttemptAssignment,
+    *,
+    label: str,
+    produced_at: datetime,
+    received_at: datetime,
+) -> AttemptResult:
+    return AttemptResult(
+        attempt_id=assignment.attempt_id,
+        assignment_digest=assignment.digest,
+        quote_digest=_vector_digest(f"{label}:quote"),
+        attested_nonce=assignment.provider_nonce,
+        measurement_digest=assignment.image_digest,
+        result_payload_digest=_vector_digest(f"{label}:result-payload"),
+        produced_at=produced_at,
+        received_at=received_at,
+    )
+
+
 def _linear_events(
     assignment: AttemptAssignment,
     *,
     label: str,
     transitions: tuple[tuple[AttemptState, AttemptState], ...],
     start_second: int = 1,
+    result: AttemptResult | None = None,
 ) -> tuple[AttemptTransitionEvent, ...]:
     return tuple(
         _event(
@@ -179,6 +288,11 @@ def _linear_events(
             target=target,
             occurred_at=NOW + timedelta(seconds=start_second + index - 1),
             label=label,
+            detail_digest=(
+                result.digest
+                if result is not None and target is AttemptState.RESULT_RECEIVED
+                else None
+            ),
         )
         for index, (current, target) in enumerate(transitions, start=1)
     )
@@ -187,6 +301,12 @@ def _linear_events(
 def build_success_transcript() -> ProviderAttemptTranscript:
     label = "transcript-success-golden"
     assignment = _assignment(attempt_id="attempt-001", nonce="1" * 64, label=label)
+    result = _result(
+        assignment,
+        label=label,
+        produced_at=NOW + timedelta(seconds=5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=6),
+    )
     transitions = (
         (AttemptState.DISPATCH_PENDING, AttemptState.SLOT_CLAIMED),
         (AttemptState.SLOT_CLAIMED, AttemptState.ASSIGNMENT_SENT),
@@ -197,7 +317,7 @@ def build_success_transcript() -> ProviderAttemptTranscript:
         (AttemptState.RESULT_RECEIVED, AttemptState.EVIDENCE_VERIFIED),
         (AttemptState.EVIDENCE_VERIFIED, AttemptState.SUCCESS_CLEANUP_PENDING),
     )
-    events = _linear_events(assignment, label=label, transitions=transitions)
+    events = _linear_events(assignment, label=label, transitions=transitions, result=result)
     cleanup = CleanupOutcome(
         attempt_id=assignment.attempt_id,
         assignment_digest=assignment.digest,
@@ -223,6 +343,7 @@ def build_success_transcript() -> ProviderAttemptTranscript:
         permits=(_permit(assignment, label=label, issued_at=NOW, expires_at=NOW + timedelta(seconds=30)),),
         events=events + (terminal,),
         cleanup=cleanup,
+        result=result,
     )
 
 
@@ -380,6 +501,12 @@ def build_evidence_rejected_transcript() -> ProviderAttemptTranscript:
 
     label = "transcript-evidence-rejected-golden"
     assignment = _assignment(attempt_id="attempt-evidence-rejected-001", nonce="5" * 64, label=label)
+    result = _result(
+        assignment,
+        label=label,
+        produced_at=NOW + timedelta(seconds=5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=6),
+    )
     transitions = (
         (AttemptState.DISPATCH_PENDING, AttemptState.SLOT_CLAIMED),
         (AttemptState.SLOT_CLAIMED, AttemptState.ASSIGNMENT_SENT),
@@ -390,7 +517,7 @@ def build_evidence_rejected_transcript() -> ProviderAttemptTranscript:
         (AttemptState.RESULT_RECEIVED, AttemptState.EVIDENCE_REJECTED),
         (AttemptState.EVIDENCE_REJECTED, AttemptState.FAILURE_CLEANUP_PENDING),
     )
-    events = _linear_events(assignment, label=label, transitions=transitions)
+    events = _linear_events(assignment, label=label, transitions=transitions, result=result)
     cleanup = CleanupOutcome(
         attempt_id=assignment.attempt_id,
         assignment_digest=assignment.digest,
@@ -416,6 +543,7 @@ def build_evidence_rejected_transcript() -> ProviderAttemptTranscript:
         permits=(_permit(assignment, label=label, issued_at=NOW, expires_at=NOW + timedelta(seconds=30)),),
         events=events + (terminal,),
         cleanup=cleanup,
+        result=result,
     )
 
 
@@ -438,6 +566,12 @@ def build_worker_transcript() -> WorkerExecutionTranscript:
         expires_at=NOW + timedelta(minutes=5),
     )
     assignment = _assignment(attempt_id="attempt-worker-golden-001", nonce="6" * 64, label=label)
+    result = _result(
+        assignment,
+        label=label,
+        produced_at=NOW + timedelta(seconds=5, milliseconds=500),
+        received_at=NOW + timedelta(seconds=6),
+    )
     transitions = (
         (AttemptState.DISPATCH_PENDING, AttemptState.SLOT_CLAIMED),
         (AttemptState.SLOT_CLAIMED, AttemptState.ASSIGNMENT_SENT),
@@ -448,7 +582,7 @@ def build_worker_transcript() -> WorkerExecutionTranscript:
         (AttemptState.RESULT_RECEIVED, AttemptState.EVIDENCE_VERIFIED),
         (AttemptState.EVIDENCE_VERIFIED, AttemptState.SUCCESS_CLEANUP_PENDING),
     )
-    events = _linear_events(assignment, label=label, transitions=transitions)
+    events = _linear_events(assignment, label=label, transitions=transitions, result=result)
     cleanup = CleanupOutcome(
         attempt_id=assignment.attempt_id,
         assignment_digest=assignment.digest,
@@ -475,6 +609,7 @@ def build_worker_transcript() -> WorkerExecutionTranscript:
         permits=(permit,),
         events=events + (terminal,),
         cleanup=cleanup,
+        result=result,
     )
     binding = AssignmentLedgerBinding(
         binding_id="binding-worker-golden-001",
@@ -580,6 +715,8 @@ def build_permit_renewal_vector() -> None:
 
 def main() -> None:
     build_assignment_vector()
+    build_attempt_result_vector()
+    build_stale_quote_vector()
 
     success = build_success_transcript()
     _write_canonical("transcript-success-v1.json", success.canonical_bytes)

@@ -16,6 +16,7 @@ from cathedral.provider_contract import (
     AssignmentLedgerBinding,
     AssignmentPermit,
     AttemptAssignment,
+    AttemptResult,
     AttemptState,
     AttemptTransitionEvent,
     CleanupOutcome,
@@ -36,6 +37,7 @@ from cathedral.provider_contract import (
     validate_cleanup_assignment,
     validate_interruption_assignment,
     validate_permit_renewal,
+    validate_result_assignment,
     validate_settlement,
     validate_settlement_supersession,
     validate_terminal_transition,
@@ -56,7 +58,7 @@ _CLEANUP_PENDING_STATES = frozenset(
     }
 )
 _ATTEMPT_KEYS = frozenset(
-    {"schema", "assignment", "permits", "events", "cleanup", "interruption"}
+    {"schema", "assignment", "permits", "events", "cleanup", "interruption", "result"}
 )
 _WORKER_KEYS = frozenset(
     {
@@ -79,6 +81,7 @@ class ProviderAttemptTranscript:
     events: tuple[AttemptTransitionEvent, ...]
     cleanup: CleanupOutcome
     interruption: InterruptionOutcome | None = None
+    result: AttemptResult | None = None
 
     def to_document(self) -> Mapping[str, object]:
         self.validate()
@@ -91,6 +94,7 @@ class ProviderAttemptTranscript:
             "interruption": (
                 self.interruption.to_document() if self.interruption is not None else None
             ),
+            "result": self.result.to_document() if self.result is not None else None,
         }
 
     @property
@@ -130,6 +134,7 @@ class ProviderAttemptTranscript:
         if len(raw_events) > MAX_TRANSCRIPT_EVENTS:
             raise ProviderContractError("provider attempt transcript has too many events")
         interruption_document = document["interruption"]
+        result_document = document["result"]
         transcript = cls(
             assignment=AttemptAssignment.from_document(document["assignment"]),
             permits=tuple(AssignmentPermit.from_document(item) for item in raw_permits),
@@ -138,6 +143,11 @@ class ProviderAttemptTranscript:
             interruption=(
                 InterruptionOutcome.from_document(interruption_document)
                 if interruption_document is not None
+                else None
+            ),
+            result=(
+                AttemptResult.from_document(result_document)
+                if result_document is not None
                 else None
             ),
         )
@@ -228,6 +238,32 @@ class ProviderAttemptTranscript:
             )
         validate_cleanup_assignment(self.assignment, self.cleanup)
         validate_terminal_transition(last_event, self.cleanup)
+
+        if self.result is not None and not isinstance(self.result, AttemptResult):
+            raise ProviderContractError("transcript result is invalid")
+        result_events = [
+            event for event in self.events if event.target is AttemptState.RESULT_RECEIVED
+        ]
+        if len(result_events) > 1:
+            raise ProviderContractError("transcript reached RESULT_RECEIVED more than once")
+        if result_events:
+            if self.result is None:
+                raise ProviderContractError(
+                    "a RESULT_RECEIVED transition requires a matching result record"
+                )
+            validate_result_assignment(self.assignment, self.result)
+            if result_events[0].detail_digest != self.result.digest:
+                raise ProviderContractError(
+                    "RESULT_RECEIVED transition does not bind its result record"
+                )
+            if result_events[0].occurred_at < self.result.received_at:
+                raise ProviderContractError(
+                    "RESULT_RECEIVED transition occurred before its result was received"
+                )
+        elif self.result is not None:
+            raise ProviderContractError(
+                "only an attempt that received a result may carry a result record"
+            )
 
         if last_event.target is AttemptState.INTERRUPTED:
             if self.interruption is None:

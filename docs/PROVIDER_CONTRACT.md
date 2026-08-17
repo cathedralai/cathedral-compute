@@ -48,6 +48,7 @@ credentials, and metadata never enter this public contract.
 | Capability slot | `cathedral_provider_capability_slot_v1` | Binds one prepared slot to region, zone, profile, image, policy, supply class, and heartbeat |
 | Capability inventory | `cathedral_provider_capability_inventory_v1` | Carries a bounded snapshot of zero or more capability slots |
 | Attempt assignment | `cathedral_attempt_assignment_v1` | Gives a provider an opaque, expiring permit for one attempt and slot |
+| Attempt result | `cathedral_attempt_result_v1` | Binds a provider's returned result and its attestation quote to the exact assignment, fresh nonce, and image digest it answers |
 | Assignment ledger binding | `cathedral_assignment_ledger_binding_v1` | Privately joins an assignment to customer, logical job, reservation, and cap facts |
 | Attempt transition | `cathedral_attempt_transition_v1` | Records one fail-closed state transition |
 | Interruption outcome | `cathedral_interruption_outcome_v1` | Binds a preemption, timeout, provider event, or operator event to an assignment |
@@ -80,10 +81,11 @@ cross-attempt substitution, changed cleanup, missing interruption evidence,
 unknown fields, and noncanonical JSON.
 
 The `FAILED`, `CANCELLED`, and `EVIDENCE_REJECTED` transcript paths, a
-`WorkerExecutionTranscript` example, an idempotency-conflict vector, and a
-permit-renewal vector are checked in alongside them. Every vector is wired to a
-test that exercises the invariant it pins rather than only parsing the file. A
-vector that merely round-trips proves nothing about the rule it represents.
+`WorkerExecutionTranscript` example, an idempotency-conflict vector, a
+permit-renewal vector, an attempt-result vector, and a stale-quote vector are
+checked in alongside them. Every vector is wired to a test that exercises the
+invariant it pins rather than only parsing the file. A vector that merely
+round-trips proves nothing about the rule it represents.
 
 Regenerate all vectors with `scripts/generate_provider_contract_vectors.py`.
 The generator builds each record from the live dataclasses and is deterministic:
@@ -181,6 +183,36 @@ These helpers express the invariant. A production dispatcher still needs a
 transactional durable store with unique constraints. An in-memory check is not
 sufficient for crash recovery or concurrent requests.
 
+## Loading the dispatched workload manifest
+
+`ProviderDispatchEnvelope.workload_manifest` is typed as a generic canonical
+object. The envelope itself only checks that it is canonical JSON, that its
+digest matches the assignment's `workload_manifest_digest`, and that it
+carries no forbidden private field name. That is a shape check, not a
+manifest check: an empty object with a matching digest satisfies it.
+
+`cathedral/workload.py` defines what a manifest actually is:
+`WorkloadManifest` and its schema, `cathedral_workload_manifest_v1`.
+`parse_workload_manifest_document` and `load_dispatch_workload_manifest`
+parse a dispatch envelope's `workload_manifest` against that real schema and
+return the typed `WorkloadManifest` object, so a dispatcher gets the exact
+policy-checked manifest that passed admission instead of an unvalidated blob
+that merely hashes to the right value. The loader:
+
+- requires the exact field set `WorkloadManifest.document()` defines, so a
+  missing, extra, or renamed field is rejected rather than silently ignored;
+- independently re-applies the private-field rule, so a manifest that
+  otherwise satisfies the real schema but also carries a forbidden field
+  (for example `budget_micros`) is still rejected; and
+- rejects a document whose redundant image fields (`registry`, `repository`,
+  `image_digest`) disagree with its `image_reference`, by reconstructing the
+  manifest and requiring its canonical bytes to match the input exactly.
+
+This loader does not run admission policy or signature verification. Those
+already happened, before this document was ever placed on the wire; this
+only confirms the wire copy is the same typed object, not a re-check of
+whether it should have been admitted.
+
 ## Attempt lifecycle
 
 The exact normal success path is:
@@ -223,6 +255,51 @@ The four terminal states are:
 - `FAILED` after `FAILURE_CLEANUP_PENDING`;
 - `CANCELLED` after `CANCEL_CLEANUP_PENDING`; and
 - `INTERRUPTED` after `INTERRUPT_CLEANUP_PENDING`.
+
+## Attempt result and quote binding
+
+`RESULT_RECEIVED` used to carry only an opaque `detail_digest` on the
+transition event, with no schema defining what it pointed at. Nothing bound
+that digest to a nonce, an attestation quote, or a result payload, so a stale
+quote, one produced for an earlier or different attempt, satisfied it as well
+as a fresh one.
+
+`cathedral_attempt_result_v1` closes that gap. It binds the assignment
+digest, the attempt ID, the quote bytes digest, the nonce the quote actually
+attests, the measurement (image) digest the quote reports, the result
+payload digest, and the canonical `produced_at` / `received_at` times. A
+transcript that reaches `RESULT_RECEIVED` must carry a matching result
+record, and the transition's `detail_digest` must equal that record's
+digest. `validate_result_assignment` then enforces, fail-closed:
+
+- the quote's attested nonce must equal the assignment's `provider_nonce`,
+  so a quote produced for a previous attempt cannot satisfy a new one, even
+  when it is otherwise correctly relabeled with the new attempt ID and
+  assignment digest;
+- the reported measurement must equal the assignment's `image_digest`; and
+- the result's own `attempt_id` and `assignment_digest` must match the
+  assignment it is checked against.
+
+An attempt that aborts before `RUNNING` never produces a result and must not
+carry one. `RESULT_RECEIVED` is reachable at most once per attempt, and its
+transition cannot be logged before the result it reports on was received.
+
+This record treats a quote as opaque bytes plus the fields it claims. It
+does **not**:
+
+- verify Intel DCAP evidence or parse a real quote structure;
+- prove the measurement is genuine, only that the claimed value matches the
+  assignment's pinned digest;
+- prove the result payload is correct, only that its digest is bound to this
+  attempt; or
+- replace the independent attestation verification the promotion
+  requirements below still call for.
+
+The golden vector is `examples/provider-contract/attempt-result-v1.json`.
+`examples/provider-contract/stale-quote-v1.json` pins the exact replay this
+record exists to reject: a result record correctly addressed to a retry
+(matching attempt ID and assignment digest) whose quote still attests the
+prior assignment's nonce.
 
 ## Cleanup and provider absence
 
