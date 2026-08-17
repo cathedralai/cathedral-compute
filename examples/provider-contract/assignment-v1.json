@@ -9,13 +9,10 @@
       "subnet_hotkey": null
     },
     "slot_id": "slot-useast1-a-001",
-    "nonce": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "workload_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "assignment_permit_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    "issued_at": "2026-08-17T12:00:00.000000Z",
-    "expires_at": "2026-08-17T12:02:00.000000Z"
+    "provider_nonce": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "workload_manifest_digest": "sha256:bfad6fd96e1335bb9e651fb318c6029fdafa47d601dca42d881d1d3fd75031b1",
+    "policy_digest": "sha256:ea200e6cad384f2498f9e0e7feb7ec55aecbc8c4bf22b30abb06a628ad56840f",
+    "image_digest": "sha256:ec23045b0e5e6f3302fecc7f26244272915ec86708629c6079569d047d7119ea"
   },
-  "expected_digest": "sha256:ec0f5a1b9a68a4ba07f07a325753a758aac8413951692396450cb71a04be2f18"
+  "expected_digest": "sha256:21c7a3ce0ef510ea61fa93477621cba03532fad22cd6e261d30a817c783dd30b"
 }

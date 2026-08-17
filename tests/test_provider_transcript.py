@@ -679,13 +679,28 @@ def test_transcript_canonical_round_trip_is_exact(build_transcript) -> None:
     [
         (
             "transcript-success-v1.json",
-            "sha256:393a2004212c906e70e53cb2b8e3af8cffc24b2c363d61d3901ecb949071a290",
+            "sha256:b776ee5b4a6e53d2a51135b1f334cd95a6a98be0edbaa981c396fa4435e34e1c",
             AttemptState.SUCCEEDED,
         ),
         (
             "transcript-interrupted-v1.json",
-            "sha256:5a426e1828bb4dad6493aa0b850797e864af7496be4760626b86cd3801755eaa",
+            "sha256:69810b58be2b6784f1e4b17cddb2da7359d77f589bbf72d999af2bd416dddc7e",
             AttemptState.INTERRUPTED,
+        ),
+        (
+            "transcript-failed-v1.json",
+            "sha256:d54847bf71f91e165d2d438b17567481cbb014449f80e86cd8d8d39e15006f98",
+            AttemptState.FAILED,
+        ),
+        (
+            "transcript-cancelled-v1.json",
+            "sha256:919dbe9e52b0ffff7b030dab111befd7da293db91ed6b1c9befb9884b4221dad",
+            AttemptState.CANCELLED,
+        ),
+        (
+            "transcript-evidence-rejected-v1.json",
+            "sha256:598fbe56c6f2086b45000c8098612c1de6fde36a60535bc30a80ff90b2420844",
+            AttemptState.FAILED,
         ),
     ],
 )
@@ -704,6 +719,25 @@ def test_checked_in_transcript_golden_vectors_are_stable(
     assert transcript.validate() is expected_state
     assert transcript.canonical_bytes == wire_bytes
     assert transcript.digest == expected_digest
+
+
+def test_checked_in_worker_transcript_golden_vector_is_stable() -> None:
+    vector_path = (
+        Path(__file__).parents[1] / "examples" / "provider-contract" / "worker-transcript-success-v1.json"
+    )
+    raw = vector_path.read_bytes()
+    assert raw.endswith(b"\n")
+    wire_bytes = raw[:-1]
+
+    transcript = WorkerExecutionTranscript.from_bytes(wire_bytes)
+
+    assert transcript.validate() is SettlementAction.CHARGED
+    assert transcript.canonical_bytes == wire_bytes
+    assert (
+        transcript.digest
+        == "sha256:a57552b025c4e3129185b1a5bca496e92c4f71987688faa65713f1faf64d2f7f"
+    )
+    assert transcript.final_settlement.winning_attempt_id == transcript.attempts[-1].assignment.attempt_id
 
 
 def test_transcript_document_rejects_unknown_fields() -> None:

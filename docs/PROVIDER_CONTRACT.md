@@ -79,6 +79,39 @@ Their fixed SHA-256 digests and strict loader tests reject reordered events,
 cross-attempt substitution, changed cleanup, missing interruption evidence,
 unknown fields, and noncanonical JSON.
 
+The `FAILED`, `CANCELLED`, and `EVIDENCE_REJECTED` transcript paths, a
+`WorkerExecutionTranscript` example, an idempotency-conflict vector, and a
+permit-renewal vector are checked in alongside them. Every vector is wired to a
+test that exercises the invariant it pins rather than only parsing the file. A
+vector that merely round-trips proves nothing about the rule it represents.
+
+Regenerate all vectors with `scripts/generate_provider_contract_vectors.py`.
+The generator builds each record from the live dataclasses and is deterministic:
+no wall-clock time, no random identifiers, so a second run is byte-identical.
+Never hand-edit a vector. Change the contract, rerun the generator, and let the
+digest assertions record the change.
+
+### This repository supersedes the plan on wire format
+
+The fast-start sandbox plan carries an earlier draft of this contract. Where the
+two disagree, this repository is canonical, because it is the artifact the tests
+execute. The differences are deliberate, not drift:
+
+- Field names. The plan uses `nonce` and `workload_digest`. The wire format uses
+  `provider_nonce` and `workload_manifest_digest`.
+- `budget_micros` is refused inside `workload_manifest` and `policy_document`.
+  The plan's assignment example sends it to the provider in the clear. A
+  provider does not need the customer's budget to execute one bounded job, and
+  the permit binds the assignment without it.
+- Attempt transitions. The plan's table lets `DISPATCH_PENDING` reach `FAILED`
+  directly while every sibling state routes through a cleanup-pending state, and
+  it gives `SUCCESS_CLEANUP_PENDING` no abort edge, which leaves its own
+  fifteen-minute rule unrepresentable. This contract routes every failure
+  through a cleanup-pending state and adds the abort edges, so an unproven
+  cleanup deadline ends `FAILED` with a refund and can never produce a success.
+
+Anyone implementing the Polaris broker should build against this repository.
+
 The composed attempt transcript contains the private ledger binding,
 reservation, settlement, customer ID, and logical job ID. It is an internal
 broker and audit record. Never send it to a provider. The opaque attempt

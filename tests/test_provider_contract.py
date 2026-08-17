@@ -1217,3 +1217,63 @@ def test_held_settlement_has_one_exact_uncharged_resolution() -> None:
 def test_settlement_sequence_rejects_float_construction() -> None:
     with pytest.raises(ProviderContractError, match="sequence must be 1 or 2"):
         _settlement(sequence=1.0)
+
+
+def _load_vector(name: str) -> dict:
+    return json.loads(
+        (Path(__file__).parents[1] / "examples" / "provider-contract" / name).read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def test_checked_in_idempotency_conflict_vector_drives_the_real_rejection() -> None:
+    """The vector must reproduce the rejection, not merely parse.
+
+    A vector that only round-trips proves nothing about the invariant it is
+    supposed to pin, which is how the previous set drifted out of sync with
+    the code while still sitting in the repository.
+    """
+    vector = _load_vector("idempotency-conflict-v1.json")
+    existing = SubmissionIdempotencyBinding.from_document(vector["existing"])
+    candidate = SubmissionIdempotencyBinding.from_document(vector["conflicting_candidate"])
+
+    assert existing.to_document() == vector["existing"]
+    assert candidate.to_document() == vector["conflicting_candidate"]
+
+    # Same customer and key, different request bytes: a conflict, not a replay.
+    assert existing.customer_id == candidate.customer_id
+    assert existing.idempotency_key_digest == candidate.idempotency_key_digest
+    assert existing.request_digest != candidate.request_digest
+
+    with pytest.raises(ProviderContractError) as excinfo:
+        resolve_submission_idempotency(existing, candidate)
+    assert excinfo.value.code is ProviderRejectionCode.IDEMPOTENCY_CONFLICT
+    assert excinfo.value.code.value == vector["expected_rejection_code"]
+
+    # An identical resubmission is a replay of the stored binding.
+    decision, resolved = resolve_submission_idempotency(existing, existing)
+    assert decision is IdempotencyDecision.REPLAY
+    assert resolved == existing
+
+
+def test_checked_in_permit_renewal_vector_accepts_next_and_rejects_replay() -> None:
+    """The renewal vector must exercise validate_permit_renewal both ways."""
+    vector = _load_vector("permit-renewal-v1.json")
+    current = AssignmentPermit.from_document(vector["current_permit"])
+    renewed = AssignmentPermit.from_document(vector["renewed_permit"])
+    observed_at = datetime.fromisoformat(vector["observed_at"])
+
+    assert current.to_document() == vector["current_permit"]
+    assert renewed.to_document() == vector["renewed_permit"]
+    assert current.digest == vector["expected_current_digest"]
+    assert renewed.digest == vector["expected_renewed_digest"]
+
+    # The renewal binds the same immutable assignment as the permit it replaces.
+    assert renewed.assignment_digest == current.assignment_digest
+
+    validate_permit_renewal(current, renewed, observed_at)
+
+    # Renewal is forward only: the superseded permit cannot come back.
+    with pytest.raises(ProviderContractError):
+        validate_permit_renewal(renewed, current, observed_at)
