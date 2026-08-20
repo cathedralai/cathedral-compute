@@ -1,0 +1,29 @@
+{
+  "assignment": {
+    "schema": "cathedral_attempt_assignment_v1",
+    "attempt_id": "attempt-result-golden-001",
+    "provider": {
+      "schema": "cathedral_provider_identity_v1",
+      "kind": "cathedral_seed",
+      "provider_id": "seed-useast-1",
+      "subnet_hotkey": null
+    },
+    "slot_id": "slot-useast1-a-001",
+    "provider_nonce": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "workload_manifest_digest": "sha256:37d18f9e50b545a9682bd50e13938cbaf60e3fda46c56ebed005c5a4b875e157",
+    "policy_digest": "sha256:1a82dec3980426b5e08161680ff594a78afa9e8abf45cf0140b499bd13dbef55",
+    "image_digest": "sha256:f0ee69dd31eb9b56b61a0e38c9492888ce509a5315dc42720b33d086480fbf93"
+  },
+  "result": {
+    "schema": "cathedral_attempt_result_v1",
+    "attempt_id": "attempt-result-golden-001",
+    "assignment_digest": "sha256:4ad440eccba4987ab731301b095725f2bda5e3e50d56d46f635d89af09bfba3c",
+    "quote_digest": "sha256:f08dc8252b726566aa8d4585b3854cc958e188259c481065470c634342ba586e",
+    "attested_nonce": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "measurement_digest": "sha256:f0ee69dd31eb9b56b61a0e38c9492888ce509a5315dc42720b33d086480fbf93",
+    "result_payload_digest": "sha256:5b8fe0270cf3b88ac7455dde9d1920e5dc2e4e106796e72e5d126849b9c08581",
+    "produced_at": "2026-08-17T12:00:05.500000Z",
+    "received_at": "2026-08-17T12:00:06.000000Z"
+  },
+  "expected_digest": "sha256:04ab8ab828f2ffab2cae770ad0180addc9d7ae31a2414998fc6bf86a59054d0e"
+}

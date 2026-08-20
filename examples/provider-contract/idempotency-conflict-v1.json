@@ -1,0 +1,17 @@
+{
+  "existing": {
+    "schema": "cathedral_submission_idempotency_v1",
+    "customer_id": "customer-1",
+    "idempotency_key_digest": "sha256:6d171a48c616a534d202924580147f0c3d3010d3a2cdc307ae231c5ba3382588",
+    "request_digest": "sha256:e2b7359c657ee40d2de5b8a27c905f9f6a2658dc799c44b90b5e778bb5a8b339",
+    "worker_id": "worker-golden-idem-001"
+  },
+  "conflicting_candidate": {
+    "schema": "cathedral_submission_idempotency_v1",
+    "customer_id": "customer-1",
+    "idempotency_key_digest": "sha256:6d171a48c616a534d202924580147f0c3d3010d3a2cdc307ae231c5ba3382588",
+    "request_digest": "sha256:c9cbd59e502688238a374538dd57911a8155ef77bab828f15b1e042ae78ddf29",
+    "worker_id": "worker-golden-idem-001"
+  },
+  "expected_rejection_code": "idempotency_conflict"
+}

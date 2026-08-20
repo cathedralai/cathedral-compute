@@ -1,0 +1,38 @@
+{
+  "assignment": {
+    "schema": "cathedral_attempt_assignment_v1",
+    "attempt_id": "attempt-permit-renewal-001",
+    "provider": {
+      "schema": "cathedral_provider_identity_v1",
+      "kind": "cathedral_seed",
+      "provider_id": "seed-useast-1",
+      "subnet_hotkey": null
+    },
+    "slot_id": "slot-useast1-a-001",
+    "provider_nonce": "7777777777777777777777777777777777777777777777777777777777777777",
+    "workload_manifest_digest": "sha256:2c6ca544cee93a9ab8e42b37d5087d252df0c7d4a7ceae80f174403d95ae5641",
+    "policy_digest": "sha256:a90e76b9e3e72062b6de1260632b091fa64b266e76d2df0d3285ab5ccafcea0e",
+    "image_digest": "sha256:3b4c6831995671b64c89ef7304487054341b933ce448d4c6dd5f3201832dd633"
+  },
+  "current_permit": {
+    "schema": "cathedral_assignment_permit_v1",
+    "assignment_digest": "sha256:4ffebbcb455f41ba1faf188059b3403803f6a2387d8880b25e41be39a6143478",
+    "sequence": 1,
+    "issued_at": "2026-08-17T12:00:00.000000Z",
+    "expires_at": "2026-08-17T12:02:00.000000Z",
+    "key_id": "broker-key-1",
+    "authorization_digest": "sha256:b96b1310b00a27ee70e5df3c5dcf41b5fe984b6678d19a169c1f7227c746e4c9"
+  },
+  "renewed_permit": {
+    "schema": "cathedral_assignment_permit_v1",
+    "assignment_digest": "sha256:4ffebbcb455f41ba1faf188059b3403803f6a2387d8880b25e41be39a6143478",
+    "sequence": 2,
+    "issued_at": "2026-08-17T12:01:00.000000Z",
+    "expires_at": "2026-08-17T12:03:00.000000Z",
+    "key_id": "broker-key-1",
+    "authorization_digest": "sha256:1feab7101f39e52c0d92164b072af81d4117a2badf7072ce512658d53646ecb8"
+  },
+  "observed_at": "2026-08-17T12:01:00.000000Z",
+  "expected_current_digest": "sha256:9af1f1fbc691956f7caae48abb4fcf95b8e19e45ae255e49251f59dbc8e48463",
+  "expected_renewed_digest": "sha256:a921d26cab400551ed44063645f26e5569928b03e74530c8e198ca325391b84b"
+}

@@ -1,0 +1,44 @@
+{
+  "first_assignment": {
+    "schema": "cathedral_attempt_assignment_v1",
+    "attempt_id": "attempt-stale-quote-001",
+    "provider": {
+      "schema": "cathedral_provider_identity_v1",
+      "kind": "cathedral_seed",
+      "provider_id": "seed-useast-1",
+      "subnet_hotkey": null
+    },
+    "slot_id": "slot-useast1-a-001",
+    "provider_nonce": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "workload_manifest_digest": "sha256:17cc536a2ecdbabff26c3183199fbaab87aba88e4b11c0f8a7d218c5825d8818",
+    "policy_digest": "sha256:c84f52ab340fa1566ae0e3ff8e14f049557d77c9bf73b3bd7069497eaa4f9e96",
+    "image_digest": "sha256:54873bac71fa54f4b3d1763bbae69fc38543d056a9bfb35937a0681ff900751e"
+  },
+  "second_assignment": {
+    "schema": "cathedral_attempt_assignment_v1",
+    "attempt_id": "attempt-stale-quote-002",
+    "provider": {
+      "schema": "cathedral_provider_identity_v1",
+      "kind": "cathedral_seed",
+      "provider_id": "seed-useast-1",
+      "subnet_hotkey": null
+    },
+    "slot_id": "slot-useast1-a-001",
+    "provider_nonce": "0000000000000000000000000000000000000000000000000000000000000000",
+    "workload_manifest_digest": "sha256:17cc536a2ecdbabff26c3183199fbaab87aba88e4b11c0f8a7d218c5825d8818",
+    "policy_digest": "sha256:c84f52ab340fa1566ae0e3ff8e14f049557d77c9bf73b3bd7069497eaa4f9e96",
+    "image_digest": "sha256:54873bac71fa54f4b3d1763bbae69fc38543d056a9bfb35937a0681ff900751e"
+  },
+  "stale_quote_result": {
+    "schema": "cathedral_attempt_result_v1",
+    "attempt_id": "attempt-stale-quote-002",
+    "assignment_digest": "sha256:ce30b5b6a55bcaf777a88a22a118174c7f2ace1073d6058cb442564926aac80e",
+    "quote_digest": "sha256:9ad322e62a2b5c751292073191ee48e0c7db2c3cbdac95537247f795fbea9106",
+    "attested_nonce": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "measurement_digest": "sha256:54873bac71fa54f4b3d1763bbae69fc38543d056a9bfb35937a0681ff900751e",
+    "result_payload_digest": "sha256:3339f59b92fa2aec3ccf32962eb414bf752648c23dea37e933549887974384f4",
+    "produced_at": "2026-08-17T12:00:05.500000Z",
+    "received_at": "2026-08-17T12:00:06.000000Z"
+  },
+  "expected_rejection_code": "result_nonce_mismatch"
+}
