@@ -39,7 +39,14 @@ from cathedral.assurance import (
     sha256_digest,
 )
 from cathedral.channel import ChannelBindingError, application_key_binding
-from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Policy, Tier
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    EvidenceKind,
+    Policy,
+    Tier,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.lifecycle import WorkerLifecycleState, canonical_utc, parse_utc
 from cathedral.workload import (
@@ -55,12 +62,17 @@ from cathedral.workload import (
 )
 
 
-ASSIGNMENT_SCHEMA = "cathedral_authenticated_workload_assignment_v1"
-GRANT_SCHEMA = "cathedral_attestation_grant_v1"
-BROKER_REQUEST_SCHEMA = "cathedral_key_broker_request_v1"
-ENVELOPE_SCHEMA = "cathedral_encrypted_data_key_v1"
-ENVELOPE_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
+ASSIGNMENT_SCHEMA = "cathedral_authenticated_workload_assignment_v2"
+LEGACY_GRANT_SCHEMA = "cathedral_attestation_grant_v1"
+GRANT_SCHEMA = "cathedral_attestation_grant_v2"
+LEGACY_BROKER_REQUEST_SCHEMA = "cathedral_key_broker_request_v1"
+BROKER_REQUEST_SCHEMA = "cathedral_key_broker_request_v2"
+LEGACY_ENVELOPE_SCHEMA = "cathedral_encrypted_data_key_v1"
+ENVELOPE_SCHEMA = "cathedral_encrypted_data_key_v2"
+LEGACY_ENVELOPE_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
+ENVELOPE_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v2"
 BROKER_PREFLIGHT_SCHEMA = "cathedral_key_broker_preflight_v1"
+KEY_RELEASE_POLICY_SCHEMA = "cathedral_key_release_policy_v2"
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _ASSIGNMENT_ID_RE = re.compile(r"assignment-[0-9a-f]{64}")
@@ -69,6 +81,13 @@ _CAPABILITY_RE = re.compile(r"assignment-hmac-sha256:[0-9a-f]{64}")
 _PURPOSE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_ENVELOPE_BYTES = 4096
+
+_CPU_TIER_EVIDENCE_KIND = MappingProxyType(
+    {
+        Tier.CC_CPU_TDX: EvidenceKind.TDX,
+        Tier.CC_CPU_SNP: EvidenceKind.SEV_SNP,
+    }
+)
 
 
 class KeyReleaseError(RuntimeError):
@@ -157,6 +176,23 @@ def _require_positive_int(value: object, name: str, *, maximum: int) -> int:
     return value
 
 
+def _require_cpu_tee_pair(
+    cpu_tier: object,
+    evidence_kind: object,
+    *,
+    category: str,
+    label: str,
+) -> tuple[Tier, EvidenceKind]:
+    if not isinstance(cpu_tier, Tier) or cpu_tier not in _CPU_TIER_EVIDENCE_KIND:
+        raise KeyReleaseError(category, f"{label} CPU tier is invalid")
+    if (
+        not isinstance(evidence_kind, EvidenceKind)
+        or _CPU_TIER_EVIDENCE_KIND[cpu_tier] is not evidence_kind
+    ):
+        raise KeyReleaseError(category, f"{label} evidence kind does not match its CPU tier")
+    return cpu_tier, evidence_kind
+
+
 def _canonical_time(value: datetime, name: str) -> str:
     try:
         return canonical_utc(value)
@@ -206,6 +242,7 @@ class BrokerPreflight:
 @dataclass(frozen=True)
 class KeyReleasePolicy:
     allowed_purposes: frozenset[str] = frozenset({"sealed_workload_data_key_v1"})
+    allowed_cpu_tiers: frozenset[Tier] = frozenset({Tier.CC_CPU_TDX})
     max_attestation_age_seconds: int = 60
     max_grant_ttl_seconds: int = 60
     clock_skew_seconds: int = 5
@@ -220,6 +257,15 @@ class KeyReleasePolicy:
             )
         ):
             raise KeyReleaseError("invalid_policy", "key-release purposes are invalid")
+        if (
+            not isinstance(self.allowed_cpu_tiers, frozenset)
+            or not self.allowed_cpu_tiers
+            or any(
+                not isinstance(cpu_tier, Tier) or cpu_tier not in _CPU_TIER_EVIDENCE_KIND
+                for cpu_tier in self.allowed_cpu_tiers
+            )
+        ):
+            raise KeyReleaseError("invalid_policy", "key-release CPU tiers are invalid")
         _require_positive_int(
             self.max_attestation_age_seconds,
             "maximum attestation age",
@@ -242,11 +288,14 @@ class KeyReleasePolicy:
         return _digest(
             _canonical_json(
                 {
+                    "allowed_cpu_tiers": sorted(
+                        cpu_tier.value for cpu_tier in self.allowed_cpu_tiers
+                    ),
                     "allowed_purposes": sorted(self.allowed_purposes),
                     "clock_skew_seconds": self.clock_skew_seconds,
                     "max_attestation_age_seconds": self.max_attestation_age_seconds,
                     "max_grant_ttl_seconds": self.max_grant_ttl_seconds,
-                    "schema": "cathedral_key_release_policy_v1",
+                    "schema": KEY_RELEASE_POLICY_SCHEMA,
                 }
             )
         )
@@ -258,6 +307,8 @@ class AuthenticatedWorkloadAssignment:
     issuer_id: str = field(repr=False)
     issuer_digest: str
     worker_hotkey: str
+    cpu_tier: Tier
+    evidence_kind: EvidenceKind
     manifest_digest: str
     workload_policy_digest: str
     production_admission: bool
@@ -269,13 +320,20 @@ class AuthenticatedWorkloadAssignment:
     _capability: str = field(repr=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.assignment_id, str) or _ASSIGNMENT_ID_RE.fullmatch(
-            self.assignment_id
-        ) is None:
+        if (
+            not isinstance(self.assignment_id, str)
+            or _ASSIGNMENT_ID_RE.fullmatch(self.assignment_id) is None
+        ):
             raise KeyReleaseError("invalid_assignment", "assignment id is invalid")
         _require_text(self.issuer_id, "assignment issuer")
         _require_digest(self.issuer_digest, "assignment issuer digest")
         _require_text(self.worker_hotkey, "assignment worker")
+        _require_cpu_tee_pair(
+            self.cpu_tier,
+            self.evidence_kind,
+            category="invalid_assignment",
+            label="assignment",
+        )
         _require_digest(self.manifest_digest, "assignment manifest digest")
         _require_digest(self.workload_policy_digest, "assignment policy digest")
         if not isinstance(self.production_admission, bool):
@@ -290,16 +348,19 @@ class AuthenticatedWorkloadAssignment:
             raise KeyReleaseError("invalid_assignment", "assignment validity is invalid")
         _require_text(self.data_key_reference, "data-key reference")
         _require_digest(self.data_key_reference_digest, "data-key reference digest")
-        if not isinstance(self._capability, str) or _CAPABILITY_RE.fullmatch(
-            self._capability
-        ) is None:
+        if (
+            not isinstance(self._capability, str)
+            or _CAPABILITY_RE.fullmatch(self._capability) is None
+        ):
             raise KeyReleaseError("invalid_assignment", "assignment capability is invalid")
 
     def capability_document(self) -> Mapping[str, object]:
         return MappingProxyType(
             {
                 "assignment_id": self.assignment_id,
+                "cpu_tier": self.cpu_tier.value,
                 "data_key_reference_digest": self.data_key_reference_digest,
+                "evidence_kind": self.evidence_kind.value,
                 "expires_at": canonical_utc(self.expires_at),
                 "issued_at": canonical_utc(self.issued_at),
                 "issuer_digest": self.issuer_digest,
@@ -377,7 +438,7 @@ class WorkloadAssignmentAuthority:
     def _sign(self, document: Mapping[str, object]) -> str:
         value = hmac.new(
             self._capability_key,
-            b"cathedral-workload-assignment-v1\0" + _canonical_json(document),
+            b"cathedral-workload-assignment-v2\0" + _canonical_json(document),
             hashlib.sha256,
         ).hexdigest()
         return "assignment-hmac-sha256:" + value
@@ -402,12 +463,20 @@ class WorkloadAssignmentAuthority:
         data_key_reference: str,
         purpose: str = "sealed_workload_data_key_v1",
         ttl_seconds: int = 300,
+        cpu_tier: Tier = Tier.CC_CPU_TDX,
+        evidence_kind: EvidenceKind = EvidenceKind.TDX,
     ) -> AuthenticatedWorkloadAssignment:
         issuer_id = _require_text(authenticated_issuer_id, "authenticated issuer")
         hotkey = _require_text(worker_hotkey, "assigned worker")
         key_reference = _require_text(data_key_reference, "data-key reference")
         if not isinstance(purpose, str) or _PURPOSE_RE.fullmatch(purpose) is None:
             raise KeyReleaseError("invalid_assignment", "assignment purpose is invalid")
+        cpu_tier, evidence_kind = _require_cpu_tee_pair(
+            cpu_tier,
+            evidence_kind,
+            category="invalid_assignment",
+            label="assignment",
+        )
         ttl = _require_positive_int(ttl_seconds, "assignment TTL", maximum=600)
         try:
             manifest = self.workload_controller.validate_admission(
@@ -440,6 +509,8 @@ class WorkloadAssignmentAuthority:
             "assignment_id": assignment_id,
             "issuer_digest": issuer_digest,
             "worker_hotkey": hotkey,
+            "cpu_tier": cpu_tier,
+            "evidence_kind": evidence_kind,
             "manifest_digest": manifest.digest,
             "workload_policy_digest": manifest.policy_digest,
             "production_admission": (
@@ -503,11 +574,17 @@ class WorkloadAssignmentAuthority:
 
         when = self._now()
         self.verify(assignment, at=when)
+        if (
+            assignment.cpu_tier is not Tier.CC_CPU_TDX
+            or assignment.evidence_kind is not EvidenceKind.TDX
+        ):
+            raise KeyReleaseError(
+                "execution_denied",
+                "execution provider authorization is not bound to this CPU tier",
+            )
         hotkey = self._execution_worker_hotkey
         if hotkey is None:
-            raise KeyReleaseError(
-                "execution_denied", "execution worker identity is not configured"
-            )
+            raise KeyReleaseError("execution_denied", "execution worker identity is not configured")
         try:
             manifest = self.workload_controller.validate_admission(
                 workload,
@@ -525,20 +602,14 @@ class WorkloadAssignmentAuthority:
             or assignment.production_admission
             != (self._production_admission and workload.production_admission)
         ):
-            raise KeyReleaseError(
-                "execution_denied", "execution assignment binding is invalid"
-            )
-        if (
-            isinstance(adapter, ExternalExecutionAdapter)
-            and (
-                self._execution_configuration_digest is None
-                or adapter.config.worker_hotkey != hotkey
-                or adapter.config.configuration_digest
-                != self._execution_configuration_digest
-                or not hmac.compare_digest(
-                    adapter.config.authorization_key,
-                    self._capability_key,
-                )
+            raise KeyReleaseError("execution_denied", "execution assignment binding is invalid")
+        if isinstance(adapter, ExternalExecutionAdapter) and (
+            self._execution_configuration_digest is None
+            or adapter.config.worker_hotkey != hotkey
+            or adapter.config.configuration_digest != self._execution_configuration_digest
+            or not hmac.compare_digest(
+                adapter.config.authorization_key,
+                self._capability_key,
             )
         ):
             raise KeyReleaseError(
@@ -596,16 +667,36 @@ class WorkloadAssignmentAuthority:
 class EncryptedDataKeyEnvelope:
     grant_id: str
     request_digest: str
+    cpu_tier: Tier
+    evidence_kind: EvidenceKind
     ephemeral_public_key_b64: str
     nonce_b64: str
     ciphertext_b64: str
+    schema: str = ENVELOPE_SCHEMA
     algorithm: str = ENVELOPE_ALGORITHM
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant_id, str) or _GRANT_ID_RE.fullmatch(self.grant_id) is None:
             raise KeyReleaseError("invalid_envelope", "envelope grant id is invalid")
+        if self.schema not in {LEGACY_ENVELOPE_SCHEMA, ENVELOPE_SCHEMA}:
+            raise KeyReleaseError("invalid_envelope", "envelope schema is unsupported")
+        cpu_tier, evidence_kind = _require_cpu_tee_pair(
+            self.cpu_tier,
+            self.evidence_kind,
+            category="invalid_envelope",
+            label="envelope",
+        )
+        if self.schema == LEGACY_ENVELOPE_SCHEMA and (
+            cpu_tier is not Tier.CC_CPU_TDX or evidence_kind is not EvidenceKind.TDX
+        ):
+            raise KeyReleaseError("invalid_envelope", "legacy envelope CPU binding is invalid")
         _require_digest(self.request_digest, "broker request digest")
-        if self.algorithm != ENVELOPE_ALGORITHM:
+        expected_algorithm = (
+            LEGACY_ENVELOPE_ALGORITHM
+            if self.schema == LEGACY_ENVELOPE_SCHEMA
+            else ENVELOPE_ALGORITHM
+        )
+        if self.algorithm != expected_algorithm:
             raise KeyReleaseError("invalid_envelope", "envelope algorithm is unsupported")
         for name, encoded, minimum, maximum in (
             ("ephemeral public key", self.ephemeral_public_key_b64, 32, 32),
@@ -625,17 +716,23 @@ class EncryptedDataKeyEnvelope:
                 raise KeyReleaseError("invalid_envelope", f"{name} is invalid")
 
     def document(self) -> Mapping[str, object]:
-        return MappingProxyType(
-            {
-                "algorithm": self.algorithm,
-                "ciphertext_b64": self.ciphertext_b64,
-                "ephemeral_public_key_b64": self.ephemeral_public_key_b64,
-                "grant_id": self.grant_id,
-                "nonce_b64": self.nonce_b64,
-                "request_digest": self.request_digest,
-                "schema": ENVELOPE_SCHEMA,
-            }
-        )
+        document: dict[str, object] = {
+            "algorithm": self.algorithm,
+            "ciphertext_b64": self.ciphertext_b64,
+            "ephemeral_public_key_b64": self.ephemeral_public_key_b64,
+            "grant_id": self.grant_id,
+            "nonce_b64": self.nonce_b64,
+            "request_digest": self.request_digest,
+            "schema": self.schema,
+        }
+        if self.schema == ENVELOPE_SCHEMA:
+            document.update(
+                {
+                    "cpu_tier": self.cpu_tier.value,
+                    "evidence_kind": self.evidence_kind.value,
+                }
+            )
+        return MappingProxyType(document)
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -652,15 +749,26 @@ class BrokerRedemptionRequest:
     key_reference: str = field(repr=False)
     key_reference_digest: str
     application_public_key: bytes = field(repr=False)
+    cpu_tier: Tier
+    evidence_kind: EvidenceKind
     channel_key_digest: str
     manifest_digest: str
     evidence_digest: str
     grant_digest: str
     purpose: str
+    schema: str = BROKER_REQUEST_SCHEMA
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant_id, str) or _GRANT_ID_RE.fullmatch(self.grant_id) is None:
             raise KeyReleaseError("invalid_broker_request", "broker grant id is invalid")
+        if self.schema != BROKER_REQUEST_SCHEMA:
+            raise KeyReleaseError("invalid_broker_request", "broker request schema is unsupported")
+        _require_cpu_tee_pair(
+            self.cpu_tier,
+            self.evidence_kind,
+            category="invalid_broker_request",
+            label="broker request",
+        )
         _require_text(self.key_reference, "broker key reference")
         _require_digest(self.key_reference_digest, "broker key-reference digest")
         try:
@@ -683,13 +791,15 @@ class BrokerRedemptionRequest:
         return MappingProxyType(
             {
                 "channel_key_digest": self.channel_key_digest,
+                "cpu_tier": self.cpu_tier.value,
                 "evidence_digest": self.evidence_digest,
+                "evidence_kind": self.evidence_kind.value,
                 "grant_id": self.grant_id,
                 "grant_digest": self.grant_digest,
                 "key_reference_digest": self.key_reference_digest,
                 "manifest_digest": self.manifest_digest,
                 "purpose": self.purpose,
-                "schema": BROKER_REQUEST_SCHEMA,
+                "schema": self.schema,
             }
         )
 
@@ -770,7 +880,7 @@ class LocalKeyBroker:
                     algorithm=hashes.SHA256(),
                     length=32,
                     salt=bytes.fromhex(request.channel_key_digest.removeprefix("sha256:")),
-                    info=b"cathedral-key-release-v1\0" + request.grant_id.encode("ascii"),
+                    info=b"cathedral-key-release-v2\0" + request.grant_id.encode("ascii"),
                 ).derive(shared_secret)
                 nonce = os.urandom(12)
                 ciphertext = AESGCM(wrapping_key).encrypt(
@@ -791,6 +901,8 @@ class LocalKeyBroker:
             envelope = EncryptedDataKeyEnvelope(
                 grant_id=request.grant_id,
                 request_digest=request.digest,
+                cpu_tier=request.cpu_tier,
+                evidence_kind=request.evidence_kind,
                 ephemeral_public_key_b64=base64.b64encode(ephemeral_public).decode("ascii"),
                 nonce_b64=base64.b64encode(nonce).decode("ascii"),
                 ciphertext_b64=base64.b64encode(ciphertext).decode("ascii"),
@@ -809,6 +921,8 @@ class AttestationGrant:
     manifest_digest: str
     measurement_digest: str
     evidence_digest: str
+    cpu_tier: Tier
+    evidence_kind: EvidenceKind
     attestation_policy_release: int
     attestation_policy_digest: str
     verification_policy_digest: str
@@ -826,14 +940,28 @@ class AttestationGrant:
     revision: int = 1
     envelope: EncryptedDataKeyEnvelope | None = None
     redeemed_at: datetime | None = None
+    schema: str = GRANT_SCHEMA
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant_id, str) or _GRANT_ID_RE.fullmatch(self.grant_id) is None:
             raise KeyReleaseError("invalid_grant", "grant id is invalid")
-        if not isinstance(self.assignment_id, str) or _ASSIGNMENT_ID_RE.fullmatch(
-            self.assignment_id
-        ) is None:
+        if (
+            not isinstance(self.assignment_id, str)
+            or _ASSIGNMENT_ID_RE.fullmatch(self.assignment_id) is None
+        ):
             raise KeyReleaseError("invalid_grant", "grant assignment id is invalid")
+        if self.schema not in {LEGACY_GRANT_SCHEMA, GRANT_SCHEMA}:
+            raise KeyReleaseError("invalid_grant", "grant schema is unsupported")
+        cpu_tier, evidence_kind = _require_cpu_tee_pair(
+            self.cpu_tier,
+            self.evidence_kind,
+            category="invalid_grant",
+            label="grant",
+        )
+        if self.schema == LEGACY_GRANT_SCHEMA and (
+            cpu_tier is not Tier.CC_CPU_TDX or evidence_kind is not EvidenceKind.TDX
+        ):
+            raise KeyReleaseError("invalid_grant", "legacy grant CPU binding is invalid")
         for name, value in (
             ("issuer digest", self.issuer_digest),
             ("manifest digest", self.manifest_digest),
@@ -868,52 +996,73 @@ class AttestationGrant:
             raise KeyReleaseError("invalid_grant", "grant envelope state is invalid")
         if (self.redeemed_at is None) != (self.state is not GrantState.REDEEMED):
             raise KeyReleaseError("invalid_grant", "grant redemption time is invalid")
-        if self.envelope is not None and self.envelope.grant_id != self.grant_id:
+        if self.envelope is not None and (
+            self.envelope.grant_id != self.grant_id
+            or self.envelope.cpu_tier is not self.cpu_tier
+            or self.envelope.evidence_kind is not self.evidence_kind
+            or (
+                self.schema == LEGACY_GRANT_SCHEMA
+                and self.envelope.schema != LEGACY_ENVELOPE_SCHEMA
+            )
+            or (self.schema == GRANT_SCHEMA and self.envelope.schema != ENVELOPE_SCHEMA)
+        ):
             raise KeyReleaseError("invalid_grant", "grant envelope binding is invalid")
 
     def public_dict(self) -> Mapping[str, object]:
-        return MappingProxyType(
-            {
-                "assignment_id": self.assignment_id,
-                "expires_at": canonical_utc(self.expires_at),
-                "grant_id": self.grant_id,
-                "issued_at": canonical_utc(self.issued_at),
-                "manifest_digest": self.manifest_digest,
-                "purpose": self.purpose,
-                "schema": GRANT_SCHEMA,
-                "state": self.state.value,
-                "worker_hotkey": self.worker_hotkey,
-            }
-        )
+        document: dict[str, object] = {
+            "assignment_id": self.assignment_id,
+            "expires_at": canonical_utc(self.expires_at),
+            "grant_id": self.grant_id,
+            "issued_at": canonical_utc(self.issued_at),
+            "manifest_digest": self.manifest_digest,
+            "purpose": self.purpose,
+            "schema": self.schema,
+            "state": self.state.value,
+            "worker_hotkey": self.worker_hotkey,
+        }
+        if self.schema == GRANT_SCHEMA:
+            document.update(
+                {
+                    "cpu_tier": self.cpu_tier.value,
+                    "evidence_kind": self.evidence_kind.value,
+                }
+            )
+        return MappingProxyType(document)
 
     def binding_document(self) -> Mapping[str, object]:
         """Immutable metadata authenticated by the broker ciphertext AAD."""
 
-        return MappingProxyType(
-            {
-                "assignment_id": self.assignment_id,
-                "attestation_policy_digest": self.attestation_policy_digest,
-                "attestation_policy_release": self.attestation_policy_release,
-                "channel_key_digest": self.channel_key_digest,
-                "data_key_reference_digest": self.data_key_reference_digest,
-                "evidence_digest": self.evidence_digest,
-                "expires_at": canonical_utc(self.expires_at),
-                "grant_id": self.grant_id,
-                "issued_at": canonical_utc(self.issued_at),
-                "issuer_digest": self.issuer_digest,
-                "key_release_policy_digest": self.key_release_policy_digest,
-                "manifest_digest": self.manifest_digest,
-                "measurement_digest": self.measurement_digest,
-                "purpose": self.purpose,
-                "schema": GRANT_SCHEMA,
-                "worker_event_id": self.worker_event_id,
-                "worker_generation": self.worker_generation,
-                "worker_hotkey": self.worker_hotkey,
-                "worker_revision": self.worker_revision,
-                "verification_policy_digest": self.verification_policy_digest,
-                "workload_policy_digest": self.workload_policy_digest,
-            }
-        )
+        document: dict[str, object] = {
+            "assignment_id": self.assignment_id,
+            "attestation_policy_digest": self.attestation_policy_digest,
+            "attestation_policy_release": self.attestation_policy_release,
+            "channel_key_digest": self.channel_key_digest,
+            "data_key_reference_digest": self.data_key_reference_digest,
+            "evidence_digest": self.evidence_digest,
+            "expires_at": canonical_utc(self.expires_at),
+            "grant_id": self.grant_id,
+            "issued_at": canonical_utc(self.issued_at),
+            "issuer_digest": self.issuer_digest,
+            "key_release_policy_digest": self.key_release_policy_digest,
+            "manifest_digest": self.manifest_digest,
+            "measurement_digest": self.measurement_digest,
+            "purpose": self.purpose,
+            "schema": self.schema,
+            "worker_event_id": self.worker_event_id,
+            "worker_generation": self.worker_generation,
+            "worker_hotkey": self.worker_hotkey,
+            "worker_revision": self.worker_revision,
+            "verification_policy_digest": self.verification_policy_digest,
+            "workload_policy_digest": self.workload_policy_digest,
+        }
+        if self.schema == GRANT_SCHEMA:
+            document.update(
+                {
+                    "cpu_tier": self.cpu_tier.value,
+                    "evidence_kind": self.evidence_kind.value,
+                }
+            )
+        return MappingProxyType(document)
 
     @property
     def binding_digest(self) -> str:
@@ -921,20 +1070,29 @@ class AttestationGrant:
 
     @property
     def expected_broker_request_digest(self) -> str:
-        return _digest(
-            _canonical_json(
+        schema = (
+            LEGACY_BROKER_REQUEST_SCHEMA
+            if self.schema == LEGACY_GRANT_SCHEMA
+            else BROKER_REQUEST_SCHEMA
+        )
+        document: dict[str, object] = {
+            "channel_key_digest": self.channel_key_digest,
+            "evidence_digest": self.evidence_digest,
+            "grant_digest": self.binding_digest,
+            "grant_id": self.grant_id,
+            "key_reference_digest": self.data_key_reference_digest,
+            "manifest_digest": self.manifest_digest,
+            "purpose": self.purpose,
+            "schema": schema,
+        }
+        if self.schema == GRANT_SCHEMA:
+            document.update(
                 {
-                    "channel_key_digest": self.channel_key_digest,
-                    "evidence_digest": self.evidence_digest,
-                    "grant_digest": self.binding_digest,
-                    "grant_id": self.grant_id,
-                    "key_reference_digest": self.data_key_reference_digest,
-                    "manifest_digest": self.manifest_digest,
-                    "purpose": self.purpose,
-                    "schema": BROKER_REQUEST_SCHEMA,
+                    "cpu_tier": self.cpu_tier.value,
+                    "evidence_kind": self.evidence_kind.value,
                 }
             )
-        )
+        return _digest(_canonical_json(document))
 
     def operator_dict(self) -> Mapping[str, object]:
         result = dict(self.public_dict())
@@ -943,9 +1101,11 @@ class AttestationGrant:
                 "attestation_policy_digest": self.attestation_policy_digest,
                 "attestation_policy_release": self.attestation_policy_release,
                 "channel_key_digest": self.channel_key_digest,
+                "cpu_tier": self.cpu_tier.value,
                 "data_key_reference_digest": self.data_key_reference_digest,
                 "envelope_digest": self.envelope.digest if self.envelope else None,
                 "evidence_digest": self.evidence_digest,
+                "evidence_kind": self.evidence_kind.value,
                 "issuer_digest": self.issuer_digest,
                 "key_release_policy_digest": self.key_release_policy_digest,
                 "measurement_digest": self.measurement_digest,
@@ -980,8 +1140,9 @@ class KeyReleaseStore:
     def _initialize(self) -> None:
         try:
             with self._connect() as connection:
-                connection.executescript(
-                    """
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    f"""
                     CREATE TABLE IF NOT EXISTS key_release_grants (
                         grant_id TEXT PRIMARY KEY,
                         assignment_id TEXT NOT NULL UNIQUE,
@@ -990,6 +1151,12 @@ class KeyReleaseStore:
                         manifest_digest TEXT NOT NULL,
                         measurement_digest TEXT NOT NULL,
                         evidence_digest TEXT NOT NULL,
+                        grant_schema TEXT NOT NULL DEFAULT '{LEGACY_GRANT_SCHEMA}'
+                            CHECK (grant_schema IN ('{LEGACY_GRANT_SCHEMA}','{GRANT_SCHEMA}')),
+                        cpu_tier TEXT NOT NULL DEFAULT '{Tier.CC_CPU_TDX.value}'
+                            CHECK (cpu_tier IN ('{Tier.CC_CPU_TDX.value}','{Tier.CC_CPU_SNP.value}')),
+                        evidence_kind TEXT NOT NULL DEFAULT '{EvidenceKind.TDX.value}'
+                            CHECK (evidence_kind IN ('{EvidenceKind.TDX.value}','{EvidenceKind.SEV_SNP.value}')),
                         attestation_policy_release INTEGER NOT NULL,
                         attestation_policy_digest TEXT NOT NULL,
                         verification_policy_digest TEXT NOT NULL,
@@ -1008,7 +1175,35 @@ class KeyReleaseStore:
                         envelope_json BLOB,
                         envelope_digest TEXT,
                         redeemed_at TEXT
-                    );
+                    )
+                    """
+                )
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(key_release_grants)")
+                }
+                migrations = {
+                    "grant_schema": (
+                        f"TEXT NOT NULL DEFAULT '{LEGACY_GRANT_SCHEMA}' "
+                        f"CHECK (grant_schema IN ('{LEGACY_GRANT_SCHEMA}','{GRANT_SCHEMA}'))"
+                    ),
+                    "cpu_tier": (
+                        f"TEXT NOT NULL DEFAULT '{Tier.CC_CPU_TDX.value}' "
+                        f"CHECK (cpu_tier IN ('{Tier.CC_CPU_TDX.value}','{Tier.CC_CPU_SNP.value}'))"
+                    ),
+                    "evidence_kind": (
+                        f"TEXT NOT NULL DEFAULT '{EvidenceKind.TDX.value}' "
+                        f"CHECK (evidence_kind IN "
+                        f"('{EvidenceKind.TDX.value}','{EvidenceKind.SEV_SNP.value}'))"
+                    ),
+                }
+                for name, declaration in migrations.items():
+                    if name not in columns:
+                        connection.execute(
+                            f"ALTER TABLE key_release_grants ADD COLUMN {name} {declaration}"
+                        )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS key_release_events (
                         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         grant_id TEXT NOT NULL,
@@ -1019,15 +1214,54 @@ class KeyReleaseStore:
                         occurred_at TEXT NOT NULL,
                         FOREIGN KEY(grant_id) REFERENCES key_release_grants(grant_id),
                         UNIQUE(grant_id, revision)
-                    );
-                    CREATE TRIGGER IF NOT EXISTS key_release_events_no_update
-                    BEFORE UPDATE ON key_release_events
-                    BEGIN SELECT RAISE(ABORT, 'key-release events are append-only'); END;
-                    CREATE TRIGGER IF NOT EXISTS key_release_events_no_delete
-                    BEFORE DELETE ON key_release_events
-                    BEGIN SELECT RAISE(ABORT, 'key-release events are append-only'); END;
+                    )
                     """
                 )
+                connection.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS key_release_events_no_update
+                    BEFORE UPDATE ON key_release_events
+                    BEGIN SELECT RAISE(ABORT, 'key-release events are append-only'); END
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS key_release_events_no_delete
+                    BEFORE DELETE ON key_release_events
+                    BEGIN SELECT RAISE(ABORT, 'key-release events are append-only'); END
+                    """
+                )
+                pair_predicate = f"""
+                    (NEW.grant_schema = '{LEGACY_GRANT_SCHEMA}'
+                        AND NEW.cpu_tier = '{Tier.CC_CPU_TDX.value}'
+                        AND NEW.evidence_kind = '{EvidenceKind.TDX.value}')
+                    OR
+                    (NEW.grant_schema = '{GRANT_SCHEMA}' AND (
+                        (NEW.cpu_tier = '{Tier.CC_CPU_TDX.value}'
+                            AND NEW.evidence_kind = '{EvidenceKind.TDX.value}')
+                        OR
+                        (NEW.cpu_tier = '{Tier.CC_CPU_SNP.value}'
+                            AND NEW.evidence_kind = '{EvidenceKind.SEV_SNP.value}')
+                    ))
+                """
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS key_release_grants_tee_pair_insert
+                    BEFORE INSERT ON key_release_grants
+                    WHEN NOT ({pair_predicate})
+                    BEGIN SELECT RAISE(ABORT, 'key-release CPU binding is invalid'); END
+                    """
+                )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS key_release_grants_tee_pair_update
+                    BEFORE UPDATE OF grant_schema,cpu_tier,evidence_kind
+                    ON key_release_grants
+                    WHEN NOT ({pair_predicate})
+                    BEGIN SELECT RAISE(ABORT, 'key-release CPU binding is invalid'); END
+                    """
+                )
+                connection.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise KeyReleaseError("store_unavailable", "key-release store is unavailable") from exc
 
@@ -1041,29 +1275,42 @@ class KeyReleaseStore:
             document = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise KeyReleaseError("store_corrupt", "persisted key envelope is invalid") from exc
-        if (
-            not isinstance(document, dict)
-            or set(document)
-            != {
-                "algorithm",
-                "ciphertext_b64",
-                "ephemeral_public_key_b64",
-                "grant_id",
-                "nonce_b64",
-                "request_digest",
-                "schema",
-            }
-            or document.get("schema") != ENVELOPE_SCHEMA
-            or _canonical_json(document) != raw
-        ):
+        common_keys = {
+            "algorithm",
+            "ciphertext_b64",
+            "ephemeral_public_key_b64",
+            "grant_id",
+            "nonce_b64",
+            "request_digest",
+            "schema",
+        }
+        if not isinstance(document, dict) or _canonical_json(document) != raw:
+            raise KeyReleaseError("store_corrupt", "persisted key envelope is invalid")
+        schema = document.get("schema")
+        if schema == LEGACY_ENVELOPE_SCHEMA and set(document) == common_keys:
+            cpu_tier = Tier.CC_CPU_TDX
+            evidence_kind = EvidenceKind.TDX
+        elif schema == ENVELOPE_SCHEMA and set(document) == common_keys | {
+            "cpu_tier",
+            "evidence_kind",
+        }:
+            try:
+                cpu_tier = Tier(document["cpu_tier"])
+                evidence_kind = EvidenceKind(document["evidence_kind"])
+            except (TypeError, ValueError) as exc:
+                raise KeyReleaseError("store_corrupt", "persisted key envelope is invalid") from exc
+        else:
             raise KeyReleaseError("store_corrupt", "persisted key envelope is invalid")
         try:
             return EncryptedDataKeyEnvelope(
                 grant_id=document["grant_id"],
                 request_digest=document["request_digest"],
+                cpu_tier=cpu_tier,
+                evidence_kind=evidence_kind,
                 ephemeral_public_key_b64=document["ephemeral_public_key_b64"],
                 nonce_b64=document["nonce_b64"],
                 ciphertext_b64=document["ciphertext_b64"],
+                schema=schema,
                 algorithm=document["algorithm"],
             )
         except (KeyError, KeyReleaseError, TypeError) as exc:
@@ -1081,6 +1328,8 @@ class KeyReleaseStore:
                 manifest_digest=row["manifest_digest"],
                 measurement_digest=row["measurement_digest"],
                 evidence_digest=row["evidence_digest"],
+                cpu_tier=Tier(row["cpu_tier"]),
+                evidence_kind=EvidenceKind(row["evidence_kind"]),
                 attestation_policy_release=row["attestation_policy_release"],
                 attestation_policy_digest=row["attestation_policy_digest"],
                 verification_policy_digest=row["verification_policy_digest"],
@@ -1102,6 +1351,7 @@ class KeyReleaseStore:
                     if row["redeemed_at"] is not None
                     else None
                 ),
+                schema=row["grant_schema"],
             )
         except KeyReleaseError:
             raise
@@ -1111,22 +1361,22 @@ class KeyReleaseStore:
             raise KeyReleaseError("store_corrupt", "persisted envelope digest is invalid")
         if envelope is not None and envelope.digest != row["envelope_digest"]:
             raise KeyReleaseError("store_corrupt", "persisted envelope digest is invalid")
-        if (
-            envelope is not None
-            and envelope.request_digest != grant.expected_broker_request_digest
-        ):
+        if envelope is not None and envelope.request_digest != grant.expected_broker_request_digest:
             raise KeyReleaseError("store_corrupt", "persisted envelope grant binding is invalid")
         return grant
 
     @staticmethod
     def _immutable(grant: AttestationGrant) -> tuple[object, ...]:
         return (
+            grant.schema,
             grant.assignment_id,
             grant.issuer_digest,
             grant.worker_hotkey,
             grant.manifest_digest,
             grant.measurement_digest,
             grant.evidence_digest,
+            grant.cpu_tier,
+            grant.evidence_kind,
             grant.attestation_policy_release,
             grant.attestation_policy_digest,
             grant.verification_policy_digest,
@@ -1143,7 +1393,11 @@ class KeyReleaseStore:
         )
 
     def create_or_get(self, candidate: AttestationGrant) -> AttestationGrant:
-        if not isinstance(candidate, AttestationGrant) or candidate.state is not GrantState.ISSUED:
+        if (
+            not isinstance(candidate, AttestationGrant)
+            or candidate.schema != GRANT_SCHEMA
+            or candidate.state is not GrantState.ISSUED
+        ):
             raise KeyReleaseError("invalid_grant", "new grant must be issued")
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1163,13 +1417,14 @@ class KeyReleaseStore:
                 INSERT INTO key_release_grants(
                     grant_id, assignment_id, issuer_digest, worker_hotkey,
                     manifest_digest, measurement_digest, evidence_digest,
+                    grant_schema, cpu_tier, evidence_kind,
                     attestation_policy_release, attestation_policy_digest,
                     verification_policy_digest, key_release_policy_digest,
                     workload_policy_digest,
                     worker_generation, worker_revision,
                     worker_event_id, channel_key_digest, data_key_reference_digest,
                     purpose, issued_at, expires_at, state, revision
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',1)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',1)
                 """,
                 (
                     candidate.grant_id,
@@ -1179,6 +1434,9 @@ class KeyReleaseStore:
                     candidate.manifest_digest,
                     candidate.measurement_digest,
                     candidate.evidence_digest,
+                    candidate.schema,
+                    candidate.cpu_tier.value,
+                    candidate.evidence_kind.value,
                     candidate.attestation_policy_release,
                     candidate.attestation_policy_digest,
                     candidate.verification_policy_digest,
@@ -1227,6 +1485,8 @@ class KeyReleaseStore:
             if row is None:
                 raise KeyReleaseError("grant_not_found", "grant does not exist")
             current = self._grant(row)
+            if current.schema != GRANT_SCHEMA:
+                raise KeyReleaseError("legacy_grant", "legacy key-release grants are audit-only")
             if at >= current.expires_at:
                 raise KeyReleaseError("grant_expired", "grant is expired")
             if current.state is not GrantState.ISSUED:
@@ -1268,6 +1528,8 @@ class KeyReleaseStore:
             if row is None:
                 raise KeyReleaseError("grant_not_found", "grant does not exist")
             current = self._grant(row)
+            if current.schema != GRANT_SCHEMA:
+                raise KeyReleaseError("legacy_grant", "legacy key-release grants are audit-only")
             if at >= current.expires_at:
                 raise KeyReleaseError("grant_expired", "grant expired before persistence")
             if current.state is GrantState.REDEEMED:
@@ -1278,7 +1540,17 @@ class KeyReleaseStore:
                 return current
             if current.state is not GrantState.REDEEMING:
                 raise KeyReleaseError("grant_conflict", "grant is not redeeming")
-            if envelope.grant_id != grant_id:
+            if (
+                envelope.grant_id != grant_id
+                or envelope.cpu_tier is not current.cpu_tier
+                or envelope.evidence_kind is not current.evidence_kind
+                or envelope.request_digest != current.expected_broker_request_digest
+                or (
+                    current.schema == LEGACY_GRANT_SCHEMA
+                    and envelope.schema != LEGACY_ENVELOPE_SCHEMA
+                )
+                or (current.schema == GRANT_SCHEMA and envelope.schema != ENVELOPE_SCHEMA)
+            ):
                 raise KeyReleaseError("invalid_envelope", "broker envelope grant is mismatched")
             revision = current.revision + 1
             encoded = envelope.canonical_bytes
@@ -1337,25 +1609,21 @@ class KeyReleaseService:
     """Issue and redeem grants while rechecking lifecycle and active policy."""
 
     def __setattr__(self, name: str, value: object) -> None:
-        if (
-            self.__dict__.get("_configuration_locked", False)
-            and name
-            in {
-                "_LOCKED_SECURITY_CONFIGURATION",
-                "_broker",
-                "_clock",
-                "_clock_lock",
-                "_configuration_locked",
-                "_last_seen_time",
-                "_production_mode",
-                "_required_broker_configuration_digest",
-                "_sealed_workloads_enabled",
-                "assignment_authority",
-                "policy",
-                "registry",
-                "store",
-            }
-        ):
+        if self.__dict__.get("_configuration_locked", False) and name in {
+            "_LOCKED_SECURITY_CONFIGURATION",
+            "_broker",
+            "_clock",
+            "_clock_lock",
+            "_configuration_locked",
+            "_last_seen_time",
+            "_production_mode",
+            "_required_broker_configuration_digest",
+            "_sealed_workloads_enabled",
+            "assignment_authority",
+            "policy",
+            "registry",
+            "store",
+        }:
             raise AttributeError("key-release security configuration is immutable")
         object.__setattr__(self, name, value)
 
@@ -1398,11 +1666,11 @@ class KeyReleaseService:
             not isinstance(required_broker_configuration_digest, str)
             or _DIGEST_RE.fullmatch(required_broker_configuration_digest) is None
         ):
-            raise KeyReleaseError(
-                "broker_unavailable", "required broker configuration is invalid"
-            )
-        if sealed_workloads_enabled and production_mode and (
-            required_broker_configuration_digest is None
+            raise KeyReleaseError("broker_unavailable", "required broker configuration is invalid")
+        if (
+            sealed_workloads_enabled
+            and production_mode
+            and (required_broker_configuration_digest is None)
         ):
             raise KeyReleaseError(
                 "broker_unavailable", "production broker configuration is not pinned"
@@ -1425,9 +1693,7 @@ class KeyReleaseService:
         self.policy = policy
         self._sealed_workloads_enabled = sealed_workloads_enabled
         self._production_mode = production_mode
-        self._required_broker_configuration_digest = (
-            required_broker_configuration_digest
-        )
+        self._required_broker_configuration_digest = required_broker_configuration_digest
         self._clock = clock
         self._clock_lock = threading.Lock()
         self._last_seen_time: datetime | None = None
@@ -1520,12 +1786,17 @@ class KeyReleaseService:
         return lifecycle, record
 
     def _validate_current(self, grant: AttestationGrant, *, at: datetime) -> None:
+        if grant.schema != GRANT_SCHEMA:
+            raise KeyReleaseError(
+                "legacy_grant", "legacy key-release grants cannot return ciphertext"
+            )
         attestation_policy, workload_policy = self._active_policies()
         if (
             attestation_policy.registry_release != grant.attestation_policy_release
             or attestation_policy.registry_digest != grant.attestation_policy_digest
             or policy_digest(attestation_policy) != grant.verification_policy_digest
             or self.policy.digest != grant.key_release_policy_digest
+            or grant.cpu_tier not in self.policy.allowed_cpu_tiers
             or workload_policy.digest != grant.workload_policy_digest
             or grant.measurement_digest
             not in {
@@ -1538,6 +1809,7 @@ class KeyReleaseService:
         claims = record.assurance
         channel_claim = claims.channel
         try:
+            record_tier = Tier(record.tier)
             channel_verified_at = parse_utc(channel_claim.verified_at or "")
             expected_channel_evidence = sha256_digest(
                 ChannelBinding(
@@ -1560,7 +1832,8 @@ class KeyReleaseService:
             or lifecycle.policy_registry_release != grant.attestation_policy_release
             or lifecycle.policy_registry_digest != grant.attestation_policy_digest
             or lifecycle.policy_digest != grant.verification_policy_digest
-            or record.tier != Tier.CC_CPU_TDX.value
+            or record_tier is not grant.cpu_tier
+            or _CPU_TIER_EVIDENCE_KIND.get(record_tier) is not grant.evidence_kind
             or not KEY_RELEASE_POLICY.allows(claims)
             or claims.hardware.evidence_digest != grant.evidence_digest
             or claims.software.policy_digest != lifecycle.policy_digest
@@ -1596,6 +1869,10 @@ class KeyReleaseService:
             )
         if assignment.purpose not in self.policy.allowed_purposes:
             raise KeyReleaseError("purpose_denied", "assignment purpose is not approved")
+        if assignment.cpu_tier not in self.policy.allowed_cpu_tiers:
+            raise KeyReleaseError(
+                "attestation_denied", "assignment CPU tier is not approved for key release"
+            )
         ttl = (
             self.policy.max_grant_ttl_seconds
             if ttl_seconds is None
@@ -1610,13 +1887,24 @@ class KeyReleaseService:
             raise KeyReleaseError("policy_revoked", "workload admission policy changed")
         lifecycle, record = self._verified_worker_state(assignment.worker_hotkey)
         claims = record.assurance
+        if not isinstance(attested, Attested):
+            raise KeyReleaseError(
+                "attestation_denied", "worker attestation does not satisfy key-release policy"
+            )
+        try:
+            attested_evidence_kind = _CPU_TIER_EVIDENCE_KIND[attested.tier]
+        except (KeyError, TypeError) as exc:
+            raise KeyReleaseError(
+                "attestation_denied", "worker CPU tier is not approved for key release"
+            ) from exc
         if (
-            not isinstance(attested, Attested)
-            or attested.verification_status != "VERIFIED"
-            or attested.tier is not Tier.CC_CPU_TDX
+            attested.verification_status != "VERIFIED"
+            or attested.tier is not assignment.cpu_tier
+            or attested_evidence_kind is not assignment.evidence_kind
+            or attested.tier not in self.policy.allowed_cpu_tiers
             or record.hotkey != assignment.worker_hotkey
             or record.chip_id != attested.chip_id
-            or record.tier != Tier.CC_CPU_TDX.value
+            or record.tier != attested.tier.value
             or claims != attested.assurance
             or attested.measurement not in attestation_policy.allowed_measurements
             or not KEY_RELEASE_POLICY.allows(claims)
@@ -1637,11 +1925,9 @@ class KeyReleaseService:
                 "attestation_denied", "worker attestation does not satisfy key-release policy"
             )
         verified_at = lifecycle.evidence_verified_at
-        if (
-            verified_at > when + timedelta(seconds=self.policy.clock_skew_seconds)
-            or when - verified_at
-            >= timedelta(seconds=self.policy.max_attestation_age_seconds)
-        ):
+        if verified_at > when + timedelta(
+            seconds=self.policy.clock_skew_seconds
+        ) or when - verified_at >= timedelta(seconds=self.policy.max_attestation_age_seconds):
             raise KeyReleaseError("attestation_stale", "worker attestation is not fresh enough")
         try:
             _x25519_public_key(application_public_key)
@@ -1667,10 +1953,10 @@ class KeyReleaseService:
             raise KeyReleaseError(
                 "channel_denied", "application key verification time is invalid"
             ) from exc
-        if (
-            channel_verified_at > when + timedelta(seconds=self.policy.clock_skew_seconds)
-            or when - channel_verified_at
-            >= timedelta(seconds=self.policy.max_attestation_age_seconds)
+        if channel_verified_at > when + timedelta(
+            seconds=self.policy.clock_skew_seconds
+        ) or when - channel_verified_at >= timedelta(
+            seconds=self.policy.max_attestation_age_seconds
         ):
             raise KeyReleaseError("channel_denied", "application key binding is stale")
         expires_at = min(
@@ -1691,6 +1977,8 @@ class KeyReleaseService:
             manifest_digest=assignment.manifest_digest,
             measurement_digest=self._measurement_digest(attested.measurement),
             evidence_digest=lifecycle.evidence_digest,
+            cpu_tier=attested.tier,
+            evidence_kind=attested_evidence_kind,
             attestation_policy_release=attestation_policy.registry_release,
             attestation_policy_digest=attestation_policy.registry_digest,
             verification_policy_digest=lifecycle.policy_digest,
@@ -1715,6 +2003,8 @@ class KeyReleaseService:
             assignment.assignment_id == grant.assignment_id
             and assignment.issuer_digest == grant.issuer_digest
             and assignment.worker_hotkey == grant.worker_hotkey
+            and assignment.cpu_tier is grant.cpu_tier
+            and assignment.evidence_kind is grant.evidence_kind
             and assignment.manifest_digest == grant.manifest_digest
             and assignment.workload_policy_digest == grant.workload_policy_digest
             and assignment.data_key_reference_digest == grant.data_key_reference_digest
@@ -1780,6 +2070,8 @@ class KeyReleaseService:
             key_reference=assignment.data_key_reference,
             key_reference_digest=grant.data_key_reference_digest,
             application_public_key=application_public_key,
+            cpu_tier=grant.cpu_tier,
+            evidence_kind=grant.evidence_kind,
             channel_key_digest=grant.channel_key_digest,
             manifest_digest=grant.manifest_digest,
             evidence_digest=grant.evidence_digest,
@@ -1795,6 +2087,9 @@ class KeyReleaseService:
         if (
             not isinstance(envelope, EncryptedDataKeyEnvelope)
             or envelope.grant_id != grant.grant_id
+            or envelope.schema != ENVELOPE_SCHEMA
+            or envelope.cpu_tier is not grant.cpu_tier
+            or envelope.evidence_kind is not grant.evidence_kind
             or envelope.request_digest != request.digest
         ):
             raise KeyReleaseError(
