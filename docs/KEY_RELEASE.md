@@ -5,12 +5,18 @@ per-workload data key only to a fresh, policy-approved CPU worker. This is a
 control-plane and broker contract. No production broker or customer container
 execution path is enabled by this repository today.
 
+The protocol supports an explicit CPU TEE selection. Its default remains Intel
+TDX only. An AMD SEV-SNP selection requires an explicit key-release policy
+opt-in. This contract support does not enable SNP production, an SNP runtime,
+an SNP provider endpoint, or a production key broker.
+
 ## Required bindings
 
 A grant is issued only when all of the following agree:
 
 - an HMAC-authenticated allocator assignment names the exact admitted workload,
-  customer issuer, worker hotkey, purpose, and opaque data-key reference;
+  customer issuer, worker hotkey, CPU tier, evidence kind, purpose, and opaque
+  data-key reference;
 - production release accepts only an assignment whose signed capability says
   it was minted by a preflighted production admission controller and verifier;
 - the workload carries an enforced admission capability from the immutable
@@ -18,8 +24,11 @@ A grant is issued only when all of the following agree:
 - the worker lifecycle is `attested`, inside its exact evidence-expiry window,
   and no more than 60 seconds old;
 - the current signed attestation policy release and digest still match;
-- the exact verifier-policy digest, including TCB, firmware, status, and
-  advisory constraints, still matches the evidence lifecycle;
+- the exact selected verifier-policy digest still matches the evidence
+  lifecycle. Platform-specific checks differ. The TDX verifier covers its
+  configured firmware, TCB status, and advisory policy. The current SNP
+  verifier covers the vendor chain, report-data binding, measurement, and
+  scalar minimum TCB;
 - the complete key-release policy digest, including allowed purposes and all
   freshness, TTL, and skew limits, is unchanged;
 - hardware, software, and channel assurance claims are all `passed`; and
@@ -39,8 +48,8 @@ shadow. Production validation rejects an older development capability even if
 it was otherwise marked `enforced`.
 
 TLS ownership alone is not sufficient for data-key release. A different
-application key, workload manifest, worker, policy, purpose, issuer, or custody
-reference cannot reuse the grant.
+application key, workload manifest, worker, CPU tier, evidence kind, policy,
+purpose, issuer, or custody reference cannot reuse the grant.
 
 Grant TTL is policy-controlled and cannot exceed 60 seconds or the remaining
 assignment, hardware, and channel attestation-freshness windows. Because expiry
@@ -48,12 +57,50 @@ is exclusive, evidence already 60 seconds old has no remaining release window.
 The exact expiry instant is denied and assignment validity, freshness, policy,
 and lifecycle state are rechecked immediately before ciphertext returns.
 
+## CPU TEE selection and protocol versions
+
+The accepted pairs are exact:
+
+| CPU tier | Evidence kind |
+| --- | --- |
+| `cc_cpu_tdx` | `tdx` |
+| `cc_cpu_snp` | `sev_snp` |
+
+The assignment capability, attestation grant, broker request, and encrypted
+envelope all bind the selected pair. The issued assignment, verified verdict,
+current worker registry record, active key-release policy, broker request, and
+returned envelope must agree. A mismatched pair or an attempt to relabel a TDX
+grant as SNP fails before key release. Broker idempotency also covers this pair,
+so a request from one CPU TEE cannot reuse the cached response from another.
+
+New assignments, grants, broker requests, and encrypted envelopes use their
+respective version 2 schemas. Their signing, derivation, and digest domains are
+also version 2. Version 2 envelopes use the
+`x25519-hkdf-sha256-aes256gcm-v2` algorithm identifier. Version 1 persisted
+grants and envelopes retain the historical
+`x25519-hkdf-sha256-aes256gcm-v1` identifier and remain readable for audit,
+with their original TDX meaning. A schema and algorithm mismatch is rejected.
+Version 1 grants are not eligible for redemption. The service returns the
+explicit `legacy_grant` category instead of deriving a version 2 digest from
+version 1 material.
+
+SQLite startup adds the grant schema, CPU tier, and evidence kind columns in one
+write transaction. Existing rows receive the version 1, TDX-only labels. Their
+stored envelope bytes and envelope digests remain unchanged. Database checks
+reject an unsupported pair and reject any SNP label on a version 1 row.
+
+The authenticated assignment now names a CPU tier, but the existing execution
+provider authorization does not. Dispatch therefore remains TDX-only and
+rejects an SNP assignment before provider access. SNP policy opt-in covers the
+key-release contract only. A later provider-contract version must bind the CPU
+tier and evidence kind before SNP execution is enabled.
+
 ## Broker boundary
 
 The provider-neutral broker receives a grant ID as its idempotency key, the
 opaque custody reference, the attested application public key, and hashes of
-all other release inputs. Its response is an encrypted envelope, never a
-plaintext key.
+all other release inputs. The request digest includes the exact CPU tier and
+evidence kind. Its response is an encrypted envelope, never a plaintext key.
 
 The local test broker uses X25519, HKDF-SHA-256, and AES-256-GCM. The complete
 immutable grant digest is part of the authenticated data. The ephemeral public
@@ -119,10 +166,11 @@ previous grant with a longer lifetime than the new request.
 
 SQLite stores grant metadata, keyed issuer and custody pseudonyms, one-way
 measurement and channel digests, append-only transition events, and encrypted
-envelope bytes. The keyed pseudonyms resist offline enumeration from a database
-copy because their HMAC key remains in the assignment-authority boundary. It does
-not store the customer issuer string, custody reference, application public
-key, plaintext data key, broker credential, or root unwrap material.
+envelope bytes. Grant metadata includes the protocol schema, CPU tier, and
+evidence kind. The keyed pseudonyms resist offline enumeration from a database
+copy because their HMAC key remains in the assignment-authority boundary. It
+does not store the customer issuer string, custody reference, application
+public key, plaintext data key, broker credential, or root unwrap material.
 
 The customer-safe grant view exposes state, assignment, worker, manifest,
 purpose, and validity times. Evidence, policy, channel, custody, issuer, event,

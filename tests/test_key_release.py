@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,18 +24,30 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from cathedral.assurance import attestation_claims, policy_digest, with_verified_channel
 from cathedral.channel import application_key_binding
-from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Policy, Tier
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    EvidenceKind,
+    Policy,
+    Tier,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.key_release import (
+    AttestationGrant,
     BrokerCustodyBoundary,
     BrokerPreflight,
     BrokerRedemptionRequest,
+    ENVELOPE_ALGORITHM,
     EncryptedDataKeyEnvelope,
     GrantState,
     KeyReleaseError,
     KeyReleasePolicy,
     KeyReleaseService,
     KeyReleaseStore,
+    LEGACY_ENVELOPE_ALGORITHM,
+    LEGACY_ENVELOPE_SCHEMA,
+    LEGACY_GRANT_SCHEMA,
     LocalKeyBroker,
     WorkloadAssignmentAuthority,
 )
@@ -66,6 +79,7 @@ HOTKEY = "worker-hotkey"
 DATA_KEY_REFERENCE = "kms/customer/project/data-key-7"
 PLAINTEXT_DATA_KEY = b"customer-data-key-material-32byte"
 BROKER_CONFIG_DIGEST = "sha256:" + "6" * 64
+LEGACY_POLICY_DIGEST = "sha256:5bca9da8f3a077168419140eee9fb17b3e1c6ea4738d22bfe8144e734abdd6c2"
 
 
 @dataclass
@@ -97,12 +111,17 @@ class Harness:
     active: dict[str, object]
 
 
-def _attestation_policy(measurement: str = "measurement") -> Policy:
+def _attestation_policy(
+    measurement: str = "measurement",
+    *,
+    cpu_tier: Tier = Tier.CC_CPU_TDX,
+) -> Policy:
+    profile = "cpu-tdx-customer-v1" if cpu_tier is Tier.CC_CPU_TDX else "cpu-snp-customer-v1"
     return Policy(
         allowed_measurements={measurement},
         registry_release=7,
         registry_digest=REGISTRY_DIGEST,
-        registry_profile_ids=("cpu-tdx-customer-v1",),
+        registry_profile_ids=(profile,),
     )
 
 
@@ -137,7 +156,14 @@ def _public_bytes(private_key: X25519PrivateKey) -> bytes:
     )
 
 
-def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
+def _harness(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    cpu_tier: Tier = Tier.CC_CPU_TDX,
+    policy: KeyReleasePolicy | None = None,
+) -> Harness:
+    evidence_kind = EvidenceKind.TDX if cpu_tier is Tier.CC_CPU_TDX else EvidenceKind.SEV_SNP
     clock = MutableClock()
     registry = RegistryStore(
         str(tmp_path / "registry.sqlite"),
@@ -145,7 +171,7 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         clock=clock,
     )
     registry.enroll(HOTKEY, "https://worker.example")
-    attestation_policy = _attestation_policy()
+    attestation_policy = _attestation_policy(cpu_tier=cpu_tier)
     application_private_key = X25519PrivateKey.generate()
     application_public_key = _public_bytes(application_private_key)
     binding = application_key_binding(application_public_key)
@@ -159,7 +185,7 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         verified_at=canonical_utc(clock.now),
     )
     attested = Attested(
-        Tier.CC_CPU_TDX,
+        cpu_tier,
         "chip-1",
         "measurement",
         1,
@@ -201,6 +227,8 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         worker_hotkey=HOTKEY,
         workload=admitted,
         data_key_reference=DATA_KEY_REFERENCE,
+        cpu_tier=cpu_tier,
+        evidence_kind=evidence_kind,
     )
     broker = LocalKeyBroker(
         {DATA_KEY_REFERENCE: PLAINTEXT_DATA_KEY},
@@ -218,6 +246,7 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         broker,
         lambda: active["attestation"],  # type: ignore[return-value]
         lambda: active["workload"],  # type: ignore[return-value]
+        policy=policy or KeyReleasePolicy(),
         sealed_workloads_enabled=enabled,
         production_mode=False,
         clock=clock,
@@ -248,6 +277,7 @@ def _service_with_broker(harness: Harness, broker) -> KeyReleaseService:
         broker,
         lambda: harness.active["attestation"],  # type: ignore[return-value]
         lambda: harness.active["workload"],  # type: ignore[return-value]
+        policy=harness.service.policy,
         sealed_workloads_enabled=True,
         production_mode=False,
         clock=harness.clock,
@@ -287,6 +317,8 @@ def _broker_request(harness: Harness, grant) -> BrokerRedemptionRequest:
         key_reference=assignment.data_key_reference,
         key_reference_digest=grant.data_key_reference_digest,
         application_public_key=harness.application_public_key,
+        cpu_tier=grant.cpu_tier,
+        evidence_kind=grant.evidence_kind,
         channel_key_digest=grant.channel_key_digest,
         manifest_digest=grant.manifest_digest,
         evidence_digest=grant.evidence_digest,
@@ -308,7 +340,7 @@ def _decrypt(
         algorithm=hashes.SHA256(),
         length=32,
         salt=bytes.fromhex(request.channel_key_digest.removeprefix("sha256:")),
-        info=b"cathedral-key-release-v1\0" + request.grant_id.encode("ascii"),
+        info=b"cathedral-key-release-v2\0" + request.grant_id.encode("ascii"),
     ).derive(shared)
     return AESGCM(wrapping_key).decrypt(
         base64.b64decode(envelope.nonce_b64, validate=True),
@@ -333,6 +365,7 @@ def test_valid_grant_releases_only_ciphertext_decryptable_by_attested_key(tmp_pa
 
     request = _broker_request(harness, grant)
     assert _decrypt(harness.application_private_key, request, envelope) == PLAINTEXT_DATA_KEY
+    assert envelope.algorithm == ENVELOPE_ALGORITHM
     assert harness.broker.unwrap_count == 1
     persisted = harness.store.get(grant.grant_id)
     assert persisted.state is GrantState.REDEEMED
@@ -366,9 +399,10 @@ def test_grant_contains_exact_assignment_policy_lifecycle_and_channel_bindings(t
         lifecycle.revision,
         lifecycle.event_id,
     )
-    assert grant.channel_key_digest == "sha256:" + application_key_binding(
-        harness.application_public_key
-    ).digest.hex()
+    assert (
+        grant.channel_key_digest
+        == "sha256:" + application_key_binding(harness.application_public_key).digest.hex()
+    )
     assert grant.expires_at == START + timedelta(seconds=60)
 
 
@@ -1171,6 +1205,26 @@ def test_authenticated_assignment_dispatches_exact_manifest_idempotently(tmp_pat
     assert adapter.workloads == [(harness.assignment.assignment_id, admitted)]
 
 
+def test_snp_assignment_does_not_reach_unversioned_execution_provider(tmp_path: Path):
+    harness = _harness(
+        tmp_path,
+        cpu_tier=Tier.CC_CPU_SNP,
+        policy=KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_SNP})),
+    )
+    admitted = harness.workload_controller.admit(_workload_request())
+    adapter = RecordingExecutionAdapter()
+
+    with pytest.raises(KeyReleaseError) as denied:
+        harness.authority.dispatch_execution(
+            assignment=harness.assignment,
+            workload=admitted,
+            adapter=adapter,
+        )
+
+    assert denied.value.category == "execution_denied"
+    assert adapter.workloads == []
+
+
 @pytest.mark.parametrize("changed", ["worker", "manifest", "expired"])
 def test_assignment_execution_binding_fails_before_provider(
     tmp_path: Path,
@@ -1307,12 +1361,16 @@ def test_store_never_persists_plaintext_key_reference_public_key_or_issuer(tmp_p
         issuer_digest, reference_digest = connection.execute(
             "SELECT issuer_digest,data_key_reference_digest FROM key_release_grants"
         ).fetchone()
-    enumerable_issuer = "sha256:" + hashlib.sha256(
-        b"cathedral-assignment-issuer-v1\0customer-account-7"
-    ).hexdigest()
-    enumerable_reference = "sha256:" + hashlib.sha256(
-        b"cathedral-data-key-reference-v1\0" + DATA_KEY_REFERENCE.encode()
-    ).hexdigest()
+    enumerable_issuer = (
+        "sha256:"
+        + hashlib.sha256(b"cathedral-assignment-issuer-v1\0customer-account-7").hexdigest()
+    )
+    enumerable_reference = (
+        "sha256:"
+        + hashlib.sha256(
+            b"cathedral-data-key-reference-v1\0" + DATA_KEY_REFERENCE.encode()
+        ).hexdigest()
+    )
     assert issuer_digest != enumerable_issuer
     assert reference_digest != enumerable_reference
 
@@ -1326,7 +1384,9 @@ def test_public_grant_omits_internal_policy_channel_key_and_custody_details(tmp_
     public = dict(grant.public_dict())
     operator = dict(grant.operator_dict())
 
-    assert public["schema"] == "cathedral_attestation_grant_v1"
+    assert public["schema"] == "cathedral_attestation_grant_v2"
+    assert public["cpu_tier"] == Tier.CC_CPU_TDX.value
+    assert public["evidence_kind"] == EvidenceKind.TDX.value
     assert "channel_key_digest" not in public
     assert "data_key_reference_digest" not in public
     assert "evidence_digest" not in public
@@ -1618,11 +1678,497 @@ def test_policy_provider_exception_is_secret_safe_and_never_calls_broker(tmp_pat
     assert harness.broker.call_count == 0
 
 
+def test_default_policy_denies_snp_even_with_a_verified_snp_record(tmp_path: Path):
+    harness = _harness(tmp_path, cpu_tier=Tier.CC_CPU_SNP)
+
+    assert harness.assignment.cpu_tier is Tier.CC_CPU_SNP
+    assert harness.assignment.evidence_kind is EvidenceKind.SEV_SNP
+    assert KeyReleasePolicy().allowed_cpu_tiers == frozenset({Tier.CC_CPU_TDX})
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+        )
+
+    assert raised.value.category == "attestation_denied"
+    assert harness.broker.call_count == 0
+
+
+def test_explicit_snp_policy_binds_snp_through_grant_request_and_envelope(
+    tmp_path: Path,
+):
+    policy = KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_SNP}))
+    harness = _harness(tmp_path, cpu_tier=Tier.CC_CPU_SNP, policy=policy)
+
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    envelope = harness.service.redeem(
+        grant.grant_id,
+        harness.assignment,
+        harness.application_public_key,
+    )
+    request = _broker_request(harness, grant)
+
+    assert grant.schema == "cathedral_attestation_grant_v2"
+    assert grant.cpu_tier is Tier.CC_CPU_SNP
+    assert grant.evidence_kind is EvidenceKind.SEV_SNP
+    assert grant.key_release_policy_digest == policy.digest
+    assert grant.public_dict()["cpu_tier"] == Tier.CC_CPU_SNP.value
+    assert grant.public_dict()["evidence_kind"] == EvidenceKind.SEV_SNP.value
+    assert request.cpu_tier is Tier.CC_CPU_SNP
+    assert request.evidence_kind is EvidenceKind.SEV_SNP
+    assert envelope.schema == "cathedral_encrypted_data_key_v2"
+    assert envelope.cpu_tier is Tier.CC_CPU_SNP
+    assert envelope.evidence_kind is EvidenceKind.SEV_SNP
+    assert envelope.request_digest == grant.expected_broker_request_digest
+    assert _decrypt(harness.application_private_key, request, envelope) == PLAINTEXT_DATA_KEY
+    reopened = KeyReleaseStore(harness.store.path).get(grant.grant_id)
+    assert (reopened.cpu_tier, reopened.evidence_kind) == (
+        Tier.CC_CPU_SNP,
+        EvidenceKind.SEV_SNP,
+    )
+
+
+def test_assignment_cpu_binding_must_match_the_verified_worker(tmp_path: Path):
+    policy = KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_TDX, Tier.CC_CPU_SNP}))
+    harness = _harness(tmp_path, policy=policy)
+    admitted = harness.workload_controller.admit(_workload_request())
+    snp_assignment = harness.authority.issue(
+        authenticated_issuer_id="customer-account-7",
+        worker_hotkey=HOTKEY,
+        workload=admitted,
+        data_key_reference=DATA_KEY_REFERENCE,
+        cpu_tier=Tier.CC_CPU_SNP,
+        evidence_kind=EvidenceKind.SEV_SNP,
+    )
+
+    assert snp_assignment.capability_document()["cpu_tier"] == Tier.CC_CPU_SNP.value
+    assert snp_assignment.capability_document()["evidence_kind"] == EvidenceKind.SEV_SNP.value
+    with pytest.raises(KeyReleaseError) as mismatch:
+        harness.service.issue_grant(
+            snp_assignment,
+            harness.attested,
+            harness.application_public_key,
+        )
+    assert mismatch.value.category == "attestation_denied"
+
+    forged = dataclasses.replace(
+        harness.assignment,
+        cpu_tier=Tier.CC_CPU_SNP,
+        evidence_kind=EvidenceKind.SEV_SNP,
+    )
+    with pytest.raises(KeyReleaseError) as capability:
+        harness.service.issue_grant(
+            forged,
+            harness.attested,
+            harness.application_public_key,
+        )
+    assert capability.value.category == "invalid_assignment"
+    assert harness.broker.call_count == 0
+
+
+def test_inconsistent_cpu_tier_and_evidence_pairs_fail_closed(tmp_path: Path):
+    harness = _harness(tmp_path)
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    request = _broker_request(harness, grant)
+    envelope = harness.broker.redeem(request)
+
+    with pytest.raises(KeyReleaseError) as invalid_grant:
+        dataclasses.replace(grant, evidence_kind=EvidenceKind.SEV_SNP)
+    assert invalid_grant.value.category == "invalid_grant"
+    with pytest.raises(KeyReleaseError) as invalid_request:
+        dataclasses.replace(request, evidence_kind=EvidenceKind.SEV_SNP)
+    assert invalid_request.value.category == "invalid_broker_request"
+    with pytest.raises(KeyReleaseError) as invalid_envelope:
+        dataclasses.replace(envelope, evidence_kind=EvidenceKind.SEV_SNP)
+    assert invalid_envelope.value.category == "invalid_envelope"
+    with pytest.raises(KeyReleaseError) as legacy_algorithm_on_v2:
+        dataclasses.replace(envelope, algorithm=LEGACY_ENVELOPE_ALGORITHM)
+    assert legacy_algorithm_on_v2.value.category == "invalid_envelope"
+    with pytest.raises(KeyReleaseError) as v2_algorithm_on_legacy:
+        dataclasses.replace(
+            envelope,
+            cpu_tier=Tier.CC_CPU_TDX,
+            evidence_kind=EvidenceKind.TDX,
+            schema=LEGACY_ENVELOPE_SCHEMA,
+        )
+    assert v2_algorithm_on_legacy.value.category == "invalid_envelope"
+
+
+def test_cross_tier_relabel_cannot_reuse_grant_broker_cache_or_store(tmp_path: Path):
+    policy = KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_TDX, Tier.CC_CPU_SNP}))
+    harness = _harness(tmp_path, cpu_tier=Tier.CC_CPU_SNP, policy=policy)
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    request = _broker_request(harness, grant)
+    envelope = harness.broker.redeem(request)
+    relabeled_grant = dataclasses.replace(
+        grant,
+        cpu_tier=Tier.CC_CPU_TDX,
+        evidence_kind=EvidenceKind.TDX,
+    )
+    relabeled_request = BrokerRedemptionRequest(
+        grant_id=relabeled_grant.grant_id,
+        key_reference=harness.assignment.data_key_reference,
+        key_reference_digest=relabeled_grant.data_key_reference_digest,
+        application_public_key=harness.application_public_key,
+        cpu_tier=relabeled_grant.cpu_tier,
+        evidence_kind=relabeled_grant.evidence_kind,
+        channel_key_digest=relabeled_grant.channel_key_digest,
+        manifest_digest=relabeled_grant.manifest_digest,
+        evidence_digest=relabeled_grant.evidence_digest,
+        grant_digest=relabeled_grant.binding_digest,
+        purpose=relabeled_grant.purpose,
+    )
+
+    assert relabeled_grant.binding_digest != grant.binding_digest
+    assert relabeled_request.digest != request.digest
+    with pytest.raises(KeyReleaseError) as cache_replay:
+        harness.broker.redeem(relabeled_request)
+    assert cache_replay.value.category == "broker_rejected"
+    with pytest.raises(KeyReleaseError) as grant_relabel:
+        harness.store.create_or_get(relabeled_grant)
+    assert grant_relabel.value.category == "grant_conflict"
+
+    harness.store.begin_redemption(grant.grant_id, at=harness.clock.now)
+    relabeled_envelope = dataclasses.replace(
+        envelope,
+        request_digest=relabeled_request.digest,
+        cpu_tier=Tier.CC_CPU_TDX,
+        evidence_kind=EvidenceKind.TDX,
+    )
+    with pytest.raises(KeyReleaseError) as envelope_relabel:
+        harness.store.persist_redemption(
+            grant.grant_id,
+            relabeled_envelope,
+            at=harness.clock.now,
+        )
+    assert envelope_relabel.value.category == "invalid_envelope"
+
+
+def test_legacy_v1_digest_vectors_remain_frozen_for_audit():
+    grant = AttestationGrant(
+        grant_id="grant-" + "a" * 64,
+        assignment_id="assignment-" + "b" * 64,
+        issuer_digest="sha256:" + "1" * 64,
+        worker_hotkey=HOTKEY,
+        manifest_digest="sha256:" + "2" * 64,
+        measurement_digest="sha256:" + "4" * 64,
+        evidence_digest="sha256:" + "5" * 64,
+        cpu_tier=Tier.CC_CPU_TDX,
+        evidence_kind=EvidenceKind.TDX,
+        attestation_policy_release=7,
+        attestation_policy_digest="sha256:" + "3" * 64,
+        verification_policy_digest="sha256:" + "8" * 64,
+        key_release_policy_digest=LEGACY_POLICY_DIGEST,
+        workload_policy_digest="sha256:" + "9" * 64,
+        worker_generation=1,
+        worker_revision=2,
+        worker_event_id=3,
+        channel_key_digest="sha256:" + "6" * 64,
+        data_key_reference_digest="sha256:" + "7" * 64,
+        purpose="sealed_workload_data_key_v1",
+        issued_at=START,
+        expires_at=START + timedelta(seconds=30),
+        schema=LEGACY_GRANT_SCHEMA,
+    )
+    historical_binding = {
+        "assignment_id": grant.assignment_id,
+        "attestation_policy_digest": grant.attestation_policy_digest,
+        "attestation_policy_release": grant.attestation_policy_release,
+        "channel_key_digest": grant.channel_key_digest,
+        "data_key_reference_digest": grant.data_key_reference_digest,
+        "evidence_digest": grant.evidence_digest,
+        "expires_at": "2026-07-17T12:00:30.000000Z",
+        "grant_id": grant.grant_id,
+        "issued_at": "2026-07-17T12:00:00.000000Z",
+        "issuer_digest": grant.issuer_digest,
+        "key_release_policy_digest": LEGACY_POLICY_DIGEST,
+        "manifest_digest": grant.manifest_digest,
+        "measurement_digest": grant.measurement_digest,
+        "purpose": grant.purpose,
+        "schema": "cathedral_attestation_grant_v1",
+        "verification_policy_digest": grant.verification_policy_digest,
+        "worker_event_id": grant.worker_event_id,
+        "worker_generation": grant.worker_generation,
+        "worker_hotkey": grant.worker_hotkey,
+        "worker_revision": grant.worker_revision,
+        "workload_policy_digest": grant.workload_policy_digest,
+    }
+
+    def historical_digest(document: dict[str, object]) -> str:
+        canonical = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    expected_binding_digest = (
+        "sha256:81e8ebfee2b910bb3fdb53a9099bd3241d059efd5282efa8786264f49cb09cc5"
+    )
+    assert historical_digest(historical_binding) == expected_binding_digest
+    assert grant.binding_digest == expected_binding_digest
+
+    historical_request = {
+        "channel_key_digest": grant.channel_key_digest,
+        "evidence_digest": grant.evidence_digest,
+        "grant_digest": expected_binding_digest,
+        "grant_id": grant.grant_id,
+        "key_reference_digest": grant.data_key_reference_digest,
+        "manifest_digest": grant.manifest_digest,
+        "purpose": grant.purpose,
+        "schema": "cathedral_key_broker_request_v1",
+    }
+    expected_request_digest = (
+        "sha256:06f10cc96b25d9172f88967d812d11bffb5ae09c5a259f4ecab1209a3afc993d"
+    )
+    assert historical_digest(historical_request) == expected_request_digest
+    assert grant.expected_broker_request_digest == expected_request_digest
+
+    envelope = EncryptedDataKeyEnvelope(
+        grant_id=grant.grant_id,
+        request_digest=expected_request_digest,
+        cpu_tier=Tier.CC_CPU_TDX,
+        evidence_kind=EvidenceKind.TDX,
+        ephemeral_public_key_b64=base64.b64encode(b"e" * 32).decode("ascii"),
+        nonce_b64=base64.b64encode(b"n" * 12).decode("ascii"),
+        ciphertext_b64=base64.b64encode(b"c" * 17).decode("ascii"),
+        schema=LEGACY_ENVELOPE_SCHEMA,
+        algorithm=LEGACY_ENVELOPE_ALGORITHM,
+    )
+    historical_envelope = {
+        "algorithm": "x25519-hkdf-sha256-aes256gcm-v1",
+        "ciphertext_b64": "Y2NjY2NjY2NjY2NjY2NjY2M=",
+        "ephemeral_public_key_b64": ("ZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWU="),
+        "grant_id": grant.grant_id,
+        "nonce_b64": "bm5ubm5ubm5ubm5u",
+        "request_digest": expected_request_digest,
+        "schema": "cathedral_encrypted_data_key_v1",
+    }
+    expected_envelope_digest = (
+        "sha256:c4c89a9a4cf33de75284c5ea07a15c8fe3dae350e1653c006c2307fa2c09f54b"
+    )
+    assert historical_digest(historical_envelope) == expected_envelope_digest
+    assert envelope.digest == expected_envelope_digest
+
+
+def test_store_migrates_legacy_grants_without_rewriting_old_envelope_digests(
+    tmp_path: Path,
+):
+    current_path = tmp_path / "current"
+    current_path.mkdir()
+    harness = _harness(current_path)
+    current = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    legacy_issued = dataclasses.replace(
+        current,
+        key_release_policy_digest=LEGACY_POLICY_DIGEST,
+        schema=LEGACY_GRANT_SCHEMA,
+    )
+    legacy_redeemed_seed = dataclasses.replace(
+        legacy_issued,
+        grant_id="grant-" + "b" * 64,
+        assignment_id="assignment-" + "b" * 64,
+    )
+    legacy_envelope = EncryptedDataKeyEnvelope(
+        grant_id=legacy_redeemed_seed.grant_id,
+        request_digest=legacy_redeemed_seed.expected_broker_request_digest,
+        cpu_tier=Tier.CC_CPU_TDX,
+        evidence_kind=EvidenceKind.TDX,
+        ephemeral_public_key_b64=base64.b64encode(b"e" * 32).decode("ascii"),
+        nonce_b64=base64.b64encode(b"n" * 12).decode("ascii"),
+        ciphertext_b64=base64.b64encode(b"c" * 17).decode("ascii"),
+        schema=LEGACY_ENVELOPE_SCHEMA,
+        algorithm=LEGACY_ENVELOPE_ALGORITHM,
+    )
+    legacy_redeemed = dataclasses.replace(
+        legacy_redeemed_seed,
+        state=GrantState.REDEEMED,
+        revision=3,
+        envelope=legacy_envelope,
+        redeemed_at=START + timedelta(seconds=1),
+    )
+    legacy_path = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(legacy_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE key_release_grants (
+                grant_id TEXT PRIMARY KEY,
+                assignment_id TEXT NOT NULL UNIQUE,
+                issuer_digest TEXT NOT NULL,
+                worker_hotkey TEXT NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                measurement_digest TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                attestation_policy_release INTEGER NOT NULL,
+                attestation_policy_digest TEXT NOT NULL,
+                verification_policy_digest TEXT NOT NULL,
+                key_release_policy_digest TEXT NOT NULL,
+                workload_policy_digest TEXT NOT NULL,
+                worker_generation INTEGER NOT NULL,
+                worker_revision INTEGER NOT NULL,
+                worker_event_id INTEGER NOT NULL,
+                channel_key_digest TEXT NOT NULL,
+                data_key_reference_digest TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('issued','redeeming','redeemed')),
+                revision INTEGER NOT NULL,
+                envelope_json BLOB,
+                envelope_digest TEXT,
+                redeemed_at TEXT
+            )
+            """
+        )
+
+        def insert(grant) -> None:
+            connection.execute(
+                """
+                INSERT INTO key_release_grants(
+                    grant_id,assignment_id,issuer_digest,worker_hotkey,
+                    manifest_digest,measurement_digest,evidence_digest,
+                    attestation_policy_release,attestation_policy_digest,
+                    verification_policy_digest,key_release_policy_digest,
+                    workload_policy_digest,worker_generation,worker_revision,
+                    worker_event_id,channel_key_digest,data_key_reference_digest,
+                    purpose,issued_at,expires_at,state,revision,envelope_json,
+                    envelope_digest,redeemed_at
+                ) VALUES (
+                    :grant_id,:assignment_id,:issuer_digest,:worker_hotkey,
+                    :manifest_digest,:measurement_digest,:evidence_digest,
+                    :attestation_policy_release,:attestation_policy_digest,
+                    :verification_policy_digest,:key_release_policy_digest,
+                    :workload_policy_digest,:worker_generation,:worker_revision,
+                    :worker_event_id,:channel_key_digest,:data_key_reference_digest,
+                    :purpose,:issued_at,:expires_at,:state,:revision,:envelope_json,
+                    :envelope_digest,:redeemed_at
+                )
+                """,
+                {
+                    "grant_id": grant.grant_id,
+                    "assignment_id": grant.assignment_id,
+                    "issuer_digest": grant.issuer_digest,
+                    "worker_hotkey": grant.worker_hotkey,
+                    "manifest_digest": grant.manifest_digest,
+                    "measurement_digest": grant.measurement_digest,
+                    "evidence_digest": grant.evidence_digest,
+                    "attestation_policy_release": grant.attestation_policy_release,
+                    "attestation_policy_digest": grant.attestation_policy_digest,
+                    "verification_policy_digest": grant.verification_policy_digest,
+                    "key_release_policy_digest": grant.key_release_policy_digest,
+                    "workload_policy_digest": grant.workload_policy_digest,
+                    "worker_generation": grant.worker_generation,
+                    "worker_revision": grant.worker_revision,
+                    "worker_event_id": grant.worker_event_id,
+                    "channel_key_digest": grant.channel_key_digest,
+                    "data_key_reference_digest": grant.data_key_reference_digest,
+                    "purpose": grant.purpose,
+                    "issued_at": canonical_utc(grant.issued_at),
+                    "expires_at": canonical_utc(grant.expires_at),
+                    "state": grant.state.value,
+                    "revision": grant.revision,
+                    "envelope_json": (grant.envelope.canonical_bytes if grant.envelope else None),
+                    "envelope_digest": grant.envelope.digest if grant.envelope else None,
+                    "redeemed_at": (
+                        canonical_utc(grant.redeemed_at) if grant.redeemed_at else None
+                    ),
+                },
+            )
+
+        insert(legacy_issued)
+        insert(legacy_redeemed)
+    original_envelope_bytes = legacy_envelope.canonical_bytes
+    original_envelope_digest = legacy_envelope.digest
+
+    migrated = KeyReleaseStore(legacy_path)
+    issued_after = migrated.get(legacy_issued.grant_id)
+    redeemed_after = migrated.get(legacy_redeemed.grant_id)
+
+    assert (issued_after.schema, issued_after.cpu_tier, issued_after.evidence_kind) == (
+        LEGACY_GRANT_SCHEMA,
+        Tier.CC_CPU_TDX,
+        EvidenceKind.TDX,
+    )
+    with pytest.raises(KeyReleaseError) as direct_redemption:
+        migrated.begin_redemption(legacy_issued.grant_id, at=START)
+    assert direct_redemption.value.category == "legacy_grant"
+    with pytest.raises(KeyReleaseError) as legacy_insert:
+        migrated.create_or_get(legacy_issued)
+    assert legacy_insert.value.category == "invalid_grant"
+    assert redeemed_after.envelope is not None
+    assert redeemed_after.envelope.schema == LEGACY_ENVELOPE_SCHEMA
+    assert redeemed_after.envelope.canonical_bytes == original_envelope_bytes
+    assert redeemed_after.envelope.digest == original_envelope_digest
+    with sqlite3.connect(legacy_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(key_release_grants)")}
+        stored = connection.execute(
+            "SELECT grant_schema,cpu_tier,evidence_kind,envelope_json,envelope_digest "
+            "FROM key_release_grants WHERE grant_id=?",
+            (legacy_redeemed.grant_id,),
+        ).fetchone()
+        assert columns >= {"grant_schema", "cpu_tier", "evidence_kind"}
+        assert stored == (
+            LEGACY_GRANT_SCHEMA,
+            Tier.CC_CPU_TDX.value,
+            EvidenceKind.TDX.value,
+            original_envelope_bytes,
+            original_envelope_digest,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CPU binding"):
+            connection.execute(
+                "UPDATE key_release_grants SET evidence_kind=? WHERE grant_id=?",
+                (EvidenceKind.SEV_SNP.value, legacy_issued.grant_id),
+            )
+
+    legacy_service = KeyReleaseService(
+        migrated,
+        harness.registry,
+        harness.authority,
+        harness.broker,
+        lambda: harness.active["attestation"],  # type: ignore[return-value]
+        lambda: harness.active["workload"],  # type: ignore[return-value]
+        policy=harness.service.policy,
+        sealed_workloads_enabled=True,
+        production_mode=False,
+        clock=harness.clock,
+    )
+    with pytest.raises(KeyReleaseError) as release:
+        legacy_service.redeem(
+            legacy_issued.grant_id,
+            harness.assignment,
+            harness.application_public_key,
+        )
+    assert release.value.category == "legacy_grant"
+    assert harness.broker.call_count == 0
+
+
 def test_invalid_release_policy_types_fail_closed():
     with pytest.raises(KeyReleaseError):
         KeyReleasePolicy(max_grant_ttl_seconds=True)  # type: ignore[arg-type]
     with pytest.raises(KeyReleaseError):
         KeyReleasePolicy(clock_skew_seconds=6)
+    with pytest.raises(KeyReleaseError):
+        KeyReleasePolicy(allowed_cpu_tiers=frozenset())
+    with pytest.raises(KeyReleaseError):
+        KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_GPU}))
     with pytest.raises(KeyReleaseError):
         KeyReleasePolicy(allowed_purposes=frozenset())
     with pytest.raises(KeyReleaseError):
