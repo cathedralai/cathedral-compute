@@ -67,7 +67,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 1912 tests collected. (Collected, not passing: the
+- Repository test suite: 1929 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)

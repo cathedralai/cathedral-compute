@@ -106,7 +106,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The suite collects 1912 tests, and `tests/test_documented_counts.py` holds that
+The suite collects 1929 tests, and `tests/test_documented_counts.py` holds that
 number to this file, so it cannot quietly drift. Passing proves software
 behavior against test doubles; it does not prove live hardware, deployment, or
 an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated

@@ -4,15 +4,6 @@ on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "scripts/detect_publisher_drift.py"
-      - "cathedral/cli.py"
-      - "cathedral/provenance.py"
-      - "cathedral/evidence.py"
-      - ".github/workflows/publisher-drift.yml"
-      - "pins/publisher-release.json"
-      - "pins/evidence-index-keys.json"
 
 jobs:
   detect:
@@ -36,20 +27,13 @@ jobs:
           python -m pip install -e .
 
       - name: Detect publisher drift
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          extra=()
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            extra+=(--git-ref origin/main)
-          else
-            extra+=(--require-release --release pins/publisher-release.json)
-            extra+=(--require-signed-index --index-keys pins/evidence-index-keys.json)
-          fi
           python scripts/detect_publisher_drift.py \
             --evidence-url https://api.cathedral.computer/v1/evidence \
             --network finney \
             --netuid 39 \
             --git-dir . \
+            --git-ref origin/main \
             --max-age-minutes 180 \
-            "${extra[@]}"
+            --require-release --release pins/publisher-release.json \
+            --require-signed-index --index-keys pins/evidence-index-keys.json
