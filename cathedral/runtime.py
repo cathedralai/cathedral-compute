@@ -1660,6 +1660,8 @@ class ConfidentialRuntime:
         assert attested is not None
         try:
             worker_lifecycle = self.registry.lifecycle_snapshot(result.target.hotkey)
+            reserved_generation = worker_lifecycle.generation
+            reserved_event_id = worker_lifecycle.event_id
             receipt = self.receipt_issuer.issue(
                 epoch_id=epoch_id,
                 source_epoch=source_epoch,
@@ -1672,7 +1674,24 @@ class ConfidentialRuntime:
                 manifest_digest=_sat_manifest_digest(item),
                 work_units=work_units,
             )
+            live = self.registry.lifecycle_snapshot(
+                result.target.hotkey,
+                materialize_freshness=False,
+            )
+            if (
+                live.generation != reserved_generation
+                or live.event_id != reserved_event_id
+            ):
+                raise ReceiptError(
+                    "lifecycle",
+                    "receipt worker lifecycle changed during issuance",
+                )
         except ReceiptError as exc:
+            # Worker-local only. A dead signing key or a broken registry
+            # hits every verified miner; swallowing those would complete
+            # the epoch and publish a zero vector.
+            if exc.category != "lifecycle":
+                raise
             self.ledger.resolve_challenge(
                 item.challenge_id,
                 "failed",

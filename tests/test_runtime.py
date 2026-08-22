@@ -32,7 +32,7 @@ from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.lifecycle import WorkerLifecycleState
-from cathedral.receipt import ReceiptIssuer, verify_receipt
+from cathedral.receipt import ReceiptError, ReceiptIssuer, verify_receipt
 from cathedral.remote import RemoteError
 from cathedral.runtime import (
     SAT_WORK_POLICY_DIGEST,
@@ -1025,6 +1025,127 @@ def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
     blocking = ledger.blocking_epoch()
     assert blocking is not None
     assert blocking["status"] == "complete"
+
+
+def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-enroll after the snapshot, inside issue(), must fail that miner.
+
+    Signing the stale ATTESTED snapshot would publish a positive receipt for
+    a worker that is already PENDING.
+    """
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        default_specs(**{"9001": MinerSpec("a")}),
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+    real_issue = issuer.issue
+
+    def issue_after_reenrollment(*args: object, **kwargs: object):
+        runtime.registry.enroll("miner", "http://127.0.0.1:9003")
+        return real_issue(*args, **kwargs)
+
+    issuer.issue = issue_after_reenrollment  # type: ignore[method-assign]
+    run = runtime.run_epoch(11, CANARY)
+    assert run.status == "complete"
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+    assert outcome.status == "receipt_failed"
+    assert run.scores["miner"] == 0.0
+
+
+def test_inactive_receipt_key_aborts_the_epoch_instead_of_publishing_zeros(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead signing key is validator-wide. Completing the epoch would
+    publish a zero vector for every verified miner."""
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        default_specs(**{"9001": MinerSpec("a")}),
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+        poster=RecordingPoster(),
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+
+    def dead_key(*args: object, **kwargs: object):
+        raise ReceiptError("key", "receipt signing key is not active at issue time")
+
+    issuer.issue = dead_key  # type: ignore[method-assign]
+    with pytest.raises(ReceiptError, match="not active"):
+        runtime.run_epoch(11, CANARY, publish=True)
+    blocking = ledger.blocking_epoch()
+    assert blocking is None or blocking["status"] != "published"
 
 
 def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(

@@ -11,6 +11,8 @@ on:
       - "cathedral/provenance.py"
       - "cathedral/evidence.py"
       - ".github/workflows/publisher-drift.yml"
+      - "pins/publisher-release.json"
+      - "pins/evidence-index-keys.json"
 
 jobs:
   detect:
@@ -20,6 +22,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+
+      - name: Fetch origin/main
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -31,8 +36,20 @@ jobs:
           python -m pip install -e .
 
       - name: Detect publisher drift
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          extra=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            extra+=(--git-ref origin/main)
+          else
+            extra+=(--require-release --release pins/publisher-release.json)
+            extra+=(--require-signed-index --index-keys pins/evidence-index-keys.json)
+          fi
           python scripts/detect_publisher_drift.py \
             --evidence-url https://api.cathedral.computer/v1/evidence \
+            --network finney \
+            --netuid 39 \
             --git-dir . \
-            --max-age-minutes 180
+            --max-age-minutes 180 \
+            "${extra[@]}"
