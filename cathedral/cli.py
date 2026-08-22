@@ -1643,8 +1643,27 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
-        if report.get("verifier_digest") != args.verifier_digest:
-            raise ValueError("signed report verifier_digest does not match --verifier-digest")
+        # A frozen report already committed its verifier digest. Re-exporting
+        # latest-published after a pin change must keep that historical pin
+        # (cathedral-compute #157). Today's --verifier-digest applies when a
+        # new score-class report is signed, not when an already-published
+        # epoch is reconciled. Comparing the two here deadlocked the epoch
+        # loop: reconcile refused the old epoch forever, so no new epoch
+        # under the new pins could ever be created.
+        report_verifier_digest = report.get("verifier_digest")
+        if not isinstance(report_verifier_digest, str) or not report_verifier_digest:
+            raise ValueError("signed report is missing verifier_digest")
+        if report_verifier_digest != args.verifier_digest:
+            print(
+                json.dumps(
+                    {
+                        "historical_pin": "verifier_digest",
+                        "report": report_verifier_digest,
+                        "cli": args.verifier_digest,
+                    },
+                    sort_keys=True,
+                )
+            )
 
         snapshot = ledger.score_class_snapshot(epoch_id)
         receipts_by_id: dict[str, bytes] = {}
@@ -1853,7 +1872,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             registry_release=int(registry_release),
             registry_digest=registry_digest,
             registry_blob=registry_blob,
-            verifier_digest=args.verifier_digest,
+            verifier_digest=report_verifier_digest,
             verifier_binary_blob=verifier_binary_blob,
             verifier_command=(
                 [args.verifier_production_path] if args.verifier_production_path else None

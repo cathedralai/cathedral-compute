@@ -2362,6 +2362,42 @@ def test_export_evidence_reconciles_a_frozen_epoch_across_a_registry_reissue(
     assert EvidenceStore(reissued_dir).get_blob(digest_bytes(REGISTRY_BYTES)) == REGISTRY_BYTES
 
 
+def test_export_evidence_keeps_a_frozen_report_pin_after_a_cli_pin_change(
+    tmp_path: Path, capsys
+):
+    """#157: latest-published reconcile must not require today's
+    --verifier-digest. A pin change used to refuse the frozen epoch forever
+    and gate new epoch creation."""
+    evidence_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    assert cli_main(_export_evidence_args(tmp_path, snapshot_path, evidence_dir=evidence_dir)) == 0
+    capsys.readouterr()
+
+    today = "sha256:" + "e" * 64
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                evidence_dir=evidence_dir,
+                verifier_digest=today,
+            )
+        )
+        == 0
+    )
+    lines = [line for line in capsys.readouterr().out.strip().splitlines() if line]
+    notices = [json.loads(line) for line in lines if line.startswith("{")]
+    assert any(
+        row.get("historical_pin") == "verifier_digest"
+        and row.get("report") == VERIFIER_DIGEST
+        and row.get("cli") == today
+        for row in notices
+    )
+    index = json.loads((evidence_dir / "index.json").read_bytes())
+    manifest = parse_manifest(EvidenceStore(evidence_dir).get_blob(index["latest"]["manifest"]))
+    assert manifest["verifier"]["digest"] == VERIFIER_DIGEST
+
+
 def test_export_evidence_fails_closed_when_no_release_carries_the_pinned_digest(
     tmp_path: Path, capsys
 ):

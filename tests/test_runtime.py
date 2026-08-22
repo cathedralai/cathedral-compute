@@ -948,6 +948,85 @@ def test_epoch_survives_a_mid_epoch_reenrollment_after_receipt_issuance(
     assert blocking["status"] == "complete"
 
 
+def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#144: the #145 cache does not cover the window between admit and
+    issue. A re-enrollment that lands on record_work_artifacts (just before
+    the _resolve_work lifecycle read) used to raise ReceiptError out of
+    run_epoch and abort the epoch. It must zero that miner only."""
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+
+    class HookLedger(Ledger):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.pre_issue_hook: Callable[[], None] | None = None
+
+        def record_work_artifacts(self, *args: object, **kwargs: object) -> None:
+            super().record_work_artifacts(*args, **kwargs)  # type: ignore[arg-type]
+            hook, self.pre_issue_hook = self.pre_issue_hook, None
+            if hook is not None:
+                hook()
+
+    ledger = HookLedger(tmp_path / "ledger.sqlite")
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+        ledger=ledger,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+    ledger.pre_issue_hook = lambda: runtime.registry.enroll(
+        "miner", "http://127.0.0.1:9003"
+    )
+
+    run = runtime.run_epoch(11, CANARY)
+
+    assert run.status == "complete"
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+    assert outcome.status == "receipt_failed"
+    assert run.scores["miner"] == 0.0
+    blocking = ledger.blocking_epoch()
+    assert blocking is not None
+    assert blocking["status"] == "complete"
+
+
 def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
