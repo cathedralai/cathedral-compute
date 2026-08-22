@@ -1544,6 +1544,30 @@ def _resolve_pinned_policy_registry(
     return live_bytes, False
 
 
+def _archived_verifier_binding(
+    evidence_dir: Path, source_epoch: int, expected_digest: str
+) -> dict[str, object] | None:
+    """Return the verifier block already published for this source epoch.
+
+    The epoch copy is immutable. If its digest matches the frozen report
+    pin, full replay can reuse that command and binary. A current CLI pin
+    must not replace them.
+    """
+    from cathedral.evidence import EvidenceError, parse_manifest
+
+    path = Path(evidence_dir) / "epochs" / f"{int(source_epoch)}.json"
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = parse_manifest(path.read_bytes())
+    except (OSError, ValueError, EvidenceError):
+        return None
+    verifier = document.get("verifier")
+    if not isinstance(verifier, dict) or verifier.get("digest") != expected_digest:
+        return None
+    return verifier
+
+
 def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
     """Export one published epoch as a public content-addressed evidence bundle.
 
@@ -1643,10 +1667,48 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
-        if report.get("verifier_digest") != args.verifier_digest:
-            raise ValueError("signed report verifier_digest does not match --verifier-digest")
+        # A frozen report already committed its verifier digest. Re-exporting
+        # latest-published after a pin change must keep that historical pin
+        # (cathedral-compute #157). Today's --verifier-digest applies when a
+        # new score-class report is signed, not when an already-published
+        # epoch is reconciled. Comparing the two here deadlocked the epoch
+        # loop: reconcile refused the old epoch forever, so no new epoch
+        # under the new pins could ever be created.
+        report_verifier_digest = report.get("verifier_digest")
+        if not isinstance(report_verifier_digest, str) or not report_verifier_digest:
+            raise ValueError("signed report is missing verifier_digest")
+        historical_verifier_pin = report_verifier_digest != args.verifier_digest
+        if historical_verifier_pin:
+            print(
+                json.dumps(
+                    {
+                        "historical_pin": "verifier_digest",
+                        "report": report_verifier_digest,
+                        "cli": args.verifier_digest,
+                    },
+                    sort_keys=True,
+                )
+            )
 
         snapshot = ledger.score_class_snapshot(epoch_id)
+        if historical_verifier_pin and (
+            args.verifier_binary or args.verifier_production_path
+        ):
+            if (
+                _archived_verifier_binding(
+                    Path(args.evidence_dir),
+                    int(snapshot["source_epoch"]),
+                    report_verifier_digest,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "signed report verifier_digest does not match "
+                    "--verifier-digest; cannot bind the current verifier to a "
+                    "historical pin. Republish from the evidence directory "
+                    "that already has this epoch, or omit --verifier-binary "
+                    "and --verifier-production-path"
+                )
         receipts_by_id: dict[str, bytes] = {}
         for row in snapshot["rows"]:
             if row["receipt_id"] is not None and row["receipt_body"] is not None:
@@ -1716,7 +1778,39 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
                 )
 
         verifier_binary_blob = None
-        if args.verifier_binary:
+        verifier_command = (
+            [args.verifier_production_path] if args.verifier_production_path else None
+        )
+        verifier_artifacts = (
+            [args.verifier_production_path] if args.verifier_production_path else None
+        )
+        if historical_verifier_pin:
+            # Pairing the frozen digest with today's binary or production
+            # path makes full replay reject the manifest. Reuse the
+            # archived epoch copy when this evidence dir already published
+            # the pin. Otherwise refuse any current verifier binding.
+            archived_verifier = _archived_verifier_binding(
+                Path(args.evidence_dir),
+                int(snapshot["source_epoch"]),
+                report_verifier_digest,
+            )
+            if archived_verifier is not None:
+                verifier_binary_blob = archived_verifier.get("binary_blob")
+                if verifier_binary_blob is not None and not isinstance(
+                    verifier_binary_blob, str
+                ):
+                    raise ValueError("archived verifier binary_blob is invalid")
+                command = archived_verifier.get("command")
+                artifacts = archived_verifier.get("artifacts")
+                verifier_command = list(command) if isinstance(command, list) else None
+                verifier_artifacts = (
+                    list(artifacts) if isinstance(artifacts, list) else None
+                )
+            else:
+                verifier_binary_blob = None
+                verifier_command = None
+                verifier_artifacts = None
+        elif args.verifier_binary:
             verifier_binary_blob = store.put_blob(
                 _read_bounded_local_file(
                     args.verifier_binary, MAX_VERIFIER_FETCH_BYTES, "verifier binary"
@@ -1853,14 +1947,10 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             registry_release=int(registry_release),
             registry_digest=registry_digest,
             registry_blob=registry_blob,
-            verifier_digest=args.verifier_digest,
+            verifier_digest=report_verifier_digest,
             verifier_binary_blob=verifier_binary_blob,
-            verifier_command=(
-                [args.verifier_production_path] if args.verifier_production_path else None
-            ),
-            verifier_artifacts=(
-                [args.verifier_production_path] if args.verifier_production_path else None
-            ),
+            verifier_command=verifier_command,
+            verifier_artifacts=verifier_artifacts,
             report_id=str(report["report_id"]),
             report_blob=report_blob,
             report_signing_key_id=str(report["signing_key_id"]),

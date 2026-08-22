@@ -62,7 +62,7 @@ from cathedral.lifecycle import (
     WorkerLifecycleState,
 )
 from cathedral.poster import Poster
-from cathedral.receipt import ReceiptIssuer
+from cathedral.receipt import ReceiptError, ReceiptIssuer
 from cathedral.remote import RemoteMiner
 
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -1543,7 +1543,7 @@ class ConfidentialRuntime:
                         continue
                     self._require_live_gpu_profile()
                     units = lane.score(result.target.hotkey, [accepted])
-                    self._resolve_work(
+                    receipt_error = self._resolve_work(
                         epoch_id,
                         source_epoch,
                         result,
@@ -1558,6 +1558,18 @@ class ConfidentialRuntime:
                             _sat_certificate_json(accepted) if lease is not None else None
                         ),
                     )
+                    if receipt_error:
+                        outcomes[result.target.hotkey] = MinerOutcome(
+                            result.target.hotkey,
+                            result.endpoint,
+                            "receipt_failed",
+                            admitted=True,
+                            challenge_id=item.challenge_id,
+                            work_units=0.0,
+                            error=receipt_error,
+                            assurance=assurance,
+                        )
+                        continue
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
@@ -1614,7 +1626,13 @@ class ConfidentialRuntime:
         customer_result: Mapping[str, object] | None = None,
         customer_error: str | None = None,
         certificate: SatCertificate | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Persist one worker's SAT outcome. Returns a receipt error, or None.
+
+        A lifecycle change between admit and issue must fail this miner, never
+        the epoch (cathedral-compute #144). The post-issuance cache (#145) does
+        not cover this window.
+        """
         if status == "verified" and certificate is not None:
             # Durable canonical work artifacts: the exact bytes the receipt's
             # manifest/result digests sign, so full provenance can replay the
@@ -1637,22 +1655,59 @@ class ConfidentialRuntime:
                 customer_error=customer_error,
                 customer_max_attempts=self.config.customer_job_max_attempts,
             )
-            return
+            return None
         attested = result.attested
         assert attested is not None
-        worker_lifecycle = self.registry.lifecycle_snapshot(result.target.hotkey)
-        receipt = self.receipt_issuer.issue(
-            epoch_id=epoch_id,
-            source_epoch=source_epoch,
-            subject_hotkey=result.target.hotkey,
-            attested=attested,
-            policy=self.policy,
-            assurance=assurance,
-            worker_lifecycle=worker_lifecycle,
-            challenge_id=item.challenge_id,
-            manifest_digest=_sat_manifest_digest(item),
-            work_units=work_units,
-        )
+        try:
+            worker_lifecycle = self.registry.lifecycle_snapshot(result.target.hotkey)
+            reserved_generation = worker_lifecycle.generation
+            reserved_event_id = worker_lifecycle.event_id
+            receipt = self.receipt_issuer.issue(
+                epoch_id=epoch_id,
+                source_epoch=source_epoch,
+                subject_hotkey=result.target.hotkey,
+                attested=attested,
+                policy=self.policy,
+                assurance=assurance,
+                worker_lifecycle=worker_lifecycle,
+                challenge_id=item.challenge_id,
+                manifest_digest=_sat_manifest_digest(item),
+                work_units=work_units,
+            )
+            live = self.registry.lifecycle_snapshot(
+                result.target.hotkey,
+                materialize_freshness=False,
+            )
+            if (
+                live.generation != reserved_generation
+                or live.event_id != reserved_event_id
+            ):
+                raise ReceiptError(
+                    "lifecycle",
+                    "receipt worker lifecycle changed during issuance",
+                )
+        except ReceiptError as exc:
+            # Worker-local only. A dead signing key or a broken registry
+            # hits every verified miner; swallowing those would complete
+            # the epoch and publish a zero vector.
+            if exc.category != "lifecycle":
+                raise
+            self.ledger.resolve_challenge(
+                item.challenge_id,
+                "failed",
+                0.0,
+                validator_derived=False,
+                customer_lease=customer_lease,
+                customer_disposition="retry" if customer_lease is not None else None,
+                customer_result=None,
+                customer_error=(
+                    f"receipt issuance refused: {exc}"
+                    if customer_lease is not None
+                    else None
+                ),
+                customer_max_attempts=self.config.customer_job_max_attempts,
+            )
+            return f"receipt issuance refused: {exc}"
         issued_at = receipt.document["issued_at"]
         assert isinstance(issued_at, str)
         self.ledger.resolve_challenge_with_receipt(
@@ -1675,6 +1730,7 @@ class ConfidentialRuntime:
         # post-SAT lifecycle-recording loop so a mid-epoch registry write
         # cannot make the ledger reject the runtime's own receipt.
         self._receipt_lifecycles[result.target.hotkey] = worker_lifecycle
+        return None
 
     def _collect_attestation(
         self,
